@@ -1,0 +1,1 @@
+ALTER TABLE "subscription_details" DROP COLUMN "psp_subscription_id";

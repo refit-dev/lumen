@@ -1,0 +1,19 @@
+{
+  "name": "@getlumen/server",
+  "version": "0.1.10",
+  "description": "Payments SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "bun test tests/**/*.test.ts"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "tsup": "^8.4.0"
+  }
+}

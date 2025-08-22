@@ -1,0 +1,23 @@
+# Ignore files/directories not needed for Elastic Beanstalk deployment
+
+docker-compose.yml
+Dockerfile.buildtest
+
+# Node modules (should be installed by Dockerfile or platform)
+node_modules/
+
+# Git directory
+.git/
+
+# Infra directory
+infra/
+
+# Local environment files
+.env
+api/.env
+ui/.env
+
+# IDE/OS files
+.vscode/
+.idea/
+*.DS_Store

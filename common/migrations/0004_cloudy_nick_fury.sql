@@ -1,0 +1,1 @@
+ALTER TABLE "pricing_table_plans" ADD COLUMN "credit_allowances" jsonb;

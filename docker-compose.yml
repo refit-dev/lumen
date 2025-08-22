@@ -1,0 +1,156 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lumen-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lumen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lumen_local}
+      POSTGRES_DB: ${POSTGRES_DB:-lumen}
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumen"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: lumen-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lumen_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-lumen_minio_local}
+    ports:
+      - "9000:9000" # API
+      - "9001:9001" # Console
+    volumes:
+      - minio_data:/data
+    entrypoint: >
+      /bin/sh -c "
+      mkdir -p /data/invoices-dev &&
+      minio server /data --console-address ':9001' &
+      sleep 5 &&
+      mc alias set myminio http://localhost:9000 ${MINIO_ROOT_USER:-lumen_minio} ${MINIO_ROOT_PASSWORD:-lumen_minio_local} &&
+      mc mb --ignore-existing myminio/invoices-dev &&
+      mc anonymous set none myminio/invoices-dev &&
+      mc admin user add myminio lumen_app lumen_app_secret &&
+      mc admin policy attach myminio readwrite --user lumen_app &&
+      wait
+      "
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: lumen-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-lumen_admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json
+    depends_on:
+      - postgres
+
+  redis:
+    image: redis:7-alpine
+    container_name: lumen-redis
+    environment:
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  questdb:
+    image: questdb/questdb:8.3.0
+    container_name: lumen-questdb
+    environment:
+      QDB_PG_USER: ${QUESTDB_USER:-admin}
+      QDB_PG_PASSWORD: ${QUESTDB_PASSWORD:-quest}
+      # disable InfluxDB line protocol over TCP and UDP - docs recommend using HTTP
+      # this also prevents another potential way to the DB for security (in AWS)
+      QDB_LINE_TCP_ENABLED: false
+      QDB_LINE_UDP_ENABLED: false
+    ports:
+      - "9010:9000" # REST API and Web Console (Host port changed to 9010)
+      - "9009:9009" # InfluxDB Line Protocol (UDP)
+      - "8812:8812" # PostgreSQL wire protocol
+      - "9003:9003" # Min health server
+    volumes:
+      - questdb_data:/var/lib/questdb
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "perl -e 'use IO::Socket::INET; my $$s = IO::Socket::INET->new(PeerAddr=>\"localhost:9003\") or exit 1; print $$s \"GET / HTTP/1.0\\r\\nHost: localhost:9003\\r\\n\\r\\n\"; my $$r = <$$s>; exit($$r =~ /200 OK/ ? 0 : 1)'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api-built:
+    container_name: lumen-api-built
+    build:
+      context: .
+      dockerfile: Dockerfile.buildtest
+      target: runtime-api
+    ports:
+      - "8001:8000" # Map container 8000 to host 8001
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      STORAGE_REGION: us-west-2 # Region doesn't matter much for MinIO
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_FORCE_PATH_STYLE: true
+      CORS_ORIGIN: http://localhost:3001
+      REDIS_URL: redis://${REDIS_HOST}:${REDIS_PORT}
+      INVOICE_BUCKET: invoices-dev
+    env_file:
+      - ./api/.env # Load variables directly from the api directory's .env file
+
+  ui-built:
+    container_name: lumen-ui-built
+    build:
+      context: .
+      dockerfile: Dockerfile.buildtest
+      target: runtime-ui
+    ports:
+      - "3001:3000" # Map container 3000 to host 3001
+    depends_on:
+      - api-built # Optional: wait for api-built to start
+    environment:
+      NEXT_PUBLIC_API_URL: http://api-built:8000
+
+volumes:
+  postgres_data:
+  minio_data:
+  pgadmin_data:
+  redis_data:
+  questdb_data:

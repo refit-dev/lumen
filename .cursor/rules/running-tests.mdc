@@ -1,0 +1,10 @@
+---
+description: This rule explain how to run tests
+globs:
+alwaysApply: false
+---
+
+If you want to run tests, the command for it is:
+cd /Users/prasoon/work/lumen/api && bun test tests/integration/<test-file.ts>
+
+Tests can only be run from inside the `api` folder.

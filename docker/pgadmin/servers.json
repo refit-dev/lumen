@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Lumen Dev DB",
+      "Group": "Development",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "lumen",
+      "Username": "lumen",
+      "Password": "lumen_local",
+      "SSLMode": "prefer"
+    }
+  }
+}

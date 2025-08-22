@@ -1,0 +1,52 @@
+# Git files
+.git
+.gitignore
+
+# Docker files
+.dockerignore
+Dockerfile
+Dockerfile.multi
+docker-compose.yml
+
+# Node modules
+node_modules
+*/node_modules
+
+# Build artifacts
+dist
+*/dist
+.next
+*/.next
+.output
+*/.output
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Env files
+.env
+.env.*
+!/.env.example
+
+# IDE and OS files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+.DS_Store
+Thumbs.db
+
+# Test files
+coverage
+
+# Temporary files
+*.tmp
