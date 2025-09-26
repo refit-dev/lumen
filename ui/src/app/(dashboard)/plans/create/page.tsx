@@ -176,10 +176,9 @@ export default function CreatePlanPage() {
             currency: value.currency,
             ...(!value.isEnterprisePlan && {
               monthlyPrice: value.monthlyPrice,
-              ...(hasYearlyPrice &&
-                value.yearlyPrice > 0 && {
-                  yearlyPrice: value.yearlyPrice,
-                }),
+              ...(hasYearlyPrice && {
+                yearlyPrice: value.yearlyPrice,
+              }),
               hasYearlyPrice,
             }),
             showInPricingTable: value.showInPricingTable,
@@ -240,10 +239,11 @@ export default function CreatePlanPage() {
           });
         }
 
-        // Validate yearly price if enabled and not enterprise plan
+        // Validate yearly price for paid plans when yearly pricing is enabled
         if (
           !value.isEnterprisePlan &&
           hasYearlyPrice &&
+          value.monthlyPrice > 0 &&
           value.yearlyPrice === 0
         ) {
           errors.yearlyPrice =
@@ -310,32 +310,30 @@ export default function CreatePlanPage() {
     const newFeatures = formValues.features || [];
 
     // Combine all features for preview
-    const allFeatures = [
-      ...newFeatures.map((f) => {
-        let text = f.featureName;
-        if (
-          f.hasCreditAllowance &&
-          f.creditAllowanceAmount &&
-          f.creditAllowanceAmount > 0
-        ) {
-          if (f.creditAllowanceRenewal && f.creditAllowanceRenewal !== "none") {
-            text += ` (${f.creditAllowanceAmount} ${f.creditAllowanceRenewal === "monthly" ? "per month" : "per year"})`;
-          }
+    const allFeatures = newFeatures.map((f) => {
+      let text = f.featureName;
+      if (
+        f.hasCreditAllowance &&
+        f.creditAllowanceAmount &&
+        f.creditAllowanceAmount > 0
+      ) {
+        if (f.creditAllowanceRenewal && f.creditAllowanceRenewal !== "none") {
+          text += ` (${f.creditAllowanceAmount} ${f.creditAllowanceRenewal === "monthly" ? "per month" : "per year"})`;
         }
+      }
 
-        // Add trial credit allowance info when trial is enabled
-        if (
-          hasFreeTrial &&
-          f.isUsageBased &&
-          f.trialCreditAllowance &&
-          f.trialCreditAllowance > 0
-        ) {
-          text += ` • Trial: ${f.trialCreditAllowance} during trial period`;
-        }
+      // Add trial credit allowance info when trial is enabled
+      if (
+        hasFreeTrial &&
+        f.isUsageBased &&
+        f.trialCreditAllowance &&
+        f.trialCreditAllowance > 0
+      ) {
+        text += ` • Trial: ${f.trialCreditAllowance} during trial period`;
+      }
 
-        return { text };
-      }),
-    ];
+      return { text };
+    });
 
     // Show monthly plan in preview (keep simple for now)
     // Build pricing components for preview
@@ -373,7 +371,7 @@ export default function CreatePlanPage() {
         pricingComponents.push({
           type: "usage",
           label: `${f.featureName} usage`,
-          unit_cost_cents: Math.round(f.usagePricePerUnit * 100),
+          unit_cost_cents: f.usagePricePerUnit,
           component_id: `preview_usage_${f.slug}`,
           component_name: `usage_${f.slug}`,
           unit_label: f.slug,

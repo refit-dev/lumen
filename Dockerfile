@@ -1,4 +1,4 @@
-FROM oven/bun:1 AS base
+FROM oven/bun:1.2.21 AS base
 WORKDIR /app
 
 # Copy entire project context (respecting .dockerignore)
@@ -20,7 +20,7 @@ RUN cd common && bun run clean && bun run build
 RUN cd api && bun run build
 
 # --- Stage 3: Production Runtime (API Only) ---
-FROM oven/bun:1-slim AS runtime
+FROM oven/bun:1.2.21-slim AS runtime
 WORKDIR /app
 
 # Copy production dependencies and built code from builder stage
@@ -38,9 +38,15 @@ COPY --from=builder /app/common/ ./common/
 # Copy built API code
 COPY --from=builder /app/api/dist ./api/dist
 
+# Copy Trigger assets (fonts for PDF generation)
+COPY --from=builder /app/api/trigger/assets ./api/trigger/assets
+
 # Create certs directory and copy the CA bundle
 RUN mkdir -p /app/certs
 COPY --from=builder /app/common/src/db/us-west-2-bundle.pem /app/certs/us-west-2-bundle.pem
+
+# Ensure all Node/Bun TLS consumers trust the RDS CA bundle by default
+ENV NODE_EXTRA_CA_CERTS=/app/certs/us-west-2-bundle.pem
 
 # Set working directory to API
 WORKDIR /app/api

@@ -668,6 +668,96 @@ export const entitlementsRouter = new Hono()
   )
 
   /**
+   * Get all entitlements for all customers in an organization (seat-aware)
+   * @param customerId - Customer ID (internal ID or externalCustomerId based on isExtCustId)
+   * @param isExtCustId - When true (default), customerId is interpreted as externalCustomerId (external ID)
+   */
+  .get(
+    "/:customerId/seat-aware",
+    zValidator("param", customerIdParamSchema),
+    zValidator("query", isExtCustIdQuerySchema),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const { customerId } = c.req.valid("param");
+      const { isExtCustId } = c.req.valid("query");
+
+      try {
+        // Resolve to internal customer ID first
+        const resolvedIds = await resolveCustomerIds(
+          merchantId,
+          customerId,
+          isExtCustId
+        );
+        const internalCustomerId = resolvedIds?.internalId || customerId;
+
+        // Get the customer's organization
+        const customer = await db.query.customers.findFirst({
+          where: and(
+            eq(customers.id, internalCustomerId),
+            eq(customers.merchantId, merchantId),
+            isNull(customers.deletedAt)
+          ),
+        });
+
+        if (!customer?.customerOrganizationId) {
+          // No organization, fall back to regular entitlements for this customer only
+          const entitlements = await getAllFeatureEntitlements(
+            merchantId,
+            customerId,
+            isExtCustId
+          );
+          return c.json({
+            entitlements: entitlements.map((entitlement) => ({
+              ...entitlement,
+              customerId: internalCustomerId,
+              externalCustomerId: customer?.externalCustomerId,
+            })),
+          });
+        }
+
+        // Get ALL customers in the organization
+        const orgCustomers = await db.query.customers.findMany({
+          where: and(
+            eq(
+              customers.customerOrganizationId,
+              customer.customerOrganizationId
+            ),
+            eq(customers.merchantId, merchantId),
+            isNull(customers.deletedAt)
+          ),
+        });
+
+        // Get entitlements for all customers in the organization
+        const allEntitlements = await Promise.all(
+          orgCustomers.map(async (orgCustomer) => {
+            const entitlements = await getAllFeatureEntitlements(
+              merchantId,
+              orgCustomer.id,
+              false // Always use internal ID for org customers
+            );
+            return entitlements.map((entitlement) => ({
+              ...entitlement,
+              customerId: orgCustomer.id,
+              externalCustomerId: orgCustomer.externalCustomerId,
+            }));
+          })
+        );
+
+        // Flatten the results
+        const flattenedEntitlements = allEntitlements.flat();
+
+        return c.json({ entitlements: flattenedEntitlements });
+      } catch (error) {
+        console.error("Error fetching seat-aware entitlements:", error);
+        return c.json(
+          { error: "Failed to fetch seat-aware entitlements" },
+          500
+        );
+      }
+    }
+  )
+
+  /**
    * Check a specific feature entitlement
    * @param customerId - Customer ID (internal ID or externalCustomerId based on isExtCustId)
    * @param featureSlug - Slug of the feature to check

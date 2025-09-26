@@ -29,6 +29,7 @@ import {
   Download,
   AlertCircle,
   RefreshCw,
+  Info,
 } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -80,6 +81,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectTrigger,
+  SelectContent,
+  SelectItem,
+  SelectValue,
+} from "@/components/ui/select";
 
 const removeFalsyValuesFromObject = (obj: Record<string, unknown>) => {
   return Object.fromEntries(Object.entries(obj).filter(([, value]) => !!value));
@@ -381,6 +391,63 @@ export default function CreateCustomerPage() {
     };
   }, []);
 
+  // Fetch organization customers if this customer has an organization
+  const { data: organizationData } = useQuery({
+    queryKey: ["customer-organization", customerId],
+    queryFn: async () => {
+      if (!customerId) return null;
+      const response = await apiClient.customers[":id"][
+        "organization-customers"
+      ].$get({
+        param: { id: customerId },
+      });
+      if (!response.ok) return null;
+      return response.json();
+    },
+    enabled: !!customerId && !!customer?.customerOrganizationId,
+  });
+
+  // Fetch entitlements for each org customer to show credits
+  const { data: orgCustomerEntitlements } = useQuery({
+    queryKey: [
+      "org-customer-entitlements",
+      customerId,
+      organizationData?.customers?.map((c) => c.id),
+    ],
+    queryFn: async () => {
+      if (!organizationData?.customers) return {};
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const entitlementsMap: Record<string, any[]> = {};
+
+      for (const orgCustomer of organizationData.customers) {
+        try {
+          const response = await apiClient.entitlements[":customerId"].$get({
+            param: { customerId: orgCustomer.id },
+            query: { isExtCustId: "false" },
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            entitlementsMap[orgCustomer.id] = data.entitlements || [];
+          } else {
+            entitlementsMap[orgCustomer.id] = [];
+          }
+        } catch (error) {
+          console.error(
+            `Failed to fetch entitlements for customer ${orgCustomer.id}:`,
+            error
+          );
+          entitlementsMap[orgCustomer.id] = [];
+        }
+      }
+
+      return entitlementsMap;
+    },
+    enabled:
+      !!organizationData?.customers && organizationData.customers.length > 0,
+  });
+
   // Fetch latest payment detail (enriched with PSP payment method info)
   const latestPaymentId =
     payments && payments.length > 0 ? payments[0].id : null;
@@ -463,13 +530,21 @@ export default function CreateCustomerPage() {
     refetch: refetchEvents,
     isRefetching: eventsRefetching,
   } = useQuery({
-    queryKey: ["customer-events", customerId, eventsLimit],
+    queryKey: [
+      "customer-events",
+      customerId,
+      customer?.externalCustomerId || null,
+      eventsLimit,
+    ],
     queryFn: async () => {
       if (!customerId) return { data: [], hasMore: false };
       try {
+        const combinedIds = customer?.externalCustomerId
+          ? `${customerId},${customer.externalCustomerId}`
+          : customerId;
         const response = await apiClient.events.$get({
           query: {
-            customerId,
+            customerId: combinedIds,
             limit: eventsLimit.toString(),
             offset: "0",
           },
@@ -531,22 +606,37 @@ export default function CreateCustomerPage() {
     defaultValues: defaultFormValues,
     onSubmit: async ({ value }) => {
       try {
+        // Determine tax treatment from local UI state
+        const treatment = selectedTaxTreatment;
+
         const response = await apiClient.customers[":id"].$post({
           param: { id: customerId },
           json: {
             ...removeFalsyValuesFromObject(value),
-            taxExempt:
-              value.taxExemptionReason === "reverse_charge" ||
-              value.taxExemptionReason === "customer_exempt",
+            taxExempt: treatment === "exempt",
             // Convert frontend values to backend format
             taxRateDefinitionId:
-              value.taxRateDefinitionId === "default"
-                ? null
-                : value.taxRateDefinitionId,
+              treatment === "manual" && value.taxRateDefinitionId !== "default"
+                ? value.taxRateDefinitionId
+                : null,
             taxCalculationMethod:
-              value.taxCalculationMethod === "default"
-                ? null
-                : value.taxCalculationMethod,
+              treatment === "auto"
+                ? "auto"
+                : treatment === "manual"
+                  ? "manual"
+                  : treatment === "default"
+                    ? "default"
+                    : taxConfig?.autoTaxCalculation
+                      ? "auto"
+                      : "default",
+            ...(treatment === "exempt"
+              ? {
+                  taxExemptionReason:
+                    selectedExemptionReason === "other"
+                      ? exemptionOtherText.trim()
+                      : selectedExemptionReason,
+                }
+              : {}),
           },
         });
         queryClient.invalidateQueries({ queryKey: ["customer", customerId] });
@@ -593,22 +683,30 @@ export default function CreateCustomerPage() {
 
   const hasPopulatedRef = useRef(false);
 
+  // Local UI state for tax treatment & exemption reason selector
+  const [selectedTaxTreatment, setSelectedTaxTreatment] = useState<
+    "auto" | "manual" | "default" | "exempt"
+  >("default");
+  const [exemptionDialogOpen, setExemptionDialogOpen] = useState(false);
+  const [selectedExemptionReason, setSelectedExemptionReason] =
+    useState<string>("nonprofit_organization");
+  const [exemptionOtherText, setExemptionOtherText] = useState("");
+
   useEffect(() => {
     if (!customer || hasPopulatedRef.current) return;
 
-    const taxExemptionReason = customer.taxExempt
-      ? customer.taxExemptionReason || "customer_exempt"
-      : "no";
-
-    // Map backend fields to UI representation
-    let taxExemptionReasonUI = taxExemptionReason;
-    if (customer.taxCalculationMethod === "manual" && !customer.taxExempt) {
-      taxExemptionReasonUI = "no_manual";
-    } else if (
-      customer.taxCalculationMethod === "auto" &&
-      !customer.taxExempt
-    ) {
-      taxExemptionReasonUI = "no_auto";
+    // Initialize local treatment state based on existing customer
+    if (customer.taxExempt) {
+      setSelectedTaxTreatment("exempt");
+      setSelectedExemptionReason(
+        (customer.taxExemptionReason as string) || "nonprofit_organization"
+      );
+    } else if (customer.taxCalculationMethod === "manual") {
+      setSelectedTaxTreatment("manual");
+    } else if (customer.taxCalculationMethod === "auto") {
+      setSelectedTaxTreatment("auto");
+    } else {
+      setSelectedTaxTreatment("default");
     }
 
     form.setFieldValue("name", customer.name ?? "");
@@ -631,7 +729,10 @@ export default function CreateCustomerPage() {
     );
     form.setFieldValue("billingPostalCode", customer.billingPostalCode ?? "");
     form.setFieldValue("taxId", customer.taxId ?? "");
-    form.setFieldValue("taxExemptionReason", taxExemptionReasonUI);
+    form.setFieldValue(
+      "taxExemptionReason",
+      customer.taxExempt ? customer.taxExemptionReason || "" : ""
+    );
     form.setFieldValue(
       "taxRateDefinitionId",
       customer.taxRateDefinitionId || "default"
@@ -722,26 +823,7 @@ export default function CreateCustomerPage() {
     }
   }, [formValues.billingCountry, formValues.billingStateProvince, form]);
 
-  // Update calculation method based on tax exemption reason selection
-  useEffect(() => {
-    const { taxExemptionReason: reason, taxCalculationMethod: method } =
-      formValues;
-
-    if (reason === "no_manual" && method !== "manual") {
-      form.setFieldValue("taxCalculationMethod", "manual");
-    } else if (reason === "no_auto" && method !== "auto") {
-      form.setFieldValue("taxCalculationMethod", "auto");
-    } else if (reason === "no" && method !== "default") {
-      form.setFieldValue("taxCalculationMethod", "default");
-    } else if (
-      (reason === "reverse_charge" || reason === "customer_exempt") &&
-      method === "manual"
-    ) {
-      // Reset to merchant's default calculation mode when selecting exemptions
-      const fallbackMethod = taxConfig?.autoTaxCalculation ? "auto" : "default";
-      form.setFieldValue("taxCalculationMethod", fallbackMethod);
-    }
-  }, [formValues.taxExemptionReason, taxConfig, form, formValues]);
+  // No longer synchronize form field with UI state - handle only on submit
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -757,7 +839,7 @@ export default function CreateCustomerPage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [form, form.handleSubmit, handleNavigateBack]);
 
-  // Prevent auto calculation for unsupported customer countries while editing
+  // Prevent auto calculation for unsupported customer countries while editing - UI state only
   useEffect(() => {
     if (!isEditMode) return;
 
@@ -765,22 +847,15 @@ export default function CreateCustomerPage() {
       (c) => c.value === formValues.billingCountry
     );
 
-    if (!isSupported && formValues.taxCalculationMethod === "auto") {
+    if (!isSupported && selectedTaxTreatment === "auto") {
       const fallbackMethod = taxConfig?.defaultTaxRate ? "default" : "manual";
-      form.setFieldValue("taxCalculationMethod", fallbackMethod);
-
-      if (formValues.taxExemptionReason === "no_auto") {
-        form.setFieldValue("taxExemptionReason", "no");
-      }
+      setSelectedTaxTreatment(
+        fallbackMethod === "default" ? "default" : "manual"
+      );
     }
-  }, [
-    isEditMode,
-    formValues.billingCountry,
-    formValues.taxCalculationMethod,
-    formValues.taxExemptionReason,
-    form,
-    taxConfig,
-  ]);
+  }, [isEditMode, formValues.billingCountry, taxConfig, selectedTaxTreatment]);
+
+  // No longer mirror dropdown into form field; we use local treatment state
 
   // Helper function to format credit status
   const formatCreditStatus = (status: string) => {
@@ -876,6 +951,11 @@ export default function CreateCustomerPage() {
     session?.merchant?.defaultCurrency ||
     customer?.preferredCurrency ||
     "USD";
+
+  // Add expanded state near other state declarations (around line 239)
+  const [expandedSeatCustomer, setExpandedSeatCustomer] = useState<
+    string | null
+  >(null);
 
   if (isLoading) {
     return (
@@ -1411,6 +1491,94 @@ export default function CreateCustomerPage() {
             </CardContent>
           </Card>
 
+          {/* Organization Information */}
+          {customer?.customerOrganizationId && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <User className="mr-2 h-5 w-5" />
+                  Organization
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">
+                      Organization ID
+                    </p>
+                    <div
+                      className="inline-flex items-center bg-muted rounded cursor-pointer hover:bg-muted-foreground/10 mt-1"
+                      onClick={() => {
+                        if (customer.customerOrganizationId) {
+                          navigator.clipboard.writeText(
+                            customer.customerOrganizationId
+                          );
+                        }
+                      }}
+                    >
+                      <code className="px-2 py-1 text-xs font-mono">
+                        {customer.customerOrganizationId}
+                      </code>
+                      <div className="h-6 px-2 flex items-center">
+                        <Copy className="h-3 w-3" />
+                      </div>
+                    </div>
+                  </div>
+
+                  {organizationData?.organization?.externalOrgId && (
+                    <div>
+                      <p className="text-sm font-medium text-muted-foreground">
+                        External Organization ID
+                      </p>
+                      <div
+                        className="inline-flex items-center bg-muted rounded cursor-pointer hover:bg-muted-foreground/10 mt-1"
+                        onClick={() => {
+                          if (organizationData.organization?.externalOrgId) {
+                            navigator.clipboard.writeText(
+                              organizationData.organization.externalOrgId
+                            );
+                          }
+                        }}
+                      >
+                        <code className="px-2 py-1 text-xs font-mono">
+                          {organizationData.organization.externalOrgId}
+                        </code>
+                        <div className="h-6 px-2 flex items-center">
+                          <Copy className="h-3 w-3" />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">
+                      Role in Organization
+                    </p>
+                    <Badge className="mt-1 bg-blue-100 text-blue-800 border-blue-200">
+                      {customer.orgRole || "Primary"}
+                    </Badge>
+                  </div>
+
+                  {organizationData?.customers &&
+                    organizationData.customers.length > 1 && (
+                      <div>
+                        <p className="text-sm font-medium text-muted-foreground">
+                          Total Customers
+                        </p>
+                        <p className="text-lg font-semibold mt-1">
+                          {organizationData.customers.length}
+                          <span className="text-sm text-muted-foreground font-normal ml-1">
+                            (1 primary + {organizationData.customers.length - 1}{" "}
+                            seats)
+                          </span>
+                        </p>
+                      </div>
+                    )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Edit Customer Details */}
           {isEditMode && (
             <Card>
@@ -1584,102 +1752,76 @@ export default function CreateCustomerPage() {
                     </div>
 
                     {/* Smart tax treatment dropdown */}
-                    <form.AppField
-                      name="taxExemptionReason"
-                      children={(field) => {
-                        const isSupportedCountry =
-                          supportedCustomerCountries.some(
-                            (c) => c.value === formValues.billingCountry
-                          );
-
-                        const options: { label: string; value: string }[] = [];
-
-                        const autoAllowed =
-                          isSupportedCountry && taxConfig?.autoTaxCalculation;
-
-                        if (autoAllowed) {
-                          options.push({
-                            label: "Calculate automatically based on location",
-                            value: "no_auto",
-                          });
-                          options.push({
-                            label: "Use specific tax rate",
-                            value: "no_manual",
-                          });
-                        } else {
-                          if (taxConfig?.defaultTaxRate) {
-                            const rate = (
-                              parseFloat(taxConfig.defaultTaxRate) * 100
-                            ).toFixed(2);
-                            options.push({
-                              label: `Apply default rate (${rate}%)`,
-                              value: "no",
-                            });
-                          } else {
-                            options.push({
-                              label: "No tax (default rate not set)",
-                              value: "no",
-                            });
-                          }
-
-                          // Manual always available
-                          options.push({
-                            label: "Use specific tax rate",
-                            value: "no_manual",
-                          });
-
-                          if (
-                            taxConfig?.autoTaxCalculation &&
-                            isSupportedCountry
-                          ) {
-                            options.push({
-                              label:
-                                "Calculate automatically based on location",
-                              value: "no_auto",
-                            });
-                          }
-                        }
-
-                        // Always include exemption options
-                        options.push({
-                          label: "Reverse charge (B2B VAT)",
-                          value: "reverse_charge",
-                        });
-                        options.push({
-                          label: "Tax exempt",
-                          value: "customer_exempt",
-                        });
-
-                        return (
-                          <field.Dropdown
-                            label="Tax Treatment"
-                            options={options}
-                            defaultValue={autoAllowed ? "no_auto" : "no"}
-                            readOnly={!isEditMode}
-                          />
+                    {(() => {
+                      const isSupportedCountry =
+                        supportedCustomerCountries.some(
+                          (c) => c.value === formValues.billingCountry
                         );
-                      }}
-                    />
+                      const autoAllowed =
+                        isSupportedCountry && taxConfig?.autoTaxCalculation;
+
+                      const currentValue = selectedTaxTreatment;
+
+                      return (
+                        <div className="space-y-2">
+                          <Label>Tax Treatment</Label>
+                          <Select
+                            value={currentValue}
+                            onValueChange={(val) => {
+                              if (val === "exempt") {
+                                setSelectedTaxTreatment("exempt");
+                                setExemptionDialogOpen(true);
+                                return;
+                              }
+                              setSelectedTaxTreatment(
+                                val as "auto" | "manual" | "default" | "exempt"
+                              );
+                            }}
+                          >
+                            <SelectTrigger disabled={!isEditMode}>
+                              <SelectValue placeholder="Select tax treatment" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {autoAllowed ? (
+                                <>
+                                  <SelectItem value="auto">
+                                    Calculate automatically based on location
+                                  </SelectItem>
+                                  <SelectItem value="manual">
+                                    Use specific tax rate
+                                  </SelectItem>
+                                  <SelectItem value="exempt">
+                                    Tax exempt
+                                  </SelectItem>
+                                </>
+                              ) : (
+                                <>
+                                  <SelectItem value="default">
+                                    {taxConfig?.defaultTaxRate
+                                      ? `Apply default rate (${(
+                                          parseFloat(taxConfig.defaultTaxRate) *
+                                          100
+                                        ).toFixed(2)}%)`
+                                      : "No tax (default tax rate not set)"}
+                                  </SelectItem>
+                                  <SelectItem value="manual">
+                                    Use specific tax rate
+                                  </SelectItem>
+                                  <SelectItem value="exempt">
+                                    Tax exempt
+                                  </SelectItem>
+                                </>
+                              )}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      );
+                    })()}
 
                     {/* Show description for selected option */}
                     <div className="text-xs text-gray-600">
                       {(() => {
-                        const exemptionReason = formValues.taxExemptionReason;
-                        const calcMethod = formValues.taxCalculationMethod;
-
-                        if (exemptionReason === "reverse_charge") {
-                          return (
-                            <p className="flex items-start gap-1.5">
-                              <span className="text-green-600 mt-0.5">✓</span>
-                              <span>
-                                No tax will be charged. The customer is
-                                responsible for paying VAT directly to their tax
-                                authority (reverse charge mechanism).
-                              </span>
-                            </p>
-                          );
-                        }
-                        if (exemptionReason === "customer_exempt") {
+                        if (selectedTaxTreatment === "exempt") {
                           return (
                             <p className="flex items-start gap-1.5">
                               <span className="text-green-600 mt-0.5">✓</span>
@@ -1690,7 +1832,7 @@ export default function CreateCustomerPage() {
                             </p>
                           );
                         }
-                        if (calcMethod === "auto") {
+                        if (selectedTaxTreatment === "auto") {
                           return (
                             <p className="flex items-start gap-1.5">
                               <span className="text-green-600 mt-0.5">✓</span>
@@ -1702,7 +1844,7 @@ export default function CreateCustomerPage() {
                             </p>
                           );
                         }
-                        if (calcMethod === "manual") {
+                        if (selectedTaxTreatment === "manual") {
                           return (
                             <p className="flex items-start gap-1.5">
                               <span className="text-green-600 mt-0.5">✓</span>
@@ -1713,7 +1855,7 @@ export default function CreateCustomerPage() {
                             </p>
                           );
                         }
-                        if (calcMethod === "default" && taxConfig) {
+                        if (selectedTaxTreatment === "default" && taxConfig) {
                           if (taxConfig.autoTaxCalculation) {
                             return (
                               <p className="flex items-start gap-1.5">
@@ -1755,7 +1897,7 @@ export default function CreateCustomerPage() {
                     </div>
 
                     {/* Show tax rate dropdown only when manual rate is selected */}
-                    {formValues.taxCalculationMethod === "manual" && (
+                    {selectedTaxTreatment === "manual" && (
                       <div className="space-y-3">
                         {taxRateDefinitions && taxRateDefinitions.length > 0 ? (
                           <form.AppField
@@ -1809,6 +1951,135 @@ export default function CreateCustomerPage() {
                         children={(field) => <field.TextField label="" />}
                       />
                     </div>
+
+                    {/* Exemption reason selection dialog */}
+                    <Dialog
+                      open={exemptionDialogOpen}
+                      onOpenChange={setExemptionDialogOpen}
+                    >
+                      <DialogContent>
+                        <DialogTitle>Select tax exemption reason</DialogTitle>
+                        <div className="mt-3 space-y-3">
+                          <div className="flex items-start gap-2 rounded-md border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+                            <Info className="h-4 w-4 mt-0.5" />
+                            <p>
+                              Tax-exempt customers are legally exempt from tax
+                              collection (for eg, some non-profits, overseas
+                              sales etc.). Only select this if you have a valid
+                              exemption certificate for the customer OR if you
+                              know what you&apos;re doing.
+                            </p>
+                          </div>
+                          <RadioGroup
+                            value={selectedExemptionReason}
+                            onValueChange={(v) => setSelectedExemptionReason(v)}
+                          >
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem
+                                value="nonprofit_organization"
+                                id="exempt-np-edit"
+                              />
+                              <label
+                                htmlFor="exempt-np-edit"
+                                className="text-sm"
+                              >
+                                Nonprofit organization
+                              </label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem
+                                value="government_entity"
+                                id="exempt-gov-edit"
+                              />
+                              <label
+                                htmlFor="exempt-gov-edit"
+                                className="text-sm"
+                              >
+                                Government entity
+                              </label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem
+                                value="educational_institution"
+                                id="exempt-edu-edit"
+                              />
+                              <label
+                                htmlFor="exempt-edu-edit"
+                                className="text-sm"
+                              >
+                                Educational institution
+                              </label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem
+                                value="resale"
+                                id="exempt-resale-edit"
+                              />
+                              <label
+                                htmlFor="exempt-resale-edit"
+                                className="text-sm"
+                              >
+                                Resale certificate
+                              </label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem
+                                value="other"
+                                id="exempt-other-edit"
+                              />
+                              <label
+                                htmlFor="exempt-other-edit"
+                                className="text-sm"
+                              >
+                                Other
+                              </label>
+                            </div>
+                          </RadioGroup>
+                          {selectedExemptionReason === "other" && (
+                            <div className="pt-2">
+                              <Input
+                                placeholder="Enter exemption reason"
+                                value={exemptionOtherText}
+                                onChange={(e) =>
+                                  setExemptionOtherText(e.target.value)
+                                }
+                              />
+                            </div>
+                          )}
+                          <div className="pt-2 flex items-center justify-end gap-2">
+                            <Button
+                              variant="outline"
+                              onClick={() => {
+                                setExemptionDialogOpen(false);
+                                const fallback = taxConfig?.autoTaxCalculation
+                                  ? "auto"
+                                  : "default";
+                                setSelectedTaxTreatment(fallback);
+                              }}
+                            >
+                              Cancel
+                            </Button>
+                            <Button
+                              onClick={() => {
+                                setExemptionDialogOpen(false);
+                                const reason =
+                                  selectedExemptionReason === "other"
+                                    ? exemptionOtherText.trim()
+                                    : selectedExemptionReason;
+                                if (reason) {
+                                  form.setFieldValue(
+                                    "taxExemptionReason",
+                                    reason
+                                  );
+                                }
+                              }}
+                            >
+                              Save
+                            </Button>
+                          </div>
+                        </div>
+                      </DialogContent>
+                    </Dialog>
                   </div>
 
                   <form.AppForm>
@@ -1835,6 +2106,9 @@ export default function CreateCustomerPage() {
                 { id: "payments", label: "Payments", icon: DollarSign },
                 { id: "credits", label: "Credits", icon: Gift },
                 { id: "usage", label: "Usage", icon: TrendingUp },
+                ...(customer?.customerOrganizationId
+                  ? [{ id: "seats", label: "Seats", icon: User }]
+                  : []),
                 { id: "events", label: "Events", icon: Activity },
               ].map((tab) => (
                 <button
@@ -2129,28 +2403,68 @@ export default function CreateCustomerPage() {
                                   </Badge>
                                 </TableCell>
                                 <TableCell>
-                                  {payment.errorMessage ? (
-                                    <p className="text-sm text-red-600">
-                                      {payment.errorMessage}
-                                    </p>
-                                  ) : payment.customerInvoiceNumber ? (
-                                    <div className="text-sm text-muted-foreground">
-                                      Invoice: {payment.customerInvoiceNumber}
-                                    </div>
-                                  ) : (
-                                    <span className="text-xs text-muted-foreground">
-                                      Payment processed
-                                    </span>
-                                  )}
-                                  {payment.refundedAmountCents && (
-                                    <div className="text-sm text-muted-foreground">
-                                      Refunded:{" "}
-                                      {formatCurrency(
-                                        payment.refundedAmountCents,
-                                        payment.currency
-                                      )}
-                                    </div>
-                                  )}
+                                  <div className="space-y-1">
+                                    {payment.errorMessage ? (
+                                      <p className="text-sm text-red-600">
+                                        {payment.errorMessage}
+                                      </p>
+                                    ) : null}
+
+                                    {payment.customerInvoiceNumber ? (
+                                      <div className="text-sm text-muted-foreground">
+                                        Invoice:{" "}
+                                        <a
+                                          href={`/invoices/${payment.invoiceId}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 hover:underline"
+                                        >
+                                          {payment.customerInvoiceNumber}
+                                          <ExternalLink className="h-3 w-3" />
+                                        </a>
+                                      </div>
+                                    ) : (
+                                      <span className="text-xs text-muted-foreground">
+                                        Payment processed
+                                      </span>
+                                    )}
+
+                                    {payment.externalPaymentId ? (
+                                      <div>
+                                        {(() => {
+                                          const url = getStripeDashboardUrl(
+                                            payment.externalPaymentId,
+                                            isTestMode
+                                          );
+                                          return url ? (
+                                            <a
+                                              href={url}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+                                            >
+                                              View in Stripe Dashboard
+                                              <ExternalLink className="h-3 w-3" />
+                                            </a>
+                                          ) : null;
+                                        })()}
+                                      </div>
+                                    ) : null}
+
+                                    {(payment.refundedAmountCents || 0) > 0 ? (
+                                      <div className="text-sm text-muted-foreground">
+                                        Refunded:{" "}
+                                        {formatCurrency(
+                                          payment.refundedAmountCents ?? 0,
+                                          payment.currency
+                                        )}
+                                        {payment.refundStatus &&
+                                        payment.refundStatus !== "full"
+                                          ? " (partial)"
+                                          : ""}
+                                      </div>
+                                    ) : null}
+                                  </div>
                                 </TableCell>
                               </TableRow>
                             ))}
@@ -2412,6 +2726,318 @@ export default function CreateCustomerPage() {
                         <p className="text-sm mt-1">
                           Usage tracking shows consumption of metered features
                           with remaining credits
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {activeTab === "seats" && (
+                  <div>
+                    {organizationData?.customers &&
+                    organizationData.customers.length > 0 ? (
+                      <div className="space-y-4">
+                        {/* Organization Summary */}
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h3 className="font-medium text-blue-900">
+                                Organization:{" "}
+                                {organizationData.customers.length} customers
+                              </h3>
+                              <p className="text-sm text-blue-700 mt-1">
+                                1 primary customer +{" "}
+                                {organizationData.customers.length - 1} seat
+                                customers
+                              </p>
+                            </div>
+                            {organizationData.organization?.externalOrgId && (
+                              <div className="text-right">
+                                <p className="text-xs text-blue-600 font-medium">
+                                  External Org ID
+                                </p>
+                                <code className="text-xs font-mono text-blue-800">
+                                  {organizationData.organization.externalOrgId}
+                                </code>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Seat Customer Cards */}
+                        <div className="space-y-3">
+                          {organizationData.customers
+                            .filter((c) => c.orgRole === "member") // Only show seat customers
+                            .map((seatCustomer) => {
+                              const isExpanded =
+                                expandedSeatCustomer === seatCustomer.id;
+                              const customerEntitlements =
+                                orgCustomerEntitlements?.[seatCustomer.id] ||
+                                [];
+                              const usageEntitlements =
+                                customerEntitlements.filter(
+                                  (ent) =>
+                                    ent.creditInfo &&
+                                    ent.creditInfo.creditAllowance > 0
+                                );
+
+                              const totalCredits = usageEntitlements.reduce(
+                                (sum, ent) =>
+                                  sum + (ent.creditInfo?.creditsRemaining || 0),
+                                0
+                              );
+
+                              return (
+                                <Card
+                                  key={seatCustomer.id}
+                                  className="overflow-hidden"
+                                >
+                                  <CardContent className="p-0">
+                                    {/* Main Customer Info */}
+                                    <div
+                                      className="p-4 cursor-pointer hover:bg-gray-50 transition-colors"
+                                      onClick={() =>
+                                        setExpandedSeatCustomer(
+                                          isExpanded ? null : seatCustomer.id
+                                        )
+                                      }
+                                    >
+                                      <div className="flex items-center justify-between">
+                                        <div className="flex items-center space-x-4">
+                                          <div className="flex-shrink-0">
+                                            <div className="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center">
+                                              <User className="w-5 h-5 text-gray-500" />
+                                            </div>
+                                          </div>
+
+                                          <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2">
+                                              <h4 className="font-medium text-gray-900 truncate">
+                                                {seatCustomer.name ||
+                                                  "Unnamed Seat"}
+                                              </h4>
+                                              <Badge className="bg-gray-100 text-gray-800 border-gray-200">
+                                                Seat
+                                              </Badge>
+                                            </div>
+
+                                            <div className="flex items-center gap-4 mt-1">
+                                              {seatCustomer.externalCustomerId && (
+                                                <div className="flex items-center gap-1">
+                                                  <span className="text-xs text-gray-500">
+                                                    ID:
+                                                  </span>
+                                                  <code className="text-xs font-mono bg-gray-100 px-1.5 py-0.5 rounded">
+                                                    {
+                                                      seatCustomer.externalCustomerId
+                                                    }
+                                                  </code>
+                                                </div>
+                                              )}
+
+                                              {totalCredits > 0 && (
+                                                <div className="flex items-center gap-1">
+                                                  <Gift className="w-3 h-3 text-green-600" />
+                                                  <span className="text-xs text-green-600 font-medium">
+                                                    {totalCredits} credits
+                                                  </span>
+                                                </div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        </div>
+
+                                        <div className="flex items-center space-x-3">
+                                          <Badge className="bg-green-100 text-green-800 border-green-200">
+                                            Active
+                                          </Badge>
+
+                                          <div className="text-gray-400">
+                                            {isExpanded ? (
+                                              <div className="flex items-center gap-1 text-xs">
+                                                <span>Collapse</span>
+                                                <div className="w-4 h-4 flex items-center justify-center">
+                                                  <div className="w-2 h-0.5 bg-gray-400"></div>
+                                                </div>
+                                              </div>
+                                            ) : (
+                                              <div className="flex items-center gap-1 text-xs">
+                                                <span>Expand</span>
+                                                <div className="w-4 h-4 flex items-center justify-center">
+                                                  <div className="relative">
+                                                    <div className="w-2 h-0.5 bg-gray-400"></div>
+                                                    <div className="w-0.5 h-2 bg-gray-400 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"></div>
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {/* Expanded Details */}
+                                    {isExpanded && (
+                                      <div className="border-t bg-gray-50 p-4 space-y-4">
+                                        {/* Credits Section */}
+                                        {usageEntitlements.length > 0 ? (
+                                          <div>
+                                            <h5 className="text-sm font-medium text-gray-900 mb-3">
+                                              Credits & Usage
+                                            </h5>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                              {usageEntitlements.map(
+                                                (entitlement, idx) => {
+                                                  const feature =
+                                                    entitlement.feature;
+                                                  const displayName =
+                                                    featureNameMap.get(
+                                                      feature?.slug || ""
+                                                    ) ||
+                                                    feature?.slug ||
+                                                    "Unknown Feature";
+                                                  const currentUsage =
+                                                    entitlement.usages?.[0]
+                                                      ?.usage || 0;
+                                                  const creditsRemaining =
+                                                    entitlement.creditInfo
+                                                      ?.creditsRemaining || 0;
+                                                  const creditAllowance =
+                                                    entitlement.creditInfo
+                                                      ?.creditAllowance || 0;
+
+                                                  return (
+                                                    <div
+                                                      key={idx}
+                                                      className="bg-white border rounded-lg p-3"
+                                                    >
+                                                      <div className="flex justify-between items-start mb-2">
+                                                        <div>
+                                                          <h6 className="text-sm font-medium text-gray-900">
+                                                            {displayName}
+                                                          </h6>
+                                                          <code className="text-xs text-gray-500">
+                                                            {feature?.slug}
+                                                          </code>
+                                                        </div>
+                                                        <Badge
+                                                          variant="outline"
+                                                          className="text-xs"
+                                                        >
+                                                          {entitlement.source}
+                                                        </Badge>
+                                                      </div>
+
+                                                      <div className="space-y-2">
+                                                        <div className="flex justify-between text-sm">
+                                                          <span className="text-gray-600">
+                                                            Current Usage:
+                                                          </span>
+                                                          <span className="font-medium">
+                                                            {currentUsage}
+                                                          </span>
+                                                        </div>
+                                                        <div className="flex justify-between text-sm">
+                                                          <span className="text-gray-600">
+                                                            Credits Remaining:
+                                                          </span>
+                                                          <span className="font-medium text-green-600">
+                                                            {creditsRemaining} /{" "}
+                                                            {creditAllowance}
+                                                          </span>
+                                                        </div>
+
+                                                        {/* Progress bar */}
+                                                        <div className="w-full bg-gray-200 rounded-full h-2 mt-2">
+                                                          <div
+                                                            className="bg-green-500 h-2 rounded-full transition-all"
+                                                            style={{
+                                                              width: `${creditAllowance > 0 ? (creditsRemaining / creditAllowance) * 100 : 0}%`,
+                                                            }}
+                                                          ></div>
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                  );
+                                                }
+                                              )}
+                                            </div>
+                                          </div>
+                                        ) : (
+                                          <div className="text-center py-4 text-gray-500">
+                                            <Gift className="w-6 h-6 mx-auto mb-2 opacity-50" />
+                                            <p className="text-sm">
+                                              No credits or usage data available
+                                            </p>
+                                          </div>
+                                        )}
+
+                                        {/* Quick Actions */}
+                                        <div className="flex items-center justify-between pt-3 border-t">
+                                          <div className="text-xs text-gray-500">
+                                            Added:{" "}
+                                            {format(
+                                              new Date(seatCustomer.createdAt),
+                                              "MMM dd, yyyy"
+                                            )}
+                                          </div>
+                                          <div className="flex gap-2">
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              onClick={() => {
+                                                if (
+                                                  seatCustomer.externalCustomerId
+                                                ) {
+                                                  navigator.clipboard.writeText(
+                                                    seatCustomer.externalCustomerId
+                                                  );
+                                                }
+                                              }}
+                                            >
+                                              <Copy className="w-3 h-3 mr-1" />
+                                              Copy ID
+                                            </Button>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </CardContent>
+                                </Card>
+                              );
+                            })}
+                        </div>
+
+                        {/* Primary Customer Summary */}
+                        <div className="mt-6">
+                          <h4 className="text-sm font-medium text-gray-700 mb-3">
+                            Primary Customer (Current)
+                          </h4>
+                          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <h5 className="font-medium text-blue-900">
+                                  {customer?.name || "Unknown Customer"}
+                                </h5>
+                                <p className="text-sm text-blue-700 mt-1">
+                                  {customer?.email} • External ID:{" "}
+                                  {customer?.externalCustomerId}
+                                </p>
+                              </div>
+                              <Badge className="bg-green-100 text-green-800 border-green-200">
+                                Primary Customer
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-center py-8 text-muted-foreground">
+                        <User className="h-8 w-8 mx-auto mb-2 opacity-50" />
+                        <p>This customer has no linked seat customers</p>
+                        <p className="text-sm mt-1">
+                          Seat customers will appear here when added via the
+                          Seats API
                         </p>
                       </div>
                     )}

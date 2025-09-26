@@ -16,12 +16,18 @@ import {
   invoices,
   plans,
   subscriptionsScheduledChanges,
+  paymentRetries,
+  customerOrganizations,
 } from "@lumen/common/schema";
+import { enforceDunningEndAction } from "../helpers/dunning";
+import { dunningConfigs } from "@lumen/common/schema";
 import {
   createSubscriptionCore,
   generateImmediateInvoice,
   getActiveSubscriptionForCustomer,
+  getOrCreateDunningConfig,
   upgradeSubscriptionAndInvoice,
+  resumeSubscriptionAndResetCycle,
 } from "../helpers/billing";
 
 import {
@@ -34,6 +40,8 @@ import { streamSSE, SSEStreamingApi } from "hono/streaming";
 import { env } from "../env";
 
 import { TransactionType } from "../helpers";
+import { createNotificationProvider } from "../helpers/notificationProvider";
+import { merchants } from "@lumen/common/schema";
 import { calculateTaxesForPaymentFlow } from "../helpers/tax-engine";
 import {
   getPaymentProvider,
@@ -45,6 +53,8 @@ import {
   generateReturnObject,
   postProcessDodoPayment,
 } from "../helpers/paymentprovider";
+import { retryInvoicePayment } from "../helpers/paymentprovider";
+import { processPayment } from "../helpers/paymentprovider";
 import { createFreeSubscriptionForUser } from "../helpers/create-free-subscription";
 import { ContentfulStatusCode } from "hono/utils/http-status";
 
@@ -108,6 +118,7 @@ const paymentInitSchema = z.object({
     .string()
     .startsWith("pk_", { message: "Invalid public key format" }),
   userId: z.string(),
+  organizationId: z.string().optional(), // External organization identifier
   planId: createPrefixValidator(
     ID_PREFIXES.plan,
     "Invalid plan ID"
@@ -157,6 +168,7 @@ const paymentInitSchema = z.object({
     })
     .optional(),
   startTrial: z.boolean().optional(),
+  primarySeatEventTimestamp: z.string().optional(),
 });
 
 const createPaymentSchema = z.object({
@@ -284,47 +296,144 @@ async function getOrCreateLumenPaymentMethodFromPspPayment({
 }
 
 // Helper function to validate intent metadata
+// TODO: Validate metadata for failure cases
 function validateIntentMetadata(
   intentType: "payment" | "setup",
-  metadata: Record<string, string>,
+  metadata: Record<string, any> | null,
   status: string
 ): { isValid: boolean; error?: string } {
-  const {
-    customer_id,
-    plan_id,
-    price_id,
-    is_first_payment,
-    subscription_id,
-    payment_method_id,
-    subscription_details_ids_string,
-  } = metadata;
+  if (!metadata) {
+    return { isValid: false, error: "Metadata is null" };
+  }
 
-  // For recurring billing, we need customer_id and subscription_id to link payment
-  if (status === "succeeded" && is_first_payment === "false") {
-    if (
-      !customer_id ||
-      !subscription_id ||
-      !payment_method_id ||
-      !subscription_details_ids_string
-    ) {
-      const errorMessage = `Missing required metadata for recurring ${intentType} intent processing`;
-      console.error(errorMessage, metadata);
-      return {
-        isValid: false,
-        error: errorMessage,
-      };
+  const isSucceeded = status === "succeeded";
+  const isFailed = status === "failed" || status === "requires_payment_method";
+
+  const customerId = metadata.customer_id as string | undefined;
+  const planId = metadata.plan_id as string | undefined;
+  const priceId = metadata.price_id as string | undefined;
+  const isFirstPayment = metadata.is_first_payment as string | undefined;
+  const subscriptionId = metadata.subscription_id as string | undefined;
+  const paymentMethodId = metadata.payment_method_id as string | undefined;
+  const subscriptionDetailsIds = metadata.subscription_details_ids_string as
+    | string
+    | undefined;
+  const invoiceId = metadata.invoice_id as string | undefined;
+
+  if (intentType === "payment") {
+    if (isSucceeded) {
+      // Trial upgrade path uses trial_subscription_id
+      if (metadata.is_trial_upgrade === "true") {
+        const trialSubId = metadata.trial_subscription_id as string | undefined;
+        if (!trialSubId || !planId || !priceId) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for trial upgrade payment: trial_subscription_id, plan_id, price_id",
+          };
+        }
+        return { isValid: true };
+      }
+
+      // Recurring cycle (explicitly marked)
+      if (isFirstPayment === "false") {
+        if (
+          !customerId ||
+          !subscriptionId ||
+          !paymentMethodId ||
+          !subscriptionDetailsIds ||
+          !invoiceId
+        ) {
+          return {
+            isValid: false,
+            error:
+              "Missing some required metadata for recurring payment: customer_id, subscription_id, payment_method_id, subscription_details_ids_string, invoice_id",
+          };
+        }
+        return { isValid: true };
+      }
+
+      // First-time payment (default if not explicitly false)
+      if (!customerId || !planId || !priceId) {
+        return {
+          isValid: false,
+          error:
+            "Missing required metadata for first-time payment: customer_id, plan_id, price_id",
+        };
+      }
+      return { isValid: true };
     }
-  } else if (
-    status === "succeeded" &&
-    (!customer_id || !plan_id || !price_id)
-  ) {
-    // For initial payment, we need customer_id, plan_id, and price_id
-    const errorMessage = `Missing required metadata for ${intentType} intent processing: ${JSON.stringify(metadata, null, 2)}`;
-    console.error(errorMessage, metadata);
-    return {
-      isValid: false,
-      error: errorMessage,
-    };
+
+    if (isFailed) {
+      // For failed recurring payments, we expect invoice_id and payment_method_id to update failure info
+      if (isFirstPayment === "false") {
+        if (!invoiceId || !paymentMethodId) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for failed recurring payment: invoice_id, payment_method_id",
+          };
+        }
+      }
+      return { isValid: true };
+    }
+  } else if (intentType === "setup") {
+    if (isSucceeded) {
+      // Portal add-payment-method flow: allow minimal metadata
+      if (metadata.portal_pm_add === "true") {
+        if (!customerId) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for portal payment method add: customer_id",
+          };
+        }
+        return { isValid: true };
+      }
+
+      if (metadata.is_trial === "true") {
+        const trialParentPlanId = metadata.trial_parent_plan_id as
+          | string
+          | undefined;
+        const trialParentPriceId = metadata.trial_parent_price_id as
+          | string
+          | undefined;
+        if (!customerId || !trialParentPlanId || !trialParentPriceId) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for trial setup: customer_id, trial_parent_plan_id, trial_parent_price_id",
+          };
+        }
+        return { isValid: true };
+      }
+
+      if (isFirstPayment === "false" && subscriptionId) {
+        if (!customerId || !paymentMethodId) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for setup on existing subscription: customer_id, payment_method_id",
+          };
+        }
+        return { isValid: true };
+      }
+
+      // First-time setup
+      if (!customerId || !planId || !priceId) {
+        return {
+          isValid: false,
+          error:
+            "Missing required metadata for first-time setup: customer_id, plan_id, price_id",
+        };
+      }
+      return { isValid: true };
+    }
+
+    if (isFailed) {
+      // No strict requirements for setup failures beyond having some metadata
+      return { isValid: true };
+    }
   }
 
   return { isValid: true };
@@ -484,10 +593,14 @@ async function processRecurringPayment(
 
 // Process trial-to-paid upgrade from webhook
 async function processTrialUpgrade(
-  payment: typeof payments.$inferSelect & {
-    metadata: Record<string, string>;
-  }
+  payment: typeof payments.$inferSelect
 ): Promise<void> {
+  if (!payment.metadata) {
+    // should have been validated already by the validateIntentMetadata function
+    // but just for making TS happy
+    throw new Error("Missing metadata for trial upgrade");
+  }
+
   const { customer_id, plan_id, price_id, trial_subscription_id } =
     payment.metadata;
 
@@ -692,6 +805,7 @@ async function createSubscriptionAndInvoice({
   tx,
   isImmediatePayment = false,
   taxInfo,
+  primarySeatEventTimestamp,
 }: {
   merchantId: string;
   customerId: string;
@@ -722,6 +836,7 @@ async function createSubscriptionAndInvoice({
       };
     }>;
   };
+  primarySeatEventTimestamp?: Date;
 }): Promise<{
   subscription: typeof subscriptions.$inferSelect;
   invoice: typeof invoices.$inferSelect | null;
@@ -745,6 +860,7 @@ async function createSubscriptionAndInvoice({
       isImmediatePayment, // used to set cyclesBilled to 1 for immediate payments
       dangerouslyAllowMultipleSubscriptions: false,
       tx,
+      primarySeatEventTimestamp,
     });
 
     if (!subscription) {
@@ -795,6 +911,9 @@ async function processFirstTimePayment(
   }
 ): Promise<void> {
   const { customer_id, plan_id, price_id } = payment.metadata;
+  const primarySeatEventTimestamp = payment.metadata.primary_seat_event_ts
+    ? new Date(payment.metadata.primary_seat_event_ts)
+    : undefined;
 
   // Extract tax information from Payment Intent metadata
   let taxLineItems: Array<{
@@ -898,7 +1017,7 @@ async function processFirstTimePayment(
         paymentMethodId,
         tx,
         taxInfo,
-        isImmediatePayment: true,
+        primarySeatEventTimestamp,
       });
 
       subscription = createResult.subscription;
@@ -917,6 +1036,7 @@ async function processFirstTimePayment(
           currency: invoice.currency,
           status: "succeeded",
           metadata: {
+            ...payment.metadata,
             subscription_id: subscription.id,
             invoice_id: invoice.id,
           },
@@ -928,6 +1048,7 @@ async function processFirstTimePayment(
         .update(payments)
         .set({
           metadata: {
+            ...payment.metadata,
             subscription_id: subscription.id,
             invoice_id: invoice?.id || "",
           },
@@ -957,16 +1078,73 @@ async function processSetupIntent(
   const subscription_id = metadata.subscription_id;
   const is_first_payment = metadata.is_first_payment;
   const is_trial = metadata.is_trial;
+  const primarySeatEventTimestamp = metadata.primary_seat_event_ts
+    ? new Date(metadata.primary_seat_event_ts)
+    : undefined;
 
   // Trial-specific metadata
   const trial_parent_plan_id = metadata.trial_parent_plan_id;
   const trial_parent_price_id = metadata.trial_parent_price_id;
 
-  return await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     let paymentMethodId: string | null = null;
     let datetimeAtTransactionStart = new Date();
 
     try {
+      // Portal add-payment-method: just save the method and link it to the customer
+      if (metadata.portal_pm_add === "true") {
+        paymentMethodId = await getOrCreateLumenPaymentMethodFromPspPayment({
+          tx,
+          merchantId: payment.merchantId,
+          customerId: metadata.customer_id as string,
+          pspPaymentId: payment.externalPaymentId!,
+          datetimeAtTransactionStart,
+        });
+
+        if (!paymentMethodId) {
+          throw new Error("Failed to process payment method for portal add");
+        }
+
+        await tx
+          .update(payments)
+          .set({
+            paymentMethodId,
+            metadata: { ...payment.metadata, payment_method_updated: "true" },
+          })
+          .where(eq(payments.id, payment.id));
+
+        // Opportunistically set this payment method on the most recent dunning subscription
+        try {
+          const sub = await tx.query.subscriptions.findFirst({
+            where: and(
+              eq(subscriptions.customerId, metadata.customer_id as string),
+              inArray(subscriptions.status, ["past_due", "paused"])
+            ),
+            orderBy: (subscriptions, { desc }) => [
+              desc(subscriptions.createdAt),
+            ],
+          });
+          if (sub) {
+            await tx
+              .update(subscriptionDetails)
+              .set({ paymentMethodId })
+              .where(
+                and(
+                  eq(subscriptionDetails.subscriptionId, sub.id),
+                  isNull(subscriptionDetails.deletedAt)
+                )
+              );
+          }
+        } catch (e) {
+          console.warn(
+            "Failed to set PM on recent subscription during portal add",
+            e
+          );
+        }
+
+        return { paymentMethodUpdated: true };
+      }
+
       paymentMethodId = await getOrCreateLumenPaymentMethodFromPspPayment({
         tx,
         merchantId: payment.merchantId,
@@ -1020,11 +1198,18 @@ async function processSetupIntent(
           paymentMethodId: paymentMethodId,
           dangerouslyAllowMultipleSubscriptions: false,
           tx,
+          primarySeatEventTimestamp,
         });
 
       if (!subscription) {
         throw new Error("Failed to create trial subscription");
       }
+
+      // Update subscription status to "trialing" for trial subscriptions
+      await tx
+        .update(subscriptions)
+        .set({ status: "trialing" })
+        .where(eq(subscriptions.id, subscription.id));
 
       // Calculate trial end date
       const trialEndDate = new Date();
@@ -1109,6 +1294,7 @@ async function processSetupIntent(
           paymentMethodId: paymentMethodId,
           dangerouslyAllowMultipleSubscriptions: false,
           tx,
+          primarySeatEventTimestamp,
         });
 
       if (wasExistingSubscription) {
@@ -1160,93 +1346,506 @@ async function processSetupIntent(
       };
     }
   });
+
+  // After saving PM for portal adds, try to recover subscription by retrying latest unpaid invoice
+  try {
+    if (payment.metadata?.portal_pm_add === "true") {
+      const latestUnpaid = await db.query.invoices.findFirst({
+        where: and(
+          eq(invoices.customerId, payment.metadata.customer_id as string),
+          eq(invoices.merchantId, payment.merchantId),
+          eq(invoices.status, "issued")
+        ),
+        orderBy: (invoices, { desc }) => [desc(invoices.createdAt)],
+      });
+
+      if (latestUnpaid) {
+        // Compute next attempt number
+        const lastRetry = await db.query.paymentRetries.findFirst({
+          where: eq(paymentRetries.invoiceId, latestUnpaid.id),
+          orderBy: (paymentRetries, { desc }) => [
+            desc(paymentRetries.attemptNumber),
+          ],
+        });
+        const attemptNumber = (lastRetry?.attemptNumber || 0) + 1;
+
+        // Ensure there's a payment object; create retry record as pending
+        let existingPayment = await db.query.payments.findFirst({
+          where: eq(payments.invoiceId, latestUnpaid.id),
+          orderBy: (payments, { desc }) => [desc(payments.createdAt)],
+        });
+
+        if (!existingPayment) {
+          const [created] = await db
+            .insert(payments)
+            .values({
+              merchantId: payment.merchantId,
+              invoiceId: latestUnpaid.id,
+              amountCents: latestUnpaid.totalAmountCents || 0,
+              currency: latestUnpaid.currency,
+              status: "pending",
+            })
+            .returning();
+          existingPayment = created;
+        }
+
+        const [retryRecord] = await db
+          .insert(paymentRetries)
+          .values({
+            paymentId: existingPayment.id,
+            invoiceId: latestUnpaid.id,
+            attemptNumber,
+            status: "pending",
+          })
+          .returning();
+
+        await retryInvoicePayment({
+          invoiceId: latestUnpaid.id,
+          paymentRetryId: retryRecord.id,
+          attemptNumber,
+        });
+      }
+    }
+  } catch (e) {
+    console.error("Failed to queue retry after PM update:", e);
+  }
+
+  return result;
 }
 
-// Process payment intent failure from webhook
-async function processPaymentFailure(
-  payment: typeof payments.$inferSelect & {
-    metadata: Record<string, string>;
-  }
+// Handle payment intent failure events directly from webhook (top-level handler)
+async function handlePaymentFailureEvent(
+  payment: typeof payments.$inferSelect
 ) {
-  const {
-    payment_method_id,
-    invoice_id,
-    is_first_payment,
-    last_payment_error,
-  } = payment.metadata;
+  console.log("Processing payment failure event:", {
+    paymentId: payment.id,
+    status: payment.status,
+    externalPaymentId: payment.externalPaymentId,
+  });
+
+  // Validate required metadata
+  const metadataValidation = validateIntentMetadata(
+    "payment",
+    payment.metadata,
+    payment.status
+  );
+
+  if (!metadataValidation.isValid) {
+    console.error("Payment failure metadata validation failed:", {
+      paymentId: payment.id,
+      error: metadataValidation.error,
+    });
+    throw new Error(metadataValidation.error);
+  }
+
+  const payment_method_id = payment.metadata?.payment_method_id as string;
+  const invoice_id =
+    (payment.metadata?.invoice_id as string) ?? payment.invoiceId ?? null;
+  const is_first_payment = payment.metadata?.is_first_payment as string;
+  const failureMessage = payment.errorMessage || "Payment failed";
 
   console.log(
     "Processing payment failure for paymentIntent",
     payment.externalPaymentId
   );
 
-  return await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     if (
       is_first_payment === "true" ||
       is_first_payment === undefined ||
       is_first_payment === null
     ) {
-      console.log("First-time payment failed, no payment record to update");
+      console.log(
+        "First-time payment failed, no subscription to put in dunning"
+      );
       return { status: "failed", firstTimePayment: true };
     }
 
-    // Update the payment record status to "failed"
-    await tx
-      .update(payments)
-      .set({
-        status: "failed",
-        errorMessage: last_payment_error?.message || "Payment failed",
-        updatedAt: new Date(),
-      })
-      .where(eq(payments.id, payment.id));
-
-    // Update invoice status back to "issued" (not paid)
-    if (invoice_id) {
-      await tx
-        .update(invoices)
-        .set({
-          status: "issued", // Revert to issued status
-        })
-        .where(eq(invoices.id, invoice_id));
-    }
-
-    // Update payment method failure information
+    // This is a recurring payment failure - initiate dunning process
+    console.log("Recurring payment failed, initiating dunning process");
     if (payment_method_id) {
       await tx
         .update(paymentMethods)
         .set({
           lastFailedAt: new Date(),
-          failureReason: last_payment_error?.message || "Payment failed",
+          failureReason: failureMessage,
         })
         .where(eq(paymentMethods.id, payment_method_id));
     }
 
+    // Update invoice status back to "issued" (not paid) just in the unlikely case some other flow has changed it
+    if (invoice_id) {
+      await tx
+        .update(invoices)
+        .set({
+          status: "issued",
+        })
+        .where(eq(invoices.id, invoice_id));
+    }
+
+    if (invoice_id) {
+      const invoice = await tx.query.invoices.findFirst({
+        where: eq(invoices.id, invoice_id),
+        with: {
+          subscription: true,
+          customer: true,
+        },
+      });
+
+      // Attempt immediate fallback to other payment methods before dunning
+      if (invoice && invoice.customer) {
+        const customerId = invoice.customerId;
+        const attemptedIds: string[] = Array.isArray(
+          (payment.metadata as any)?.attempted_payment_method_ids
+        )
+          ? ([
+              ...new Set(
+                (payment.metadata as any)
+                  ?.attempted_payment_method_ids as string[]
+              ),
+            ] as string[])
+          : ([payment.metadata?.payment_method_id as string | undefined].filter(
+              Boolean
+            ) as string[]);
+
+        // Fetch candidate methods ordered by recency
+        const candidateMethods = await tx.query.paymentMethods.findMany({
+          where: and(
+            eq(paymentMethods.customerId, customerId),
+            isNull(paymentMethods.deletedAt)
+          ),
+          orderBy: (paymentMethods, { desc }) => [
+            desc(paymentMethods.lastUsedAt),
+          ],
+        });
+
+        // Prefer method on subscription details first (if set and not tried)
+        let preferredId: string | null = null;
+        if (invoice.subscriptionId) {
+          const sd = await tx.query.subscriptionDetails.findFirst({
+            where: and(
+              eq(subscriptionDetails.subscriptionId, invoice.subscriptionId),
+              isNull(subscriptionDetails.deletedAt)
+            ),
+          });
+          preferredId = sd?.paymentMethodId || null;
+        }
+
+        const tried = new Set(attemptedIds);
+        const ordered = [
+          ...(preferredId && !tried.has(preferredId)
+            ? candidateMethods.filter((m) => m.id === preferredId)
+            : []),
+          ...candidateMethods.filter((m) => m.id !== preferredId),
+        ];
+        const nextMethod = ordered.find((m) => !tried.has(m.id));
+
+        if (nextMethod) {
+          // Update payment record to reflect next attempt
+          const newAttempted = Array.from(
+            new Set([...attemptedIds, nextMethod.id])
+          );
+          await tx
+            .update(payments)
+            .set({
+              paymentMethodId: nextMethod.id,
+              metadata: {
+                ...(payment.metadata || {}),
+                attempted_payment_method_ids: newAttempted,
+                payment_method_id: nextMethod.id,
+                retry_reason: "webhook_failover",
+              },
+              updatedAt: new Date(),
+            })
+            .where(eq(payments.id, payment.id));
+
+          // Short-circuit dunning; we'll retry immediately after transaction
+          return { status: "retry_queued", nextPaymentMethodId: nextMethod.id };
+        }
+      }
+
+      if (invoice?.subscription && invoice.subscription.status !== "canceled") {
+        const dunningConfig = await getOrCreateDunningConfig(
+          invoice.subscription.merchantId,
+          invoice.subscription.planId
+        );
+
+        if (dunningConfig.gracePeriodDays > 0) {
+          const now = new Date();
+          const existingGraceEnd = invoice.subscription.gracePeriodEndsAt;
+          if (invoice.subscription.status === "past_due" && existingGraceEnd) {
+            if (existingGraceEnd <= now) {
+              console.log(
+                `Grace period already expired for subscription ${invoice.subscription.id}; enforcing end-of-dunning action now`
+              );
+              await enforceDunningEndAction({
+                tx,
+                subscriptionId: invoice.subscription.id,
+                action: dunningConfig.endOfDunningAction,
+                currentTimestamp: now,
+              });
+            } else {
+              console.log(
+                `Subscription ${invoice.subscription.id} already in past_due; keeping existing gracePeriodEndsAt ${existingGraceEnd.toISOString()}`
+              );
+            }
+          } else {
+            const gracePeriodEndsAt = new Date();
+            gracePeriodEndsAt.setDate(
+              gracePeriodEndsAt.getDate() + dunningConfig.gracePeriodDays
+            );
+
+            await tx
+              .update(subscriptions)
+              .set({
+                status: "past_due",
+                gracePeriodEndsAt,
+              })
+              .where(eq(subscriptions.id, invoice.subscription.id));
+
+            console.log(
+              `Subscription ${invoice.subscription.id} moved to past_due status with grace period until ${gracePeriodEndsAt.toISOString()}`
+            );
+
+            try {
+              const invFull = await tx.query.invoices.findFirst({
+                where: eq(invoices.id, invoice.id),
+                with: { customer: true, merchant: true },
+              });
+              const notify = createNotificationProvider();
+              const customerEmail = invFull?.customer?.email;
+              const merchantName =
+                invFull?.merchant?.displayName ||
+                invFull?.merchant?.legalName ||
+                "Your Service Provider";
+              if (customerEmail) {
+                await notify.sendEmail({
+                  to: customerEmail,
+                  subject: `Payment issue – action needed (${merchantName})`,
+                  html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                      <h2>We couldn't process your payment</h2>
+                      <p>Your subscription has entered a grace period. Please update your payment method to avoid interruption.</p>
+                      <p>Grace period ends on <strong>${gracePeriodEndsAt.toDateString()}</strong>.</p>
+                      <p>Best regards,<br>${merchantName}</p>
+                    </div>
+                  `,
+                  from: "noreply@getlumen.dev",
+                });
+              }
+            } catch (e) {
+              console.error("Failed to send entered-dunning email:", e);
+            }
+          }
+        } else {
+          // merchant has ZERO grace period - immediate action needed
+          console.log(
+            "No grace period configured, executing immediate action:",
+            dunningConfig.endOfDunningAction
+          );
+          await enforceDunningEndAction({
+            tx,
+            subscriptionId: invoice.subscription.id,
+            action: (dunningConfig.endOfDunningAction === "pause_subscription"
+              ? "pause_subscription"
+              : dunningConfig.endOfDunningAction === "cancel_subscription"
+                ? "cancel_subscription"
+                : "mark_as_unpaid") as any,
+            currentTimestamp: new Date(),
+          });
+        }
+      }
+    }
+
     console.info(
-      `Processed payment failure for payment ${payment.id}, invoice ${invoice_id || "N/A"}`
+      `Processed payment failure with dunning for payment ${payment.id}, invoice ${invoice_id || "N/A"}`
     );
+
+    return { status: "failed", payment };
+  });
+
+  // If we queued a retry with a different payment method, immediately attempt it now
+  if (result && "status" in result && result.status === "retry_queued") {
+    const invoiceId =
+      (payment.metadata?.invoice_id as string) ?? payment.invoiceId;
+    if (!invoiceId) {
+      return { status: "failed", payment };
+    }
+
+    // Refresh payment (to ensure we have the latest metadata/PM assignment)
+    const refreshedPayment = await db.query.payments.findFirst({
+      where: eq(payments.id, payment.id),
+    });
+
+    const invoice = await db.query.invoices.findFirst({
+      where: eq(invoices.id, invoiceId),
+      with: {
+        customer: true,
+        merchant: true,
+        subscription: true,
+      },
+    });
+
+    if (!refreshedPayment || !invoice || !invoice.customer) {
+      return { status: "failed", payment };
+    }
+
+    // Build subscription details list for metadata (if any)
+    let subDetails: { subscriptionDetailsId: string }[] = [];
+    if (invoice.subscriptionId) {
+      const subId = invoice.subscriptionId as string;
+      try {
+        subDetails = await db
+          .select({ subscriptionDetailsId: subscriptionDetails.id })
+          .from(subscriptionDetails)
+          .where(eq(subscriptionDetails.subscriptionId, subId));
+      } catch (err) {
+        console.error(
+          `Failed to fetch subscription details for invoice ${invoice.id}:`,
+          err
+        );
+      }
+    }
+
+    // Fetch the explicitly selected next PM (stored on the payment record)
+    const nextPaymentMethod = refreshedPayment.paymentMethodId
+      ? await db.query.paymentMethods.findFirst({
+          where: and(
+            eq(paymentMethods.id, refreshedPayment.paymentMethodId as string),
+            isNull(paymentMethods.deletedAt)
+          ),
+        })
+      : null;
+
+    if (!nextPaymentMethod) {
+      return { status: "failed", payment };
+    }
+
+    const inv = invoice;
+    const rp = refreshedPayment;
+
+    const context = {
+      customer: inv.customer,
+      paymentMethod: nextPaymentMethod,
+      merchantId: inv.merchantId,
+      currency: inv.currency,
+    } as const;
+
+    await processPayment({
+      context,
+      subscriptionId: inv.subscriptionId || "",
+      subDetails,
+      invoice: inv,
+      invoiceId,
+      payment: rp,
+    });
+
+    return { status: "retry_queued", payment: refreshedPayment };
+  }
+
+  return result;
+}
+
+// Handle setup intent failure events directly from webhook (top-level handler)
+async function handleSetupFailureEvent(payment: typeof payments.$inferSelect) {
+  console.log("Processing setup failure event:", {
+    paymentId: payment.id,
+    status: payment.status,
+    externalPaymentId: payment.externalPaymentId,
+  });
+
+  // Validate required metadata
+  const metadataValidation = validateIntentMetadata(
+    "setup",
+    payment.metadata,
+    payment.status
+  );
+
+  if (!metadataValidation.isValid) {
+    console.error("Setup failure metadata validation failed:", {
+      paymentId: payment.id,
+      error: metadataValidation.error,
+    });
+    throw new Error(metadataValidation.error);
+  }
+
+  const { customer_id, last_setup_error } = payment.metadata as Record<
+    string,
+    any
+  >;
+
+  console.log(
+    "Processing setup failure for setupIntent",
+    payment.externalPaymentId
+  );
+
+  return await db.transaction(async (tx) => {
+    // Update the payment record status to "failed"
+    await tx
+      .update(payments)
+      .set({
+        status: "failed",
+        errorMessage: last_setup_error?.message || "Setup failed",
+        updatedAt: new Date(),
+      })
+      .where(eq(payments.id, payment.id));
+
+    console.info(`Processed setup failure for payment ${payment.id}`);
+
+    try {
+      const notify = createNotificationProvider();
+      const cust = await tx.query.customers.findFirst({
+        where: eq(customers.id, customer_id),
+      });
+      const merch = await tx.query.merchants.findFirst({
+        where: eq(merchants.id, payment.merchantId),
+      });
+      const customerEmail = cust?.email;
+      const merchantName =
+        merch?.displayName || merch?.legalName || "Your Service Provider";
+      if (customerEmail) {
+        await notify.sendEmail({
+          to: customerEmail,
+          subject: `We couldn't set up your payment method`,
+          html: `
+            <div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">
+              <h2>Action needed to complete setup</h2>
+              <p>We couldn't set up your payment method. Please try again or use a different method.</p>
+              <p>If you continue to have trouble, contact support.</p>
+              <p>Best regards,<br>${merchantName}</p>
+            </div>
+          `,
+          from: "noreply@getlumen.dev",
+        });
+      }
+    } catch (e) {
+      console.error("Failed to send setup failure email:", e);
+    }
 
     return { status: "failed", payment };
   });
 }
 
 // Handle payment intent events from stripe AND dodo payments
-async function handlePaymentEvent(
-  payment: typeof payments.$inferSelect & {
-    metadata: Record<string, string | number | boolean>;
-  }
-) {
+async function handlePaymentEvent(payment: typeof payments.$inferSelect) {
   console.log("Processing payment event:", {
     paymentId: payment.id,
     status: payment.status,
     externalPaymentId: payment.externalPaymentId,
   });
 
-  const { is_first_payment } = payment.metadata;
+  if (!payment.metadata) {
+    // should have been validated already by the validateIntentMetadata function
+    // but just for making TS happy
+    throw new Error("Missing metadata for payment");
+  }
+
+  const is_first_payment = payment.metadata?.is_first_payment;
 
   // Validate required metadata
   const metadataValidation = validateIntentMetadata(
     "payment",
-    payment.metadata as Record<string, string>,
+    payment.metadata,
     payment.status
   );
 
@@ -1258,6 +1857,7 @@ async function handlePaymentEvent(
     throw new Error(metadataValidation.error);
   }
 
+  // This handler now only processes successful payments
   if (payment.status === "succeeded") {
     console.log("Payment succeeded, determining payment type:", {
       paymentId: payment.id,
@@ -1265,14 +1865,72 @@ async function handlePaymentEvent(
       isFirstPayment: is_first_payment,
     });
 
+    // First, check if this successful payment can recover a subscription from dunning
+    const invoiceId = payment.invoiceId as string;
+    if (invoiceId) {
+      try {
+        const invoice = await db.query.invoices.findFirst({
+          where: eq(invoices.id, invoiceId),
+          with: {
+            subscription: true,
+            customer: true,
+            merchant: true,
+          },
+        });
+
+        if (
+          invoice?.subscription &&
+          (invoice.subscription.status === "past_due" ||
+            invoice.subscription.status === "paused")
+        ) {
+          console.log(
+            `Recovering subscription ${invoice.subscription.id} from ${invoice.subscription.status} state`
+          );
+
+          await resumeSubscriptionAndResetCycle({
+            subscriptionId: invoice.subscription.id,
+            resumedAt: new Date(),
+          });
+
+          console.log(
+            `Subscription ${invoice.subscription.id} unpaused and set to active`
+          );
+
+          try {
+            const notify = createNotificationProvider();
+            const customerEmail = invoice.customer?.email;
+            const merchantName =
+              invoice.merchant?.displayName ||
+              invoice.merchant?.legalName ||
+              "Your Service Provider";
+            if (customerEmail) {
+              await notify.sendEmail({
+                to: customerEmail,
+                subject: `Payment received – your subscription is active`,
+                html: `
+                  <div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">
+                    <h2>You're back on track!</h2>
+                    <p>Your recent payment succeeded and your subscription has resumed.</p>
+                    <p>Best regards,<br>${merchantName}</p>
+                  </div>
+                `,
+                from: "noreply@getlumen.dev",
+              });
+            }
+          } catch (e) {
+            console.error("Failed to send recovery email:", e);
+          }
+        }
+      } catch (error) {
+        // Don't fail the entire payment processing if dunning recovery fails
+        console.error("Failed to recover subscription from dunning:", error);
+      }
+    }
+
     // Check for trial upgrades first
     if (payment.metadata.is_trial_upgrade === "true") {
       console.log("Processing trial upgrade payment:", payment.id);
-      return await processTrialUpgrade(
-        payment as typeof payments.$inferSelect & {
-          metadata: Record<string, string>;
-        }
-      );
+      return await processTrialUpgrade(payment);
     }
 
     // Check if this is the first payment in a recurring billing cycle
@@ -1301,36 +1959,15 @@ async function handlePaymentEvent(
       });
       throw new Error("Invalid is_first_payment value");
     }
-  } else if (payment.status === "canceled") {
-    // Payment intent was canceled
-    // For other non-success statuses like 'requires_payment_method', 'processing', etc.,
-    // we don't cancel the subscription since they may still complete successfully
-    console.log("Payment was canceled:", {
-      paymentId: payment.id,
-      externalPaymentId: payment.externalPaymentId,
-    });
-    return { status: "canceled" };
-  } else if (
-    payment.status === "requires_payment_method" &&
-    payment.metadata.last_payment_error
-  ) {
-    // Payment failed and requires a new payment method
-    console.log("Payment failed and requires new payment method:", {
-      paymentId: payment.id,
-      error: payment.metadata.last_payment_error,
-    });
-    return await processPaymentFailure(
-      payment as typeof payments.$inferSelect & {
-        metadata: Record<string, string>;
-      }
-    );
   }
 
-  console.log("Payment event processed with status:", {
+  // This function should only be called for succeeded payments
+  // All failure cases are now handled by dedicated failure handlers
+  console.log("Unexpected payment status in success handler:", {
     paymentId: payment.id,
     status: payment.status,
   });
-  return { status: payment.status };
+  throw new Error(`Unexpected payment status: ${payment.status}`);
 }
 
 // Handle setup intent events from webhook
@@ -1360,20 +1997,19 @@ async function handleSetupEvent(
     throw new Error(metadataValidation.error);
   }
 
+  // This handler now only processes successful setup intents
   if (payment.status === "succeeded") {
     console.log("Setup intent succeeded, processing:", payment.id);
     return await processSetupIntent(payment);
-  } else if (payment.status === "canceled") {
-    // Setup intent was canceled
-    console.log(`Setup intent ${payment.id} was canceled`);
-    return { status: "canceled" };
   }
 
-  console.log("Setup event processed with status:", {
+  // This function should only be called for succeeded setup intents
+  // All failure cases are now handled by dedicated failure handlers
+  console.log("Unexpected setup status in success handler:", {
     paymentId: payment.id,
     status: payment.status,
   });
-  return { status: payment.status };
+  throw new Error(`Unexpected setup status: ${payment.status}`);
 }
 
 // Handle payment link completion - payment provider agnostic
@@ -1576,7 +2212,7 @@ export const publicRoute: Hono = new Hono()
   })
   .post("/webhook-dodo/:merchant_id", async (c) => {
     const merchantId = c.req.param("merchant_id");
-    console.log("[DEBUG] Received Dodo webhook for merchant", merchantId);
+    console.log("Received Dodo webhook for merchant", merchantId);
 
     try {
       // Get the raw body for signature verification
@@ -1601,104 +2237,142 @@ export const publicRoute: Hono = new Hono()
         status: webhookPayload.data?.status,
       });
 
+      if (
+        webhookPayload.type !== "payment.succeeded" &&
+        webhookPayload.type !== "payment.failed"
+      ) {
+        console.log(
+          `Unhandled Dodo webhook event type: ${webhookPayload.type}`
+        );
+        return c.json({ received: true });
+      }
+
       // Process different event types
+      const dodoPayment = webhookPayload.data as DodoPayments.Payment;
+      if (!dodoPayment.subscription_id) {
+        throw new Error(
+          `No subscription ID found for Dodo payment: ${dodoPayment.payment_id}`
+        );
+      }
+      // this works fine for both first time payment and subsequent payments
+      const lumenPaymentId = webhookPayload.data.metadata.lumen_payment_id;
+      console.log("lumenPaymentId", lumenPaymentId);
+      let payment = await db.query.payments.findFirst({
+        where: eq(payments.id, lumenPaymentId),
+      });
+
+      if (!payment) {
+        console.error(
+          `No Lumen payment ID found for Dodo payment metadata. Dodo payment ID: ${dodoPayment.payment_id}`
+        );
+        return c.json({ received: true });
+      }
+
+      if (!payment.metadata) {
+        console.error(
+          `No metadata found for Lumen payment ID: ${lumenPaymentId}`
+        );
+        return c.json({ received: true });
+      }
+
+      console.log("Found matching payment object");
+
       if (webhookPayload.type === "payment.succeeded") {
-        const dodoPayment = webhookPayload.data as DodoPayments.Payment;
-        if (!dodoPayment.subscription_id) {
-          throw new Error(
-            `No subscription ID found for Dodo payment: ${dodoPayment.payment_id}`
-          );
-        }
-        // this works fine for both first time payment and subsequent payments
-        const lumenPaymentId = webhookPayload.data.metadata.lumen_payment_id;
-        let payment = await db.query.payments.findFirst({
-          where: eq(payments.id, lumenPaymentId),
+        console.log("Updating payment record with Dodo payment ID", {
+          paymentId: payment.id,
+          dodoPaymentId: dodoPayment.payment_id,
         });
 
-        if (!payment) {
-          console.error(
-            `No Lumen payment ID found for Dodo payment metadata. Dodo payment ID: ${dodoPayment.payment_id}`
+        // update payment record with successful status
+        [payment] = await db
+          .update(payments)
+          .set({
+            status: "succeeded",
+            // for first time payment, this is the Dodo Subscription ID so we update it to the Dodo Payment ID
+            externalPaymentId: dodoPayment.payment_id,
+          })
+          .where(eq(payments.id, payment.id))
+          .returning();
+
+        // Determine the correct handler based on payment metadata (similar to Stripe branching)
+        const metadata = payment.metadata!; // We already checked this above
+        const isCheckoutSession = "checkoutSessionId" in metadata;
+        const isTrial = metadata.is_trial === "true";
+        const amountCents = payment.amountCents || 0;
+
+        console.log("Dodo payment routing decision:", {
+          paymentId: payment.id,
+          isCheckoutSession,
+          isTrial,
+          amountCents,
+          metadata: metadata,
+        });
+
+        if (isCheckoutSession) {
+          // Handle Dodo payment link - extract details and call generic handler
+          await handlePaymentLinkEvent({
+            payment,
+            merchantId,
+            externalPaymentId: dodoPayment.payment_id,
+            paymentStatus: "succeeded",
+            paymentNotes: `Paid online via Dodo payment ${dodoPayment.payment_id}`,
+          });
+        } else if (isTrial || amountCents === 0) {
+          // Handle trials and zero-amount payments (setup intents equivalent)
+          // This mirrors Stripe's setup_intent handling for trials
+          console.log(
+            "Routing Dodo payment to setup event handler (trial/setup)"
           );
-          return c.json({ received: true });
+          await handleSetupEvent(
+            payment as typeof payments.$inferSelect & {
+              metadata: Record<string, string>;
+            }
+          );
+        } else {
+          // Handle regular payments (payment intent equivalent)
+          console.log(
+            "Routing Dodo payment to payment event handler (regular payment)"
+          );
+          await handlePaymentEvent(
+            payment as typeof payments.$inferSelect & {
+              metadata: Record<string, string>;
+            }
+          );
         }
 
-        if (!payment.metadata) {
-          console.error(
-            `No metadata found for Lumen payment ID: ${lumenPaymentId}`
-          );
-          return c.json({ received: true });
-        }
-
-        if (dodoPayment.status === "succeeded") {
-          console.log("Updating payment record with Dodo payment ID", {
-            paymentId: payment.id,
-            dodoPaymentId: dodoPayment.payment_id,
-          });
-
-          // update payment record with successful status
-          [payment] = await db
-            .update(payments)
-            .set({
-              status: "succeeded",
-              // for first time payment, this is the Dodo Subscription ID so we update it to the Dodo Payment ID
-              externalPaymentId: dodoPayment.payment_id,
-            })
-            .where(eq(payments.id, payment.id))
-            .returning();
-
-          // Determine the correct handler based on payment metadata (similar to Stripe branching)
-          const metadata = payment.metadata!; // We already checked this above
-          const isCheckoutSession = "checkoutSessionId" in metadata;
-          const isTrial = metadata.is_trial === "true";
-          const amountCents = payment.amountCents || 0;
-
-          console.log("Dodo payment routing decision:", {
-            paymentId: payment.id,
-            isCheckoutSession,
-            isTrial,
-            amountCents,
-            metadata: metadata,
-          });
-
-          if (isCheckoutSession) {
-            // Handle Dodo payment link - extract details and call generic handler
-            await handlePaymentLinkEvent({
-              payment,
-              merchantId,
-              externalPaymentId: dodoPayment.payment_id,
-              paymentStatus: "succeeded",
-              paymentNotes: `Paid online via Dodo payment ${dodoPayment.payment_id}`,
-            });
-          } else if (isTrial || amountCents === 0) {
-            // Handle trials and zero-amount payments (setup intents equivalent)
-            // This mirrors Stripe's setup_intent handling for trials
-            console.log(
-              "Routing Dodo payment to setup event handler (trial/setup)"
-            );
-            await handleSetupEvent(
-              payment as typeof payments.$inferSelect & {
-                metadata: Record<string, string>;
-              }
-            );
-          } else {
-            // Handle regular payments (payment intent equivalent)
-            console.log(
-              "Routing Dodo payment to payment event handler (regular payment)"
-            );
-            await handlePaymentEvent(
-              payment as typeof payments.$inferSelect & {
-                metadata: Record<string, string>;
-              }
-            );
+        // Mark retry record as succeeded if applicable
+        try {
+          const retryId = payment.metadata?.payment_retry_id as
+            | string
+            | undefined;
+          if (retryId) {
+            await db
+              .update(paymentRetries)
+              .set({ status: "succeeded" })
+              .where(eq(paymentRetries.id, retryId));
           }
+        } catch (e) {
+          console.warn(
+            "Failed to update Dodo payment retry status (succeeded)",
+            e
+          );
+        }
 
+        // Only post-process paid events that produced an invoice (non-setup, non-payment-link)
+        const shouldPostProcess =
+          !isCheckoutSession && !isTrial && amountCents > 0;
+        if (shouldPostProcess) {
           // Get the updated payment record to ensure we have the invoice ID
           payment = await db.query.payments.findFirst({
             where: eq(payments.id, payment.id),
           });
 
           if (!payment?.invoiceId) {
-            throw new Error("No invoice ID found for payment");
+            console.warn(
+              "Dodo payment succeeded without invoiceId; skipping post-processing",
+              { paymentId: payment?.id }
+            );
+            return c.json({ received: true });
           }
 
           // Post-process the Dodo payment: update tax info, invoice totals, and handle PDF
@@ -1708,20 +2382,53 @@ export const publicRoute: Hono = new Hono()
             invoiceId: payment.invoiceId,
             merchantId,
           });
-        } else {
-          // TODO: Handle Failures
-          console.error(
-            `Dodo payment ${dodoPayment.payment_id} failed with status ${dodoPayment.status}`
-          );
-          return c.json({ received: true });
         }
-      } else {
-        console.log(
-          `Unhandled Dodo webhook event type: ${webhookPayload.type}`
-        );
-      }
+        return c.json({ received: true });
+      } else if (webhookPayload.type === "payment.failed") {
+        try {
+          await db
+            .update(payments)
+            .set({
+              // same as before - first time payment it has the Dodo Subscription ID, subsequent payments have the Dodo Payment ID so we update it
+              externalPaymentId: dodoPayment.payment_id,
+              status: "failed",
+              errorMessage: dodoPayment.error_message,
+            })
+            .where(eq(payments.id, payment.id));
+          console.log(
+            `Dodo payment failed: ${dodoPayment.payment_id} - ${dodoPayment.error_message}`
+          );
+          await handlePaymentFailureEvent(payment);
+        } catch (e) {
+          console.warn(
+            `Failed to set externalPaymentId for failed Dodo payment ${dodoPayment.payment_id}`,
+            e
+          );
+        }
 
-      return c.json({ received: true });
+        // Mark retry record as failed if applicable
+        try {
+          const retryId = payment.metadata?.payment_retry_id as
+            | string
+            | undefined;
+          if (retryId) {
+            await db
+              .update(paymentRetries)
+              .set({
+                status: "failed",
+                errorMessage: dodoPayment.error_message,
+              })
+              .where(eq(paymentRetries.id, retryId));
+          }
+        } catch (e) {
+          console.warn(
+            "Failed to update Dodo payment retry status (failed)",
+            e
+          );
+        }
+
+        return c.json({ received: true });
+      }
     } catch (error) {
       console.error("Dodo webhook error:", error);
       return c.json(
@@ -1738,6 +2445,7 @@ export const publicRoute: Hono = new Hono()
   .post("/webhook/:merchant_id", async (c) => {
     const merchantId = c.req.param("merchant_id");
 
+    // these should match the events allowed at the time of webhook creation in routes/stripe.ts
     const supportedEventTypes = [
       "payment_intent.",
       "setup_intent.",
@@ -1795,6 +2503,13 @@ export const publicRoute: Hono = new Hono()
 
       const obj = event.data.object as SupportedEvent;
 
+      if (obj.metadata?.is_checkout_session === "true") {
+        console.log(
+          `Received Stripe webhook for merchant ${merchantId}: Skipping checkout session event type: ${event.type}`
+        );
+        return c.json({ received: true }, 200);
+      }
+
       // Prepare the broadcast data for SSE
       const broadcastData = prepareEventBroadcastData(event, merchantId);
 
@@ -1840,12 +2555,7 @@ export const publicRoute: Hono = new Hono()
       if (!payment) {
         const errorMessage = `Payment not found for externalPaymentId: ${obj.id}, lumenPaymentId: ${lumenPaymentId}`;
         console.error(errorMessage);
-        if (obj.metadata?.is_checkout_session === "true") {
-          // do not retry. it's the PI from the checkout session. This will be handled in the checkout.session.success flow
-          return c.json({ error: errorMessage }, 200);
-        } else {
-          return c.json({ error: errorMessage }, 404);
-        }
+        return c.json({ error: errorMessage }, 404);
       }
 
       if (!payment?.metadata) {
@@ -1860,24 +2570,68 @@ export const publicRoute: Hono = new Hono()
         )}`
       );
 
-      // Process different event types
-      if (event.type.startsWith("payment_intent.")) {
-        payment.metadata = {
-          ...payment.metadata,
-          ...((obj as Stripe.PaymentIntent).last_payment_error
-            ? {
-                last_payment_error: (obj as Stripe.PaymentIntent)
-                  .last_payment_error,
-              }
-            : {}),
-        };
-        await handlePaymentEvent(
-          payment as typeof payments.$inferSelect & {
-            // metadata not being null is not automatically inferred by the type
-            metadata: Record<string, string>;
+      // Process different event types - handle failures at top level
+      if (event.type === "payment_intent.payment_failed") {
+        // Handle payment failure events directly
+        const lastPaymentError = (obj as Stripe.PaymentIntent)
+          .last_payment_error;
+        // try to update the payment record
+        const updatedPayment = await db
+          .update(payments)
+          .set({
+            status: "failed",
+            errorMessage: lastPaymentError?.message,
+          })
+          .where(eq(payments.id, payment.id))
+          .returning();
+        try {
+          const retryId = updatedPayment[0]?.metadata?.payment_retry_id as
+            | string
+            | undefined;
+
+          if (retryId) {
+            await db
+              .update(paymentRetries)
+              .set({
+                status: "failed", // it was set to pending on the retry attempt
+                errorMessage: lastPaymentError?.message,
+              })
+              .where(eq(paymentRetries.id, retryId));
           }
-        );
-      } else if (event.type.startsWith("setup_intent.")) {
+        } catch (e) {
+          console.warn("Failed to update payment retry status (failed)", e);
+        }
+        await handlePaymentFailureEvent(updatedPayment[0]);
+      } else if (event.type === "setup_intent.setup_failed") {
+        // Handle setup failure events directly
+        const lastSetupError = (obj as Stripe.SetupIntent).last_setup_error;
+        const updatedPayment = await db
+          .update(payments)
+          .set({
+            status: "failed",
+            errorMessage: lastSetupError?.message,
+          })
+          .where(eq(payments.id, payment.id))
+          .returning();
+        await handleSetupFailureEvent(updatedPayment[0]);
+      } else if (event.type === "payment_intent.succeeded") {
+        // Handles successful payment events and recovers from dunning
+        await handlePaymentEvent(payment);
+        try {
+          const retryId = payment.metadata?.payment_retry_id as
+            | string
+            | undefined;
+          if (retryId) {
+            await db
+              .update(paymentRetries)
+              .set({ status: "succeeded" })
+              .where(eq(paymentRetries.id, retryId));
+          }
+        } catch (e) {
+          console.warn("Failed to update payment retry status (succeeded)", e);
+        }
+      } else if (event.type === "setup_intent.succeeded") {
+        // Handle successful setup events
         await handleSetupEvent(
           payment as typeof payments.$inferSelect & {
             // metadata not being null is not automatically inferred by the type
@@ -2156,12 +2910,6 @@ export const publicRoute: Hono = new Hono()
       return c.json({ error: "Plan not found" }, 404);
     }
 
-    const paymentProvider = await getPaymentProvider(apiKeyData.merchantId);
-    if (!paymentProvider.isPaymentProviderReady) {
-      console.error(paymentProvider.statusMessage);
-      return c.json({ error: paymentProvider.statusMessage }, 400);
-    }
-
     // Fetch Price data first (read-only operation)
     const price = await db.query.prices.findFirst({
       where: and(
@@ -2222,17 +2970,60 @@ export const publicRoute: Hono = new Hono()
       hasUsageComponentWithNonZeroPrice
     );
 
+    const paymentProvider = await getPaymentProvider(apiKeyData.merchantId);
+
     // Handle database mutations in a transaction
     try {
       const result = await db.transaction(async (tx) => {
         let customer: typeof customers.$inferSelect;
+        let targetCustomerId = data.userId; // Default to userId for backward compatibility
+
+        // Handle organization-based subscription creation for seat plans
+        if (data.organizationId) {
+          // Look up organization by external ID, create if it doesn't exist
+          let organization = await tx.query.customerOrganizations.findFirst({
+            where: and(
+              eq(customerOrganizations.externalOrgId, data.organizationId),
+              eq(customerOrganizations.merchantId, apiKeyData.merchantId),
+              isNull(customerOrganizations.deletedAt)
+            ),
+          });
+
+          if (organization && organization.billingCustomerId) {
+            // Use the organization's billing customer for the subscription
+            const billingCustomer = await tx.query.customers.findFirst({
+              where: and(
+                eq(customers.id, organization.billingCustomerId),
+                eq(customers.merchantId, apiKeyData.merchantId),
+                isNull(customers.deletedAt)
+              ),
+            });
+
+            if (billingCustomer && billingCustomer.externalCustomerId) {
+              targetCustomerId = billingCustomer.externalCustomerId;
+              console.log(
+                `Using existing organization billing customer: ${organization.billingCustomerId} (external: ${targetCustomerId})`
+              );
+            } else {
+              console.warn(
+                `Organization ${organization.id} has invalid billingCustomerId: ${organization.billingCustomerId}`
+              );
+            }
+          } else if (!organization) {
+            // Organization doesn't exist - we'll create it after customer creation
+            console.log(
+              `Organization ${data.organizationId} not found, will create after customer upsert`
+            );
+          }
+        }
+
         try {
           customer = await upsertCustomer({
             merchantId: apiKeyData.merchantId,
             email: data.customerEmail,
             name: data.customerName,
             businessName: data.businessName,
-            externalCustomerId: data.userId,
+            externalCustomerId: targetCustomerId,
             billingAddressLine1: data.customerAddress,
             billingAddressLine2: data.customerAddressLine2,
             billingCity: data.customerCity,
@@ -2253,47 +3044,112 @@ export const publicRoute: Hono = new Hono()
 
         console.log("Customer in payment-init:", customer);
         if (!customer.pspCustomerId) {
-          console.log(
-            `Creating new PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`
-          );
-          const pspCustomer = await createPspCustomer({
-            paymentProvider,
-            customer: {
-              id: customer.id,
-              email: customer.email || "",
-              name: customer.name || "",
-            },
+          if (paymentProvider.isPaymentProviderReady) {
+            console.log(
+              `Creating new PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`
+            );
+            const pspCustomer = await createPspCustomer({
+              paymentProvider,
+              customer: {
+                id: customer.id,
+                email: customer.email || "",
+                name: customer.name || "",
+              },
+            });
+
+            if (!pspCustomer) {
+              return {
+                error: `Failed to create PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`,
+                code: 500,
+              };
+            }
+
+            try {
+              console.log(
+                `Updating local customer with PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`
+              );
+              const updatedCustomer = await tx
+                .update(customers)
+                .set({
+                  pspCustomerId: pspCustomer.id,
+                })
+                .where(
+                  and(
+                    eq(customers.id, customer.id),
+                    isNull(customers.deletedAt)
+                  )
+                )
+                .returning();
+              customer = updatedCustomer[0]; // Assign the updated customer back
+            } catch (error) {
+              // We were unable to update the customer object with the correct PSP ID
+              // This can lead to really bad problems down the line so we should throw an error
+              return {
+                error:
+                  "Failed to update customer with Stripe ID. Please contact support.",
+                code: 500,
+              };
+            }
+          } else {
+            console.log(
+              "Skipping creating PSP Customer ID: ",
+              paymentProvider.statusMessage
+            );
+          }
+        }
+
+        // Create organization if organizationId was provided but not found
+        if (data.organizationId) {
+          let organization = await tx.query.customerOrganizations.findFirst({
+            where: and(
+              eq(customerOrganizations.externalOrgId, data.organizationId),
+              eq(customerOrganizations.merchantId, apiKeyData.merchantId),
+              isNull(customerOrganizations.deletedAt)
+            ),
           });
 
-          if (!pspCustomer) {
-            return {
-              error: `Failed to create PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`,
-              code: 500,
-            };
-          }
+          if (!organization) {
+            // Create new organization with this customer as billing customer
+            const [createdOrg] = await tx
+              .insert(customerOrganizations)
+              .values({
+                merchantId: apiKeyData.merchantId,
+                externalOrgId: data.organizationId,
+                billingCustomerId: customer.id,
+              })
+              .returning();
 
-          try {
             console.log(
-              `Updating local customer with PSP Customer ID in ${paymentProvider.name} for customer ${customer.id}`
+              `Created new organization ${createdOrg.id} for external org ${data.organizationId} with billing customer ${customer.id}`
             );
-            const updatedCustomer = await tx
+
+            // Update customer to link to the organization with primary role
+            await tx
               .update(customers)
               .set({
-                pspCustomerId: pspCustomer.id,
+                customerOrganizationId: createdOrg.id,
+                orgRole: "primary",
               })
-              .where(
-                and(eq(customers.id, customer.id), isNull(customers.deletedAt))
-              )
-              .returning();
-            customer = updatedCustomer[0]; // Assign the updated customer back
-          } catch (error) {
-            // We were unable to update the customer object with the correct PSP ID
-            // This can lead to really bad problems down the line so we should throw an error
-            return {
-              error:
-                "Failed to update customer with Stripe ID. Please contact support.",
-              code: 500,
-            };
+              .where(eq(customers.id, customer.id));
+          } else if (!organization.billingCustomerId) {
+            // Update organization to use this customer as billing customer
+            await tx
+              .update(customerOrganizations)
+              .set({ billingCustomerId: customer.id })
+              .where(eq(customerOrganizations.id, organization.id));
+
+            // Update customer to link to the organization with primary role
+            await tx
+              .update(customers)
+              .set({
+                customerOrganizationId: organization.id,
+                orgRole: "primary",
+              })
+              .where(eq(customers.id, customer.id));
+
+            console.log(
+              `Updated organization ${organization.id} billing customer to ${customer.id}`
+            );
           }
         }
 
@@ -2305,6 +3161,9 @@ export const publicRoute: Hono = new Hono()
           price_id: price.id,
           platform_user_id: data.userId,
           invoice_id: "",
+          ...(data.primarySeatEventTimestamp && {
+            primary_seat_event_ts: data.primarySeatEventTimestamp,
+          }),
         } as Record<string, string>;
 
         // Handle trial activation if requested
@@ -2448,6 +3307,9 @@ export const publicRoute: Hono = new Hono()
               metadata,
             })
             .returning();
+
+          console.log("created payment row in payment-init", payment[0].id);
+          console.log("metadata", payment[0].metadata);
 
           const paymentAuthorization = await createPspPaymentAuthorization({
             plan,

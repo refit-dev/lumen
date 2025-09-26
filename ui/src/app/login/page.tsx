@@ -235,7 +235,7 @@ export default function SignIn() {
                       case "INVALID_EMAIL_OR_PASSWORD":
                         // Could be either user doesn't exist OR wrong password
                         // Try signing up to provide unified UX
-                        setSuccess("Attempting to create account...");
+                        setSuccess("Creating account...");
 
                         const signUpResponse = await signUp.email({
                           email,

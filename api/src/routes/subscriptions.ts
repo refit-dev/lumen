@@ -12,14 +12,16 @@ import {
   subscriptionDetails as subscriptionDetailsTable,
   creditGrants,
   subscriptionsScheduledChanges,
-  plans,
 } from "@lumen/common/schema";
 import {
   associateFeaturesWithSubscription,
   SubscriptionFeatureEntryInput,
   createSubscriptionCore,
   triggerImmediateBillingIfNeeded,
+  getOrCreateDunningConfig,
+  resumeSubscriptionAndResetCycle,
 } from "../helpers/billing";
+import { enforceDunningEndAction } from "../helpers/dunning";
 import { FeatureValue } from "../helpers/index";
 import {
   createFreeSubscriptionForUser,
@@ -33,6 +35,7 @@ import {
   invoices as invoicesTable,
 } from "@lumen/common/schema";
 import { issuePspRefund } from "../helpers/paymentprovider";
+import { createRefundAdjustmentInvoice } from "../helpers/refund-documents";
 
 const subscriptionApiSchema = subscriptionsInsertSchema
   .omit({
@@ -79,7 +82,10 @@ const deleteSubscription = async (
     // End the subscription
     await db
       .update(subscriptions)
-      .set({ endTimestamp: currentTimestamp })
+      .set({
+        endTimestamp: currentTimestamp,
+        status: "canceled", // Set proper dunning status
+      })
       .where(eq(subscriptions.id, subscription.id));
 
     // Soft delete all subscription details linked to this subscription
@@ -588,17 +594,32 @@ export const subscriptionsRouter = new Hono()
 
     console.log("data", data);
     try {
-      const { subscription: newSubscription } = await createSubscriptionCore({
-        merchantId,
-        customerId: data.customerId,
-        planId: data.planId,
-        effectivePriceId: data.effectivePriceId,
-        startTimestamp: data.startTimestamp
-          ? new Date(data.startTimestamp)
-          : new Date(),
-        dangerouslyAllowMultipleSubscriptions:
-          data.dangerouslyAllowMultipleSubscriptions ?? false,
-      });
+      const { subscription: newSubscription, wasExistingSubscription } =
+        await createSubscriptionCore({
+          merchantId,
+          customerId: data.customerId,
+          planId: data.planId,
+          effectivePriceId: data.effectivePriceId,
+          startTimestamp: data.startTimestamp
+            ? new Date(data.startTimestamp)
+            : new Date(),
+          dangerouslyAllowMultipleSubscriptions:
+            data.dangerouslyAllowMultipleSubscriptions ?? false,
+        });
+
+      // If an existing active subscription was found, return an error
+      if (wasExistingSubscription) {
+        return c.json<{
+          error: string;
+          existingSubscriptionId: string;
+        }>(
+          {
+            error: "Customer already has an active subscription.",
+            existingSubscriptionId: newSubscription.stableSubscriptionId,
+          },
+          409
+        );
+      }
 
       // Check if we need to trigger immediate billing for bill_immediately components
       await triggerImmediateBillingIfNeeded({
@@ -960,7 +981,44 @@ export const subscriptionsRouter = new Hono()
         });
 
         // Persist refund record and update payment aggregation
+        let createdAdjustmentInvoiceId: string | undefined = undefined;
         await db.transaction(async (tx) => {
+          // Generate adjustment document (cancellation for full first refund; credit note otherwise)
+          let adjustmentInvoiceId: string | undefined = undefined;
+
+          const originalInvoice = payment!.invoiceId
+            ? await tx.query.invoices.findFirst({
+                where: eq(invoicesTable.id, payment!.invoiceId),
+                with: {
+                  lineItems: true,
+                  customer: true,
+                  merchant: true,
+                },
+              })
+            : null;
+
+          if (originalInvoice) {
+            const prevRefunded = payment!.refundedAmountCents || 0;
+            const refundableRemaining =
+              (payment!.amountCents || 0) - prevRefunded;
+            const isFirstRefund = prevRefunded === 0;
+            const isFullThisRefund =
+              refundResult.amountCents >= refundableRemaining && isFirstRefund;
+
+            const created = await createRefundAdjustmentInvoice({
+              tx,
+              merchantId,
+              originalInvoiceId: originalInvoice.id,
+              documentType: isFullThisRefund ? "cancellation" : "credit_note",
+              amountCents: isFullThisRefund
+                ? undefined
+                : refundResult.amountCents,
+              reason: reason || null,
+            });
+            adjustmentInvoiceId = created?.id;
+            createdAdjustmentInvoiceId = created?.id;
+          }
+
           await tx.insert(refundsTable).values({
             merchantId,
             paymentId: payment!.id,
@@ -969,6 +1027,7 @@ export const subscriptionsRouter = new Hono()
             currency: payment!.currency,
             status: refundResult.status,
             reason: reason || null,
+            adjustmentInvoiceId: adjustmentInvoiceId || null,
           });
 
           const newRefunded =
@@ -1002,6 +1061,7 @@ export const subscriptionsRouter = new Hono()
             amountCents: refundResult.amountCents,
           },
           terminated: !!terminateSubscription,
+          adjustmentInvoiceId: createdAdjustmentInvoiceId || null,
         });
       } catch (error) {
         const errorMessage: string =
@@ -1036,5 +1096,150 @@ export const subscriptionsRouter = new Hono()
       });
 
       return c.json(response, status);
+    }
+  )
+  // Pause a subscription (manual control)
+  .post(
+    "/:id/pause",
+    zValidator("param", z.object({ id: z.string() })),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const stableId = c.req.valid("param").id;
+
+      const subscription = await db.query.subscriptions.findFirst({
+        where: and(
+          eq(subscriptions.stableSubscriptionId, stableId),
+          eq(subscriptions.merchantId, merchantId),
+          isNull(subscriptions.deletedAt)
+        ),
+      });
+
+      if (!subscription) {
+        return c.json(
+          { error: "Subscription not found or access denied" },
+          404
+        );
+      }
+
+      await db
+        .update(subscriptions)
+        .set({ status: "paused", gracePeriodEndsAt: null })
+        .where(eq(subscriptions.id, subscription.id));
+
+      return c.json({ success: true, status: "paused" });
+    }
+  )
+  // Resume a subscription (from paused)
+  .post(
+    "/:id/resume",
+    zValidator("param", z.object({ id: z.string() })),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const stableId = c.req.valid("param").id;
+
+      const subscription = await db.query.subscriptions.findFirst({
+        where: and(
+          eq(subscriptions.stableSubscriptionId, stableId),
+          eq(subscriptions.merchantId, merchantId),
+          isNull(subscriptions.deletedAt)
+        ),
+      });
+
+      if (!subscription) {
+        return c.json(
+          { error: "Subscription not found or access denied" },
+          404
+        );
+      }
+
+      // Reset billing cycle and credits on resume
+      await resumeSubscriptionAndResetCycle({
+        subscriptionId: subscription.id,
+        resumedAt: new Date(),
+      });
+
+      return c.json({ success: true, status: "active" });
+    }
+  )
+  // Reactivate a subscription from unpaid (resume billing)
+  .post(
+    "/:id/reactivate",
+    zValidator("param", z.object({ id: z.string() })),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const stableId = c.req.valid("param").id;
+
+      const subscription = await db.query.subscriptions.findFirst({
+        where: and(
+          eq(subscriptions.stableSubscriptionId, stableId),
+          eq(subscriptions.merchantId, merchantId),
+          isNull(subscriptions.deletedAt)
+        ),
+      });
+
+      if (!subscription) {
+        return c.json(
+          { error: "Subscription not found or access denied" },
+          404
+        );
+      }
+
+      if (subscription.status !== "unpaid") {
+        return c.json(
+          { error: "Reactivate is allowed only for unpaid subscriptions" },
+          400
+        );
+      }
+
+      await db
+        .update(subscriptions)
+        .set({ status: "active", gracePeriodEndsAt: null, endTimestamp: null })
+        .where(eq(subscriptions.id, subscription.id));
+
+      return c.json({ success: true, status: "active" });
+    }
+  )
+  // Enforce dunning action immediately for a subscription
+  .post(
+    "/:id/enforce-dunning-now",
+    zValidator("param", z.object({ id: z.string() })),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const stableId = c.req.valid("param").id;
+
+      const subscription = await db.query.subscriptions.findFirst({
+        where: and(
+          eq(subscriptions.stableSubscriptionId, stableId),
+          eq(subscriptions.merchantId, merchantId),
+          isNull(subscriptions.deletedAt)
+        ),
+      });
+
+      if (!subscription) {
+        return c.json(
+          { error: "Subscription not found or access denied" },
+          404
+        );
+      }
+
+      const dunningConfig = await getOrCreateDunningConfig(
+        merchantId,
+        subscription.planId
+      );
+
+      await db.transaction(async (tx) => {
+        await enforceDunningEndAction({
+          tx,
+          subscriptionId: subscription.id,
+          action: (dunningConfig.endOfDunningAction === "pause_subscription"
+            ? "pause_subscription"
+            : dunningConfig.endOfDunningAction === "cancel_subscription"
+              ? "cancel_subscription"
+              : "mark_as_unpaid") as any,
+          currentTimestamp: new Date(),
+        });
+      });
+
+      return c.json({ success: true });
     }
   );

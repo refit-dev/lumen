@@ -15,6 +15,7 @@ export const ID_PREFIXES = {
   // Core business entities (customer-facing, more descriptive)
   merchant: "mer_",
   customer: "cus_",
+  customerOrganization: "org_",
   subscription: "sub_int_",
   stableSubscription: "sub_",
   plan: "plan_int_",
@@ -63,6 +64,9 @@ export const ID_PREFIXES = {
   pricingTable: "price_table_",
   pricingTablePlan: "price_table_plan_",
 
+  // Plan enrollment rules
+  planEnrollmentRule: "plan_enroll_rule_",
+
   // Credit definitions
   creditDefinition: "cred_def_",
   creditGrant: "cred_",
@@ -70,6 +74,10 @@ export const ID_PREFIXES = {
 
   // Billing session for transaction tracking
   billingSession: "bill_sess_",
+
+  // Dunning management
+  dunningConfig: "dunning_",
+  paymentRetry: "pay_retry_",
 
   // Tax configuration
   merchantTaxConfig: "mer_tax_cfg_",

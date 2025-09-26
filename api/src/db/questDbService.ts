@@ -1004,6 +1004,35 @@ class QuestDbService {
     }
   }
 
+  /**
+   * Execute a raw SQL command (INSERT/UPDATE/DELETE) against QuestDB via PG wire
+   * Returns the affected row count. Intended for maintenance/testing utilities.
+   */
+  public async executeCommand(
+    sqlText: string,
+    values: any[] = []
+  ): Promise<{ rowCount: number } | { error: string }> {
+    if (this.explicitlyClosed) {
+      return { error: "Command failed: QuestDB service explicitly closed." };
+    }
+    if (!this.isConnected || !this.pgPool) {
+      return { error: "QuestDB PG Pool not connected or initialized." };
+    }
+    const pgClient = await this.pgPool.connect();
+    try {
+      const result: QueryResult = await pgClient.query(sqlText, values);
+      return { rowCount: result.rowCount ?? 0 };
+    } catch (error) {
+      this.logger.error("Failed to execute raw command via PG", {
+        error: String(error),
+        sql: sqlText,
+      });
+      return { error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      pgClient.release();
+    }
+  }
+
   // Helper to build SQL for querying events
   private buildEventSql(params: EventQueryParams): {
     sql: string;

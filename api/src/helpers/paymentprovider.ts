@@ -15,26 +15,19 @@ import { invoices, invoiceLineItems } from "@lumen/common/schema";
 import { env } from "../env";
 import fs from "fs";
 import { Webhook } from "standardwebhooks";
-import { sendEmail } from "./emails";
 import { getSecretOrEnvVar } from "./secrets";
-import { slackLog } from "./slack";
+import { createNotificationProvider } from "./notificationProvider";
 import { merchants } from "@lumen/common/schema";
 import { getObjectStorageUrl, uploadFile, generatePresignedUrl } from "./s3";
 import type { TransactionType } from "./";
-import { configure, tasks } from "@trigger.dev/sdk/v3";
-import type { sendInvoiceEmailJob } from "../../trigger/jobs/sendInvoiceEmail";
 import type { InvoiceCompleteAPI } from "./invoices";
 import { formatInvoiceWithDetailsToCompleteAPI } from "./invoices";
+import { sendInvoiceEmail } from "./invoiceEmail";
 
-// Configure Trigger.dev for server-side triggering
-configure({
-  secretKey: (await getSecretOrEnvVar({
-    secretNameTemplate: "lumen/*/trigger-secret-key",
-    envVariableName: "TRIGGER_SECRET_KEY",
-    throwOnDevError: true,
-    throwOnStagingOrProdError: true,
-  })) as string,
-});
+const notify = createNotificationProvider({ NODE_ENV: env.NODE_ENV });
+
+const NO_PAYMENT_PROVIDER_CONFIGURED_ERROR =
+  "No payment provider configured. If you are the developer of this app during testing: you can add Stripe Test keys in https://getlumen.dev/developer/paymentprovider";
 
 export type PaymentProvider =
   | {
@@ -172,7 +165,7 @@ export const getPaymentProvider = async (
     stripeIntegration: null,
     dodoIntegration: null,
     isPaymentProviderReady: false,
-    statusMessage: "No payment provider configured",
+    statusMessage: NO_PAYMENT_PROVIDER_CONFIGURED_ERROR,
   };
 };
 
@@ -240,7 +233,13 @@ const getPspCustomerId = async (
     });
     return dodoCustomer.customer_id;
   }
-  throw new Error("No payment provider configured");
+  throw new Error(NO_PAYMENT_PROVIDER_CONFIGURED_ERROR);
+};
+
+const throwErrorIfNotReady = (paymentProvider: PaymentProvider) => {
+  if (!paymentProvider.isPaymentProviderReady) {
+    throw new Error(paymentProvider.statusMessage);
+  }
 };
 
 const createPspPayment = async ({
@@ -260,11 +259,12 @@ const createPspPayment = async ({
   paymentMethod: typeof paymentMethods.$inferSelect;
   subscriptionId?: string;
   lumenPaymentId: string;
-  metadata: Record<string, string>;
+  metadata: Record<string, string | number | boolean | null>;
 }): Promise<{
   id: string;
   status: string;
 }> => {
+  throwErrorIfNotReady(paymentProvider);
   if (paymentProvider.name === "stripe") {
     const stripe = await createStripeClient(paymentProvider);
     // Create and confirm payment intent
@@ -308,7 +308,7 @@ const createPspPayment = async ({
       throw e;
     }
   }
-  throw new Error("No payment provider configured");
+  throw new Error(NO_PAYMENT_PROVIDER_CONFIGURED_ERROR);
 };
 
 export const processPayment = async ({
@@ -351,6 +351,18 @@ export const processPayment = async ({
       context.customer.pspCustomerId = customerWithPspId.pspCustomerId;
     }
 
+    const attemptedExisting = Array.isArray(
+      (payment.metadata as any)?.attempted_payment_method_ids
+    )
+      ? ([
+          ...new Set([
+            ...(((payment.metadata as any)
+              ?.attempted_payment_method_ids as string[]) || []),
+            context.paymentMethod.id,
+          ] as string[]),
+        ] as string[])
+      : ([context.paymentMethod.id] as string[]);
+
     const metadata = {
       customer_id: context.customer.id,
       merchant_id: context.customer.merchantId,
@@ -361,7 +373,23 @@ export const processPayment = async ({
       payment_method_id: context.paymentMethod.id,
       is_first_payment: "false",
       invoice_id: invoiceId,
+      attempted_payment_method_ids: attemptedExisting,
     };
+
+    const pspMetadata = {
+      ...metadata,
+      attempted_payment_method_ids: attemptedExisting.join(","),
+    };
+
+    await db
+      .update(payments)
+      .set({
+        metadata: {
+          ...(payment.metadata || {}),
+          ...metadata,
+        },
+      })
+      .where(eq(payments.id, payment.id));
 
     const pspPayment = await createPspPayment({
       paymentProvider,
@@ -371,12 +399,8 @@ export const processPayment = async ({
       paymentMethod: context.paymentMethod,
       subscriptionId,
       lumenPaymentId: payment.id,
-      metadata, // For info purposes only, we only rely on payments.metadada
+      metadata: pspMetadata, // For info purposes only, we only rely on payments.metadada
     });
-
-    if (pspPayment.status !== "succeeded") {
-      throw new Error(`Payment failed: ${pspPayment.status}`);
-    }
 
     logger.info(
       `Created ${paymentProvider.name} payment ${pspPayment.id} for customer ${context.customer.id}`
@@ -388,7 +412,6 @@ export const processPayment = async ({
         .update(payments)
         .set({
           externalPaymentId: pspPayment.id,
-          metadata,
         })
         .where(eq(payments.id, payment.id));
 
@@ -408,42 +431,211 @@ export const processPayment = async ({
         paymentIntentId: pspPayment.id,
         invoiceId: invoiceId,
         paymentId: payment.id,
-        status: "succeeded",
-        message: "Payment successfully processed",
+        status: pspPayment.status,
+        message: "Payment initiated; awaiting webhook for final status",
       },
     };
   } catch (paymentProcessingError) {
-    // Update payment status to failed in a new transaction
-    await db.transaction(async (tx) => {
-      await tx
-        .update(payments)
-        .set({
-          status: "failed",
-          errorMessage:
-            paymentProcessingError instanceof Error
-              ? paymentProcessingError.message
-              : "Unknown error",
-        })
-        .where(eq(payments.id, payment.id));
-    });
+    // Keep payment pending; set error message and at least stamp metadata so webhook can proceed
+    try {
+      const fallbackMetadata = {
+        customer_id: context.customer.id,
+        merchant_id: context.customer.merchantId,
+        subscription_id: subscriptionId,
+        subscription_details_ids_string: subDetails
+          .map((d: any) => d.subscriptionDetailsId)
+          .join(","),
+        payment_method_id: context.paymentMethod?.id,
+        is_first_payment: "false",
+        invoice_id: invoiceId,
+      } as Record<string, string>;
+
+      await db.transaction(async (tx) => {
+        await tx
+          .update(payments)
+          .set({
+            status: "pending",
+            errorMessage:
+              paymentProcessingError instanceof Error
+                ? paymentProcessingError.message
+                : "Unknown error",
+            metadata: {
+              ...fallbackMetadata,
+              ...(payment.metadata || {}),
+            },
+          })
+          .where(eq(payments.id, payment.id));
+      });
+    } catch (e) {
+      logger.warn(
+        `Failed to persist pending payment metadata after error: ${
+          e instanceof Error ? e.message : String(e)
+        }`
+      );
+    }
 
     // Don't re-throw - return failure response instead
     logger.error(
-      `Payment failed for customer ${context.customer.id}: ${paymentProcessingError}`
+      `Payment failed for customer ${context.customer.id}: ${
+        paymentProcessingError instanceof Error
+          ? paymentProcessingError.message
+          : String(paymentProcessingError)
+      }`
     );
 
     return {
       type: "success", // Transaction was successful, but payment failed
       response: {
-        success: false,
+        success: true,
         invoiceId: invoiceId,
         paymentId: payment.id,
-        status: "failed",
-        message:
-          paymentProcessingError instanceof Error
-            ? paymentProcessingError.message
-            : "Payment processing failed",
+        status: "pending",
+        message: "Payment initiation errored; awaiting webhook or manual retry",
       },
+    };
+  }
+};
+
+/**
+ * Retries charging an existing unpaid invoice by reusing the latest payment record.
+ * Creates a new PSP payment intent and updates the existing payment record metadata to reflect retry context.
+ * The final outcome is handled asynchronously via webhooks; this function only triggers the attempt.
+ */
+export const retryInvoicePayment = async ({
+  invoiceId,
+  paymentRetryId,
+  attemptNumber,
+}: {
+  invoiceId: string;
+  paymentRetryId: string;
+  attemptNumber: number;
+}): Promise<{
+  queued: boolean;
+  message?: string;
+  paymentId?: string;
+}> => {
+  try {
+    const invoice = await db.query.invoices.findFirst({
+      where: eq(invoices.id, invoiceId),
+      with: {
+        customer: true,
+        merchant: true,
+        subscription: {
+          with: {
+            plan: true,
+          },
+        },
+      },
+    });
+
+    if (!invoice) {
+      return { queued: false, message: "Invoice not found" };
+    }
+
+    if (invoice.status === "paid") {
+      return { queued: false, message: "Invoice already paid" };
+    }
+
+    // Get customer's latest payment method
+    const paymentMethod = await db.query.paymentMethods.findFirst({
+      where: and(
+        eq(paymentMethods.customerId, invoice.customerId),
+        isNull(paymentMethods.deletedAt)
+      ),
+      orderBy: (paymentMethods, { desc }) => [desc(paymentMethods.lastUsedAt)],
+    });
+
+    if (!paymentMethod) {
+      return { queued: false, message: "No payment method found for customer" };
+    }
+
+    // Reuse the latest payment for this invoice if present
+    let payment = await db.query.payments.findFirst({
+      where: eq(payments.invoiceId, invoiceId),
+      orderBy: (payments, { desc }) => [desc(payments.createdAt)],
+    });
+
+    if (!payment) {
+      // Fallback: create a payment record to track the retry (rare case)
+      // this should never happen - we create the payment object with the invoice
+      // but just in case, we'll create it here
+      console.log(`No payment found for invoice ${invoiceId}, creating one`);
+      const created = await db
+        .insert(payments)
+        .values({
+          merchantId: invoice.merchantId,
+          invoiceId: invoiceId,
+          paymentMethodId: paymentMethod.id,
+          amountCents: invoice.totalAmountCents,
+          currency: invoice.currency,
+          status: "pending",
+        })
+        .returning();
+      payment = created[0];
+    }
+
+    // Stamp retry metadata on the payment prior to PSP attempt for webhook correlation
+    try {
+      const tmpPayment = await db
+        .update(payments)
+        .set({
+          metadata: {
+            ...(payment.metadata || {}),
+            is_dunning_retry: "true",
+            retry_attempt_number: String(attemptNumber),
+            payment_retry_id: paymentRetryId,
+          },
+        })
+        .where(eq(payments.id, payment.id))
+        .returning();
+      if (!tmpPayment || !tmpPayment[0]) throw new Error("Payment not found");
+      payment = tmpPayment[0];
+    } catch (e) {
+      console.warn("Failed to stamp retry metadata on payment", e);
+    }
+
+    // Build subscription details list if needed
+    let subDetails: { subscriptionDetailsId: string }[] = [];
+    if (invoice.subscriptionId) {
+      try {
+        subDetails = await db
+          .select({ subscriptionDetailsId: subscriptionDetails.id })
+          .from(subscriptionDetails)
+          .where(
+            eq(subscriptionDetails.subscriptionId, invoice.subscriptionId)
+          );
+      } catch (err) {
+        console.error(
+          `Failed to fetch subscription details for invoice ${invoice.id}:`,
+          err
+        );
+      }
+    }
+
+    const context = {
+      customer: invoice.customer,
+      paymentMethod,
+      merchantId: invoice.merchantId,
+      currency: invoice.currency,
+    };
+
+    // Trigger PSP charge with retry metadata; webhook will finalize
+    await processPayment({
+      context,
+      subscriptionId: invoice.subscriptionId || "",
+      subDetails,
+      invoice,
+      invoiceId,
+      payment,
+    });
+
+    return { queued: true, paymentId: payment.id };
+  } catch (err) {
+    console.error("Error queueing invoice retry:", err);
+    return {
+      queued: false,
+      message:
+        err instanceof Error ? err.message : "Unknown error queuing retry",
     };
   }
 };
@@ -461,6 +653,7 @@ export const ensurePspCustomerExists = async ({
   customerId: string;
   merchantId: string;
 }): Promise<typeof customers.$inferSelect & { pspCustomerId: string }> => {
+  throwErrorIfNotReady(paymentProvider);
   // Get customer data from database
   const customerData = await db.query.customers.findFirst({
     where: and(
@@ -725,25 +918,9 @@ export const createOneTimePaymentLink = async ({
           merchantRecord?.legalName ||
           "Your Service Provider";
 
-        const resendApiKey =
-          env.NODE_ENV === "production"
-            ? await getSecretOrEnvVar({
-                secretNameTemplate: "lumen/*/resend-api-key",
-                envVariableName: "RESEND_API_KEY",
-                throwOnDevError: false,
-                throwOnStagingOrProdError: true,
-              })
-            : null;
-
         const invoiceNumber = invoice.customerInvoiceNumber || invoice.id;
 
-        if (env.NODE_ENV === "production") {
-          if (!resendApiKey) {
-            logger.error(
-              "RESEND_API_KEY is required to send payment link emails in production"
-            );
-          } else {
-            const emailBody = `
+        const emailBody = `
               <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
                 <h2>Invoice Payment</h2>
                 <p>Dear ${customerWithPspId.name},</p>
@@ -762,42 +939,21 @@ export const createOneTimePaymentLink = async ({
               </div>
             `;
 
-            const result = await sendEmail({
-              to: customerWithPspId.email!,
-              subject: `Invoice payment from ${merchantName}`,
-              body: emailBody,
-              from: "noreply@getlumen.dev",
-              resendApiKey,
-            });
+        const result = await notify.sendEmail({
+          to: customerWithPspId.email!,
+          subject: `Invoice payment from ${merchantName}`,
+          html: emailBody,
+          from: "noreply@getlumen.dev",
+        });
 
-            if (!("success" in result && result.success)) {
-              logger.error(
-                `Failed to send payment link email for invoice ${invoice.id}: ${"error" in result ? String(result.error) : "unknown error"}`
-              );
-            } else {
-              logger.info(
-                `Sent payment link email to ${customerWithPspId.email} for invoice ${invoice.id}`
-              );
-            }
-          }
-        } else if (env.NODE_ENV === "staging") {
-          await slackLog(
-            `Would send payment link email (env: ${env.NODE_ENV})\nInvoice: ${invoiceNumber}\nCustomer: ${customerWithPspId.name} <${customerWithPspId.email}>\nMerchant: ${merchantName}\nLink: ${subscription.payment_link}`
+        if (!result.success) {
+          logger.error(
+            `Failed to process payment link notification for invoice ${invoice.id}: ${result.error ?? "unknown error"}`
           );
-        } else if (env.NODE_ENV === "development") {
-          console.log("================");
-          console.log("Would send payment link email (env: development)");
-          console.log("Invoice: ", invoiceNumber);
-          console.log(
-            "Customer: ",
-            customerWithPspId.name,
-            customerWithPspId.email
-          );
-          console.log("Merchant: ", merchantName);
-          console.log("Link: ", subscription.payment_link);
-          console.log("================");
         } else {
-          console.log("Unhandled environment: ", env.NODE_ENV);
+          logger.info(
+            `Processed payment link notification to ${customerWithPspId.email} for invoice ${invoice.id}`
+          );
         }
       } catch (emailError) {
         logger.error(
@@ -816,7 +972,7 @@ export const createOneTimePaymentLink = async ({
     }
   } else {
     throw new Error(
-      "No payment provider configured for one-time payment links"
+      "One time payment links error: " + NO_PAYMENT_PROVIDER_CONFIGURED_ERROR
     );
   }
 };
@@ -887,14 +1043,38 @@ export const chargeInvoice = async ({
       };
     }
 
-    // Get customer's payment method
-    const paymentMethod = await db.query.paymentMethods.findFirst({
-      where: and(
-        eq(paymentMethods.customerId, invoice.customerId),
-        isNull(paymentMethods.deletedAt)
-      ),
-      orderBy: (paymentMethods, { desc }) => [desc(paymentMethods.lastUsedAt)],
-    });
+    // Get payment method: prefer the one set on subscription details if available
+    let paymentMethod: typeof paymentMethods.$inferSelect | null = null;
+    if (invoice.subscriptionId) {
+      const subDetail = await db.query.subscriptionDetails.findFirst({
+        where: and(
+          eq(subscriptionDetails.subscriptionId, invoice.subscriptionId),
+          isNull(subscriptionDetails.deletedAt)
+        ),
+      });
+      if (subDetail?.paymentMethodId) {
+        const pm = await db.query.paymentMethods.findFirst({
+          where: and(
+            eq(paymentMethods.id, subDetail.paymentMethodId),
+            isNull(paymentMethods.deletedAt)
+          ),
+        });
+        paymentMethod = pm ?? null;
+      }
+    }
+
+    if (!paymentMethod) {
+      const pm = await db.query.paymentMethods.findFirst({
+        where: and(
+          eq(paymentMethods.customerId, invoice.customerId),
+          isNull(paymentMethods.deletedAt)
+        ),
+        orderBy: (paymentMethods, { desc }) => [
+          desc(paymentMethods.lastUsedAt),
+        ],
+      });
+      paymentMethod = pm ?? null;
+    }
 
     if (!paymentMethod) {
       // Create payment record for tracking
@@ -1067,7 +1247,7 @@ export const chargeCustomerWithAmount = async ({
   error?: string;
 }> => {
   try {
-    // Get customer and their payment method
+    // Get customer
     const customer = await db.query.customers.findFirst({
       where: and(
         eq(customers.id, customerId),
@@ -1084,8 +1264,8 @@ export const chargeCustomerWithAmount = async ({
       };
     }
 
-    // Get customer's active payment method
-    const paymentMethod = await db.query.paymentMethods.findFirst({
+    // Get all active customer's payment methods ordered by recency
+    const candidateMethods = await db.query.paymentMethods.findMany({
       where: and(
         eq(paymentMethods.customerId, customerId),
         isNull(paymentMethods.deletedAt)
@@ -1093,10 +1273,10 @@ export const chargeCustomerWithAmount = async ({
       orderBy: (paymentMethods, { desc }) => [desc(paymentMethods.lastUsedAt)],
     });
 
-    if (!paymentMethod || !paymentMethod.externalPspPaymentMethodId) {
+    if (!candidateMethods || candidateMethods.length === 0) {
       return {
         success: false,
-        message: "No stored payment method found for customer",
+        message: "No stored payment methods found for customer",
         error: "missing_payment_method",
       };
     }
@@ -1119,16 +1299,25 @@ export const chargeCustomerWithAmount = async ({
           customerId,
           merchantId,
         });
-
         customer.pspCustomerId = customerWithPspId.pspCustomerId;
       }
 
-      // Create payment record first
-      const paymentRecord = await db
+      const method = candidateMethods.find(
+        (m) => !!m.externalPspPaymentMethodId
+      );
+      if (!method) {
+        return {
+          success: false,
+          message: "No usable payment method found",
+          error: "missing_payment_method",
+        };
+      }
+
+      const [paymentRecord] = await db
         .insert(payments)
         .values({
           merchantId,
-          paymentMethodId: paymentMethod.id,
+          paymentMethodId: method.id,
           amountCents,
           currency,
           status: "pending",
@@ -1137,48 +1326,47 @@ export const chargeCustomerWithAmount = async ({
             ...metadata,
             customer_id: customerId,
             merchant_id: merchantId,
-          },
+            payment_method_id: method.id,
+            attempted_payment_method_ids: [method.id],
+          } as Record<string, any>,
         })
         .returning();
-      if (!paymentRecord || paymentRecord.length === 0) {
+      if (!paymentRecord) {
         throw new Error("Failed to create payment record");
       }
 
-      // Create and confirm PaymentIntent
       const paymentIntent = await stripe.paymentIntents.create({
         amount: amountCents,
         currency: currency,
-        customer: customer.pspCustomerId,
-        payment_method: paymentMethod.externalPspPaymentMethodId,
+        customer: customer.pspCustomerId!,
+        payment_method: method.externalPspPaymentMethodId!,
         description,
         metadata: {
           // For info purposes only, we only rely on payments.metadada
           customer_id: customerId,
           merchant_id: merchantId,
-          lumen_payment_id: paymentRecord[0].id,
+          lumen_payment_id: paymentRecord.id,
           ...metadata,
+          payment_method_id: method.id,
+          attempted_payment_method_ids: [method.id].join(","),
         },
       });
 
-      // Update payment record with successful charge
       await db
         .update(payments)
-        .set({
-          externalPaymentId: paymentIntent.id,
-        })
-        .where(eq(payments.id, paymentRecord[0].id));
+        .set({ externalPaymentId: paymentIntent.id })
+        .where(eq(payments.id, paymentRecord.id));
 
       await stripe.paymentIntents.confirm(paymentIntent.id, {
         off_session: true,
       });
 
-      // Update payment method's last used timestamp
-      await db
-        .update(paymentMethods)
-        .set({ lastUsedAt: new Date() })
-        .where(eq(paymentMethods.id, paymentMethod.id));
-
       if (paymentIntent.status === "succeeded") {
+        await db
+          .update(paymentMethods)
+          .set({ lastUsedAt: new Date() })
+          .where(eq(paymentMethods.id, method.id));
+
         return {
           success: true,
           pspPaymentId: paymentIntent.id,
@@ -1203,74 +1391,83 @@ export const chargeCustomerWithAmount = async ({
         };
       }
     } else if (paymentProvider.name === "dodo") {
-      try {
-        const client = await createDodoClient(paymentProvider);
+      const client = await createDodoClient(paymentProvider);
 
-        if (!targetPlan?.pspPlanId) {
-          return {
-            success: false,
-            message:
-              "Plan doesn't have a pspPlanId pointing to Dodo Subscription ID",
-            error: "plan_not_configured_for_dodo",
-          };
+      if (!targetPlan?.pspPlanId) {
+        return {
+          success: false,
+          message:
+            "Plan doesn't have a pspPlanId pointing to Dodo Subscription ID",
+          error: "plan_not_configured_for_dodo",
+        };
+      }
+
+      // Ensure customer has Dodo customer ID using generic function
+      if (!customer.pspCustomerId) {
+        const customerWithPspId = await ensurePspCustomerExists({
+          paymentProvider,
+          customerId,
+          merchantId,
+        });
+        customer.pspCustomerId = customerWithPspId.pspCustomerId;
+      }
+
+      const method = candidateMethods.find(
+        (m) => !!m.externalPspPaymentMethodId
+      );
+      if (!method) {
+        return {
+          success: false,
+          message: "No usable payment method found",
+          error: "missing_payment_method",
+        };
+      }
+
+      const [payment] = await db
+        .insert(payments)
+        .values({
+          merchantId,
+          paymentMethodId: method.id,
+          amountCents,
+          currency,
+          status: "pending",
+          metadata: {
+            ...metadata,
+            customer_id: customerId,
+            merchant_id: merchantId,
+            payment_method_id: method.id,
+            attempted_payment_method_ids: [method.id],
+          } as Record<string, any>,
+        })
+        .returning();
+
+      const charge = await client.subscriptions.charge(
+        method.externalPspPaymentMethodId!,
+        {
+          product_description: description,
+          product_price: amountCents,
+          metadata: {
+            customer_id: customerId,
+            merchant_id: merchantId,
+            payment_id: payment.id,
+            lumen_payment_id: payment.id,
+            ...metadata,
+            payment_method_id: method.id,
+            attempted_payment_method_ids: [method.id].join(","),
+          },
         }
+      );
 
-        // Ensure customer has Dodo customer ID using generic function
-        if (!customer.pspCustomerId) {
-          const customerWithPspId = await ensurePspCustomerExists({
-            paymentProvider,
-            customerId,
-            merchantId,
-          });
+      await db
+        .update(payments)
+        .set({ externalPaymentId: charge.payment_id })
+        .where(eq(payments.id, payment.id));
 
-          customer.pspCustomerId = customerWithPspId.pspCustomerId;
-        }
-
-        // Create payment record first
-        const [payment] = await db
-          .insert(payments)
-          .values({
-            merchantId,
-            paymentMethodId: paymentMethod.id,
-            amountCents,
-            currency,
-            status: "pending",
-            metadata: {
-              ...metadata,
-              customer_id: customerId,
-              merchant_id: merchantId,
-            },
-          })
-          .returning();
-
-        const charge = await client.subscriptions.charge(
-          paymentMethod.externalPspPaymentMethodId!,
-          {
-            product_description: description,
-            product_price: amountCents,
-            metadata: {
-              customer_id: customerId,
-              merchant_id: merchantId,
-              payment_id: payment.id,
-              lumen_payment_id: payment.id,
-              ...metadata,
-            },
-          }
-        );
-
-        // Update payment record with successful charge
-        await db
-          .update(payments)
-          .set({
-            externalPaymentId: charge.payment_id,
-          })
-          .where(eq(payments.id, payment.id));
-
-        // Update payment method's last used timestamp
+      if (charge.payment_id) {
         await db
           .update(paymentMethods)
           .set({ lastUsedAt: new Date() })
-          .where(eq(paymentMethods.id, paymentMethod.id));
+          .where(eq(paymentMethods.id, method.id));
 
         return {
           success: true,
@@ -1278,23 +1475,17 @@ export const chargeCustomerWithAmount = async ({
           status: "succeeded",
           message: "Payment successful",
         };
-      } catch (error) {
-        logger.error(
-          `Error charging Dodo customer: ${error instanceof Error ? error.message : JSON.stringify(error)}`
-        );
-        return {
-          success: false,
-          message:
-            error instanceof Error
-              ? error.message
-              : "Dodo payment failed" + JSON.stringify(error),
-          error: "dodo_charge_failed",
-        };
       }
+
+      return {
+        success: false,
+        message: "Payment failed",
+        error: "charge_failed",
+      };
     } else {
       return {
         success: false,
-        message: "No payment provider configured for merchant",
+        message: NO_PAYMENT_PROVIDER_CONFIGURED_ERROR,
         error: "no_payment_provider",
       };
     }
@@ -1381,8 +1572,6 @@ export const verifyPaymentProviderWebhook = async ({
       "webhook-timestamp": (c.req.header("webhook-timestamp") || "") as string,
     };
 
-    console.log("[DEBUG] Webhook headers:", webhookHeaders);
-
     // Verify all required headers are present
     if (
       !webhookHeaders["webhook-id"] ||
@@ -1410,6 +1599,7 @@ export const verifyPaymentProviderWebhook = async ({
 };
 
 const createPspClient = async (paymentProvider: PaymentProvider) => {
+  throwErrorIfNotReady(paymentProvider);
   try {
     if (paymentProvider.name === "stripe") {
       return await createStripeClient(paymentProvider);
@@ -1444,6 +1634,7 @@ export const getPspPaymentMethodDetailsFromPayment = async ({
   cardNetwork?: string;
   metadata?: Record<string, string>;
 }> => {
+  throwErrorIfNotReady(paymentProvider);
   const client = pspClient || (await createPspClient(paymentProvider));
 
   if (paymentProvider.name === "stripe") {
@@ -1574,7 +1765,7 @@ export const issuePspRefund = async ({
     return { id: externalId, status, amountCents: returnedAmount };
   }
 
-  throw new Error("No payment provider configured");
+  throw new Error(NO_PAYMENT_PROVIDER_CONFIGURED_ERROR);
 };
 
 export const createPspCustomer = async ({
@@ -1592,6 +1783,7 @@ export const createPspCustomer = async ({
   name: string;
   email: string;
 } | null> => {
+  throwErrorIfNotReady(paymentProvider);
   if (paymentProvider.name === "stripe") {
     const stripe = await createStripeClient(paymentProvider);
     const stripeCustomer = await stripe.customers.create({
@@ -1665,6 +1857,7 @@ export const createPspPaymentAuthorization = async ({
   plan: typeof plans.$inferSelect;
   lumenPaymentId: string;
 }): Promise<PaymentAuthorization | null> => {
+  throwErrorIfNotReady(paymentProvider);
   if (paymentProvider.name === "stripe") {
     const stripe = await createStripeClient(paymentProvider);
     let intent: Stripe.SetupIntent | Stripe.PaymentIntent;
@@ -1818,15 +2011,13 @@ export const postProcessDodoPayment = async ({
   invoiceId: string;
   merchantId: string;
 }): Promise<void> => {
-  let emailPayload: {
+  const emailPayload: {
     invoice: InvoiceCompleteAPI;
     fileName: string;
     pdfUrl: string;
     invoiceNumber: string;
     pdfBuffer?: Buffer;
-  } | null = null;
-
-  await db.transaction(async (tx) => {
+  } | null = await db.transaction(async (tx) => {
     console.log(
       `Post-processing Dodo payment ${dodoPayment.payment_id} for invoice ${invoiceId}`
     );
@@ -1968,7 +2159,7 @@ export const postProcessDodoPayment = async ({
             ? invoiceWithDetails.customerInvoiceNumber.trim()
             : `INV-${invoiceWithDetails.id.substring(0, 8)}`;
 
-        emailPayload = {
+        return {
           invoice: pdfInvoice,
           fileName,
           pdfUrl: presignedPdfUrl,
@@ -1987,26 +2178,28 @@ export const postProcessDodoPayment = async ({
     console.log(
       `Successfully post-processed Dodo payment ${dodoPayment.payment_id} for invoice ${invoiceId}`
     );
+    return null;
   });
 
-  // Trigger the email job outside the transaction
+  console.log("Dodo payment post-processed, processing email payload");
+
+  // Send invoice email outside the transaction
   try {
     if (emailPayload) {
-      await tasks.trigger<typeof sendInvoiceEmailJob>(
-        "send-invoice-email",
-        emailPayload
-      );
+      await sendInvoiceEmail({
+        invoice: emailPayload.invoice,
+        pdfBuffer: emailPayload.pdfBuffer,
+        pdfUrl: emailPayload.pdfUrl,
+        invoiceNumber: emailPayload.invoiceNumber,
+      });
     }
-  } catch (emailTriggerError) {
-    logger.error(
-      `Failed to trigger sendInvoiceEmailJob for invoice ${invoiceId}`,
-      {
-        invoiceId,
-        error:
-          emailTriggerError instanceof Error
-            ? emailTriggerError.message
-            : String(emailTriggerError),
-      }
-    );
+  } catch (emailSendError) {
+    logger.error(`Failed to send invoice email for invoice ${invoiceId}`, {
+      invoiceId,
+      error:
+        emailSendError instanceof Error
+          ? emailSendError.message
+          : String(emailSendError),
+    });
   }
 };

@@ -37,6 +37,7 @@ import {
   stripe as stripeSchema,
   dodo as dodoSchema,
   customers,
+  customerOrganizations,
   user,
   organization,
   merchants,
@@ -45,6 +46,9 @@ import {
   taxRateDefinitions,
   merchantTaxConfig,
   refunds,
+  paymentRetries,
+  dunningConfigs,
+  planEnrollmentRules,
 } from "@lumen/common/schema";
 
 import dotenv from "dotenv";
@@ -137,6 +141,7 @@ export const cleanupDataFull = async (
     await db.execute(sql`
       DELETE FROM ${creditUsageTransactions};
       DELETE FROM ${refunds};
+      DELETE FROM ${paymentRetries};
       DELETE FROM ${payments};
       DELETE FROM ${invoiceLineItems};
       DELETE FROM ${invoices};
@@ -159,6 +164,11 @@ export const cleanupDataFull = async (
       DELETE FROM ${creditDefinitions};
     `);
 
+    // Fourth batch: Clean up dunning configs that reference plans and merchants
+    await db.execute(sql`
+      DELETE FROM ${dunningConfigs};
+    `);
+
     // Fifth batch: Clean up prices and dependent records
     await db.execute(sql`
       DELETE FROM ${prices};
@@ -168,11 +178,13 @@ export const cleanupDataFull = async (
       DELETE FROM ${metrics};
       DELETE FROM ${pricingTablePlans};
       DELETE FROM ${pricingTables};
+      DELETE FROM ${planEnrollmentRules};
       DELETE FROM ${plans};
       DELETE FROM ${customers};
+      DELETE FROM ${customerOrganizations};
     `);
 
-    // Fourth batch: Clean up tax tables in correct dependency order
+    // Sixth batch: Clean up tax tables in correct dependency order
     await db.execute(sql`
       DELETE FROM ${taxRegistrations};
       DELETE FROM ${usNexusConfig};

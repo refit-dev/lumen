@@ -14,7 +14,6 @@ import {
   createTestApiClient,
   createTestPlanWithFeatures,
   createTestPrice,
-  createTestStripe,
   createTestCustomer,
   cleanupDataFull,
 } from "../test-helpers";
@@ -29,20 +28,21 @@ import {
   invoiceLineItems,
   subscriptionDetails,
 } from "@lumen/common/schema";
-import { eq, and, ne, sql } from "drizzle-orm";
-import { spawn, ChildProcess } from "child_process";
+import { eq, and, ne } from "drizzle-orm";
+import { ChildProcess } from "child_process";
 import { promises as fs } from "fs";
-import { setTimeout as sleep } from "timers/promises";
-import path from "path";
+import { sleep } from "../test-helpers/sleep";
+// import { setTimeout as sleep } from "timers/promises";
 import { processBillingCycle } from "../../trigger/helpers/billing";
-import {
-  collectPaymentJob,
-  collectPaymentPayloadSchema,
-} from "../../trigger/jobs/collectPayment";
+import { collectPaymentJob } from "../../trigger/jobs/collectPayment";
 import { env } from "../../src/env";
 import { z } from "zod";
+import {
+  createPaymentProvider,
+  PaymentProviderAdapter,
+} from "../test-helpers/paymentProvider";
 
-type CollectPaymentJobPayload = z.infer<typeof collectPaymentPayloadSchema>;
+type CollectPaymentJobPayload = any;
 
 // Define the type for batch items
 type BatchItem = { payload: CollectPaymentJobPayload };
@@ -73,39 +73,11 @@ describe("Recurring Payment Flow", () => {
   let stripeWebhookSecret: string;
   let stripeClient: Stripe;
   let webhookProcess: ChildProcess | null = null;
+  let paymentProvider: PaymentProviderAdapter;
   const tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
   const tempMerchantIdFile = "/tmp/test_merchant_id.txt";
 
   let collectPaymentJobTriggerSpy: ReturnType<typeof spyOn>;
-
-  // Helper function to find the Stripe CLI
-  async function findStripeCLI(): Promise<string | null> {
-    try {
-      const proc = await Bun.spawn(["which", "stripe"], { stdout: "pipe" });
-      const stdout = await new Response(proc.stdout).text();
-      const result = stdout.trim();
-      if (result) return result;
-    } catch (e) {
-      /* ignore */
-    }
-
-    const possiblePaths = [
-      "/usr/local/bin/stripe",
-      "/opt/homebrew/bin/stripe",
-      path.join(process.env.HOME || "", ".local/bin/stripe"),
-      process.env.STRIPE_CLI_PATH, // Allow overriding via env var
-    ];
-    for (const p of possiblePaths) {
-      if (!p) continue;
-      try {
-        await fs.access(p, fs.constants.X_OK);
-        return p;
-      } catch (e) {
-        /* ignore */
-      }
-    }
-    return null;
-  }
 
   const cleanupWebhook = async () => {
     if (webhookProcess && !webhookProcess.killed) {
@@ -149,6 +121,7 @@ describe("Recurring Payment Flow", () => {
     const { merchant: globalMerchant, user: globalUser } =
       await createFullTestEnvironment();
     merchantId = globalMerchant.id; // Set the global merchantId
+    paymentProvider = await createPaymentProvider();
 
     await fs.writeFile(tempMerchantIdFile, merchantId); // Write the correct merchantId
 
@@ -158,58 +131,9 @@ describe("Recurring Payment Flow", () => {
     );
     sessionToken = authResponse.cookies.sessionToken;
 
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
-    const stripeCLIPath = await findStripeCLI();
-    if (stripeCLIPath) {
-      // Get live webhook secret from `stripe listen --print-secret`
-      const secretProc = Bun.spawnSync([
-        stripeCLIPath,
-        "listen",
-        "--print-secret",
-        "--api-key",
-        stripeSecretKey,
-      ]);
-      if (secretProc.exitCode === 0) {
-        const liveWebhookSecret = secretProc.stdout.toString().trim();
-        await fs.writeFile(tempWebhookSecretFile, liveWebhookSecret); // Use this live secret
-        console.log(
-          `Saved live webhook secret to ${tempWebhookSecretFile} for merchant ${merchantId}`
-        );
-
-        webhookProcess = spawn(
-          stripeCLIPath,
-          [
-            "listen",
-            "--forward-to",
-            `${apiUrl}/public/webhook/${merchantId}`, // Use the specific merchantId
-            "--api-key",
-            stripeSecretKey,
-            "--events",
-            "payment_intent.succeeded,payment_intent.payment_failed", // Listen to specific events
-          ],
-          { detached: true, stdio: "ignore" }
-        );
-        console.log(
-          `Recurring payment webhook listener started with PID ${webhookProcess.pid} for merchant ${merchantId}`
-        );
-        await sleep(2000); // Give listener time to start
-      } else {
-        console.error("Failed to get live webhook secret:", secretProc.stderr);
-        console.warn(
-          "Stripe CLI --print-secret failed. Webhook listener may not use the correct secret."
-        );
-      }
-    } else {
-      console.warn(
-        "Stripe CLI not found, live webhook tests will likely fail."
-      );
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
   });
 
   afterAll(async () => {

@@ -7,17 +7,46 @@ import { db } from "../../src/db/client";
 import { payments as paymentsTable } from "@lumen/common/schema";
 import { eq } from "drizzle-orm";
 import { DodoPayments } from "dodopayments";
+import Stripe from "stripe";
 
 export type PaymentProviderName = "stripe" | "dodo";
 
 export type IntentType = "payment_intent" | "setup_intent" | string;
 
+export type PaymentInitTaxData = {
+  taxableAmount: number;
+  totalTaxCents: number;
+  effectiveTaxRate: number;
+  jurisdiction: string;
+  calculationMethod: "auto" | "manual" | "exempt";
+  taxLineItems: Array<{
+    type: "tax";
+    description: string;
+    subtotalCents: number;
+    taxMetadata?: Record<string, unknown>;
+  }>;
+};
+
 export interface PaymentProviderAdapter {
+  name: PaymentProviderName;
   initialize(): Promise<void>;
   registerIntegration(merchantId: string): Promise<void>;
   startWebhookForwarder(merchantId: string): Promise<void>;
+  firstTaxCalculation(params: {
+    apiClient: any;
+    publishableApiKey: string;
+    planId: string;
+    priceId: string;
+    subtotalCents: number;
+    currency: string;
+    customerCountry?: string;
+    customerStateProvince?: string;
+    taxId?: string;
+    businessName?: string;
+  }): Promise<PaymentInitTaxData | undefined>;
   completePaymentInit(
-    paymentInitResponse: ReturnType<typeof generateReturnObject>
+    paymentInitResponse: ReturnType<typeof generateReturnObject>,
+    opts?: { stripePaymentMethodId?: string }
   ): Promise<void>;
   waitForWebhooks(ms?: number): Promise<void>;
   cleanup(): Promise<void>;
@@ -45,6 +74,7 @@ export async function createPaymentProvider(
 }
 
 class StripeAdapter implements PaymentProviderAdapter {
+  name: PaymentProviderName = "stripe";
   private stripeClient: any;
   private webhookProcess: ChildProcess | null = null;
   private tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
@@ -52,7 +82,6 @@ class StripeAdapter implements PaymentProviderAdapter {
 
   async initialize(): Promise<void> {
     const secretKey = testEnv.TEST_STRIPE_SECRET_KEY;
-    const Stripe = (await import("stripe")).default;
     this.stripeClient = new Stripe(secretKey, {
       apiVersion: "2025-02-24.acacia",
     });
@@ -69,6 +98,14 @@ class StripeAdapter implements PaymentProviderAdapter {
   }
 
   async startWebhookForwarder(merchantId: string): Promise<void> {
+    // Always write merchant id file so local mocks can read it even if Stripe CLI is unavailable
+    // @ts-ignore
+    if (Stripe.isMock) {
+      console.log(`[stripe-mock] Writing merchant id file: ${merchantId}`);
+      await fs.writeFile(this.tempMerchantIdFile, merchantId);
+      return;
+    }
+
     const stripeCLIPath = await resolveCliBinary(
       ["stripe"],
       [
@@ -82,8 +119,6 @@ class StripeAdapter implements PaymentProviderAdapter {
       console.log("Stripe CLI not found, webhook listener will not be started");
       return;
     }
-
-    await fs.writeFile(this.tempMerchantIdFile, merchantId);
 
     const secretProcess = spawn(stripeCLIPath, [
       "listen",
@@ -122,8 +157,48 @@ class StripeAdapter implements PaymentProviderAdapter {
     await this.waitForWebhooks(1000);
   }
 
+  async firstTaxCalculation(params: {
+    apiClient: any;
+    publishableApiKey: string;
+    planId: string;
+    priceId: string;
+    subtotalCents: number;
+    currency: string;
+    customerCountry?: string;
+    customerStateProvince?: string;
+    taxId?: string;
+    businessName?: string;
+  }): Promise<PaymentInitTaxData | undefined> {
+    const resp = await params.apiClient.public["calculate-tax"].$post({
+      json: {
+        lumenPublishableKey: params.publishableApiKey,
+        planId: params.planId,
+        priceId: params.priceId,
+        subtotalCents: params.subtotalCents,
+        currency: params.currency,
+        customerCountry: params.customerCountry,
+        customerStateProvince: params.customerStateProvince,
+        taxId: params.taxId,
+        businessName: params.businessName,
+      },
+    });
+    const data = await resp.json();
+    if ("error" in data) throw new Error(String((data as any).error));
+    const taxCalc = (data as any).taxCalculation;
+    if (!taxCalc) return undefined;
+    return {
+      taxableAmount: taxCalc.subtotalCents,
+      totalTaxCents: taxCalc.taxAmountCents,
+      effectiveTaxRate: taxCalc.effectiveTaxRate,
+      jurisdiction: taxCalc.jurisdiction,
+      calculationMethod: taxCalc.calculationMethod,
+      taxLineItems: taxCalc.taxLineItems,
+    };
+  }
+
   async completePaymentInit(
-    paymentInitResponse: ReturnType<typeof generateReturnObject>
+    paymentInitResponse: ReturnType<typeof generateReturnObject>,
+    opts?: { stripePaymentMethodId?: string }
   ): Promise<void> {
     if (!this.stripeClient) throw new Error("Stripe client not initialized");
     if (
@@ -135,10 +210,11 @@ class StripeAdapter implements PaymentProviderAdapter {
     }
 
     const { intentId, intentType } = paymentInitResponse;
+    const paymentMethodId = opts?.stripePaymentMethodId || "pm_card_visa";
 
     if (intentType === "payment_intent") {
       const res = await this.stripeClient.paymentIntents.confirm(intentId, {
-        payment_method: "pm_card_visa",
+        payment_method: paymentMethodId,
       });
       if (res.status !== "succeeded") {
         throw new Error(`PaymentIntent not succeeded: ${res.status}`);
@@ -148,7 +224,7 @@ class StripeAdapter implements PaymentProviderAdapter {
 
     if (intentType === "setup_intent") {
       const res = await this.stripeClient.setupIntents.confirm(intentId, {
-        payment_method: "pm_card_visa",
+        payment_method: paymentMethodId,
       });
       if (res.status !== "succeeded") {
         throw new Error(`SetupIntent not succeeded: ${res.status}`);
@@ -160,6 +236,8 @@ class StripeAdapter implements PaymentProviderAdapter {
   }
 
   async waitForWebhooks(ms?: number): Promise<void> {
+    // @ts-ignore
+    if (Stripe.isMock) return;
     const wait = typeof ms === "number" ? ms : 3000;
     console.log(`Waiting for webhooks ${wait}ms`);
     await new Promise((r) => setTimeout(r, wait));
@@ -182,6 +260,7 @@ class StripeAdapter implements PaymentProviderAdapter {
 }
 
 class DodoAdapter implements PaymentProviderAdapter {
+  name: PaymentProviderName = "dodo";
   private dodoClient: DodoPayments;
   private webhookProcess: ChildProcess | null = null;
   private redirectProcess: any = null;
@@ -340,8 +419,24 @@ class DodoAdapter implements PaymentProviderAdapter {
       throw new Error(errorMsg);
     }
   }
+  async firstTaxCalculation(_params: {
+    apiClient: any;
+    publishableApiKey: string;
+    planId: string;
+    priceId: string;
+    subtotalCents: number;
+    currency: string;
+    customerCountry?: string | undefined;
+    customerStateProvince?: string | undefined;
+    taxId?: string;
+    businessName?: string;
+  }): Promise<PaymentInitTaxData | undefined> {
+    // Dodo calculates tax downstream; no-op here
+    return undefined;
+  }
   async completePaymentInit(
-    paymentInitResponse: ReturnType<typeof generateReturnObject>
+    paymentInitResponse: ReturnType<typeof generateReturnObject>,
+    _opts?: { stripePaymentMethodId?: string }
   ): Promise<void> {
     if (
       !("id" in paymentInitResponse && "payment_link" in paymentInitResponse)

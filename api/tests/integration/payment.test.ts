@@ -13,8 +13,8 @@ import {
   createTestApiClient,
   createTestPlanWithFeatures,
   createTestPrice,
-  createTestStripe,
   createTestApiKeys,
+  cleanupDataFull,
 } from "../test-helpers";
 import { testEnv } from "../test-env";
 import { db } from "../../src/db/client";
@@ -44,10 +44,14 @@ import { eq, and, isNull, ne, sql } from "drizzle-orm";
 import { FeatureValue } from "../test-helpers/data/feature";
 import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
-import { setTimeout as sleep } from "timers/promises";
+import { sleep } from "../test-helpers/sleep";
 import path from "path";
 import { sseClients, exposeForTesting } from "../../src/routes/public";
 import { SSEStreamingApi } from "hono/streaming";
+import {
+  createPaymentProvider,
+  PaymentProviderAdapter,
+} from "../test-helpers/paymentProvider";
 
 /**
  * End-to-End Payment Flow Test
@@ -76,6 +80,7 @@ describe("End-to-End Payment Flow", () => {
   let tempMerchantIdFile = "/tmp/test_merchant_id.txt";
   let customerId: string;
   let publishableApiKey: string;
+  let paymentProvider: PaymentProviderAdapter;
 
   // Clean up function
   const cleanupWebhook = async () => {
@@ -94,7 +99,15 @@ describe("End-to-End Payment Flow", () => {
     }
   };
 
+  beforeEach(async () => {
+    exposeForTesting.clearSseClients();
+  });
+
   beforeAll(async () => {
+    paymentProvider = await createPaymentProvider();
+    // Clean up any existing test data
+    await cleanupDataFull();
+
     // 1. Set up testing environment (merchant, user, etc.)
     const { merchant, user } = await createFullTestEnvironment();
     merchantId = merchant.id;
@@ -117,12 +130,7 @@ describe("End-to-End Payment Flow", () => {
     });
 
     // 4. Create Stripe account for test merchant
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // 5. Create API keys for the merchant
     const apiKeys = await createTestApiKeys({
@@ -182,77 +190,10 @@ describe("End-to-End Payment Flow", () => {
     priceId = price.id;
 
     // 8. Start webhook listener in a separate process
-    // This is similar to the stripe-webhook-listen-dev.sh script but tailored for test
-    try {
-      console.log(`Starting webhook listener for merchant ${merchantId}...`);
-
-      // Get the stripe CLI path
-      const stripeCLIPath = await findStripeCLI();
-      console.log(`Found Stripe CLI at: ${stripeCLIPath}`);
-
-      // Start the webhook listner only if we found the Stripe CLI
-      if (stripeCLIPath) {
-        // First, get the webhook secret
-        const secretProcess = spawn(stripeCLIPath, [
-          "listen",
-          "--forward-to",
-          `localhost:8000/v1/public/webhook/${merchantId}`,
-          "--print-secret",
-          "--api-key",
-          testEnv.TEST_STRIPE_SECRET_KEY,
-        ]);
-
-        // Collect the secret from stdout
-        let secret = "";
-        secretProcess.stdout.on("data", (data) => {
-          secret += data.toString();
-        });
-
-        await new Promise<void>((resolve) => {
-          secretProcess.on("close", async () => {
-            // Clean up and save the secret
-            secret = secret.trim();
-            await fs.writeFile(tempWebhookSecretFile, secret);
-            console.log(`Saved webhook secret to ${tempWebhookSecretFile}`);
-            resolve();
-          });
-        });
-
-        // Now start the actual webhook listener
-        webhookProcess = spawn(
-          stripeCLIPath,
-          [
-            "listen",
-            "--forward-to",
-            `localhost:8000/v1/public/webhook/${merchantId}`,
-            "--api-key",
-            testEnv.TEST_STRIPE_SECRET_KEY,
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-          }
-        );
-
-        // Give some time for the webhook process to start
-        await sleep(1000);
-
-        console.log(`Webhook listener started with PID ${webhookProcess.pid}`);
-      } else {
-        console.warn(
-          "Stripe CLI not found, webhook listener will not be started"
-        );
-        console.warn(
-          "This test will still run but may not properly test the webhook handling"
-        );
-      }
-    } catch (error) {
-      console.error("Failed to start webhook listener:", error);
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
   });
 
   afterAll(async () => {
-    // Clean up the webhook process
     await cleanupWebhook();
 
     // Clean up database records
@@ -892,41 +833,6 @@ describe("End-to-End Payment Flow", () => {
   }, 30000);
 });
 
-// Helper function to find the Stripe CLI
-async function findStripeCLI(): Promise<string | null> {
-  // Try to find it on PATH
-  try {
-    const proc = await Bun.spawn(["which", "stripe"], {
-      stdout: "pipe",
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const result = stdout.trim();
-    if (result) {
-      return result;
-    }
-  } catch (e) {
-    console.error("Failed to find Stripe CLI:", e);
-  }
-
-  // Common places to look for stripe CLI
-  const possiblePaths = [
-    "/usr/local/bin/stripe",
-    "/opt/homebrew/bin/stripe",
-    path.join(process.env.HOME || "", ".local/bin/stripe"),
-  ];
-
-  for (const p of possiblePaths) {
-    try {
-      await fs.access(p, fs.constants.X_OK);
-      return p;
-    } catch (e) {
-      console.error("Failed to find Stripe CLI:", e);
-    }
-  }
-
-  return null;
-}
-
 /**
  * Tests for the SSE functionality in the payment flow
  *
@@ -1007,11 +913,6 @@ describe("Payment SSE Events", () => {
       onAbortHandler: abortHandler,
     };
   };
-
-  // Clear the SSE clients map before and after each test
-  beforeEach(() => {
-    exposeForTesting.clearSseClients();
-  });
 
   afterEach(() => {
     exposeForTesting.clearSseClients();

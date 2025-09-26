@@ -1,5 +1,5 @@
 import * as React from "react";
-import * as SwitchPrimitives from "@radix-ui/react-switch";
+import { Switch } from "./ui/switch";
 import { Button } from "./ui/button";
 import {
   Card,
@@ -43,60 +43,7 @@ interface PricingTableCardsProps {
   subscriptionStatus?: SubscriptionStatus | null;
 }
 
-const switchStyles = `
-  .pricing-switch-root {
-    display: inline-flex;
-    height: 1.5rem;
-    width: 2.75rem;
-    flex-shrink: 0;
-    cursor: pointer;
-    align-items: center;
-    border-radius: 9999px;
-    border: 2px solid transparent;
-    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-    transition: background-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
-    background-color: #e5e7eb;
-    outline: none;
-  }
-
-  .pricing-switch-root:focus-visible {
-    outline: 2px solid #3b82f6;
-    outline-offset: 2px;
-  }
-
-  .pricing-switch-root:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
-  }
-
-  .pricing-switch-root[data-state="checked"] {
-    background-color: #3b82f6;
-  }
-
-  .pricing-switch-root[data-state="unchecked"] {
-    background-color: #e5e7eb;
-  }
-
-  .pricing-switch-thumb {
-    pointer-events: none;
-    display: block;
-    height: 1.25rem;
-    width: 1.25rem;
-    border-radius: 9999px;
-    background-color: white;
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-    ring: 0;
-    transition: transform 0.2s ease-in-out;
-  }
-
-  .pricing-switch-thumb[data-state="checked"] {
-    transform: translateX(1.25rem);
-  }
-
-  .pricing-switch-thumb[data-state="unchecked"] {
-    transform: translateX(0);
-  }
-`;
+//
 
 export const PricingTableCards = ({
   heading,
@@ -106,40 +53,30 @@ export const PricingTableCards = ({
   setSelectedPlan,
   subscriptionStatus,
 }: PricingTableCardsProps) => {
-  const [isYearly, setIsYearly] = React.useState(true);
+  const [isYearly, setIsYearly] = React.useState(false);
+  const initializedYearlyRef = React.useRef(false);
 
-  // Function to determine the grid columns class based on plans length
   const getGridColumnsClass = () => {
-    // Explicit classes to ensure Tailwind includes them in the build
-    // cols-1 for small screens, then scale up based on number of plans
-    const gridClasses = {
-      1: "grid-cols-1 sm:grid-cols-1 md:grid-cols-1 lg:grid-cols-1 xl:grid-cols-1 2xl:grid-cols-1",
-      2: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-2",
-      3: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3 2xl:grid-cols-3",
-      4: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-4",
-      5: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5",
-      6: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6",
-      7: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-7",
-      8: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-4 2xl:grid-cols-8",
-      9: "grid-cols-1 sm:grid-cols-1 md:grid-cols-3 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-9",
-      10: "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-5 xl:grid-cols-5 2xl:grid-cols-10",
-      11: "grid-cols-1 sm:grid-cols-1 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-11",
-      12: "grid-cols-1 sm:grid-cols-1 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-12",
+    const grid: Record<number, string> = {
+      1: "grid-cols-1",
+      2: "grid-cols-1 md:grid-cols-2",
+      3: "grid-cols-1 md:grid-cols-2 lg:grid-cols-3",
+      4: "grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
     };
-
-    return (
-      gridClasses[plans.length as keyof typeof gridClasses] ||
-      "grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3 2xl:grid-cols-3"
-    );
+    return grid[plans.length] || "grid-cols-1 md:grid-cols-2 lg:grid-cols-3";
   };
 
-  // Check if any plan has both monthly and yearly pricing (and is not enterprise)
-  const hasMultiplePricingOptions = plans.some(
-    (plan) =>
-      !plan.isEnterprisePlan &&
-      plan.priceMonthly !== undefined &&
-      plan.priceYearly !== undefined
-  );
+  const nonEnterprisePlans = plans.filter((plan) => !plan.isEnterprisePlan);
+
+  // Show toggle only when all non-enterprise plans have both monthly and yearly price and a yearly priceId
+  const shouldShowYearlyToggle =
+    nonEnterprisePlans.length > 0 &&
+    nonEnterprisePlans.every(
+      (plan) =>
+        plan.priceMonthly !== undefined &&
+        plan.priceYearly !== undefined &&
+        !!plan.priceIdYearly
+    );
 
   // Function to calculate discount percentage
   const getDiscountPercentage = (plan: Plan) => {
@@ -154,6 +91,18 @@ export const PricingTableCards = ({
 
     return null;
   };
+
+  React.useEffect(() => {
+    if (shouldShowYearlyToggle) {
+      if (!initializedYearlyRef.current) {
+        setIsYearly(true);
+        initializedYearlyRef.current = true;
+      }
+    } else {
+      setIsYearly(false);
+      initializedYearlyRef.current = false;
+    }
+  }, [shouldShowYearlyToggle]);
 
   const isCurrentPlan = (plan: Plan) => {
     return (
@@ -175,13 +124,7 @@ export const PricingTableCards = ({
   );
 
   return (
-    <div
-      className={cn(
-        "pricing-table-component container px-4 py-12 mx-auto",
-        className
-      )}
-    >
-      <style>{switchStyles}</style>
+    <div className={cn("container px-4 py-12 mx-auto", className)}>
       {heading && (
         <div>
           <h2 className="text-3xl font-bold tracking-tight sm:text-4xl md:text-5xl">
@@ -195,23 +138,24 @@ export const PricingTableCards = ({
         </div>
       )}
 
-      {hasMultiplePricingOptions && maxDiscountPercentage > 0 && (
-        <div className="flex items-center justify-center space-x-3 mt-8 mb-8">
-          <SwitchPrimitives.Root
-            className="pricing-switch-root"
-            checked={isYearly}
-            onCheckedChange={setIsYearly}
-          >
-            <SwitchPrimitives.Thumb className="pricing-switch-thumb" />
-          </SwitchPrimitives.Root>
-          <span
-            className={`text-sm ${isYearly ? "text-foreground" : "text-muted-foreground"}`}
-          >
-            Pay yearly
-          </span>
-          <Badge variant="secondary" className="ml-2">
-            Save {maxDiscountPercentage}%
-          </Badge>
+      {shouldShowYearlyToggle && (
+        <div className="relative w-full flex items-center justify-center mt-8 mb-8">
+          <div className="relative inline-flex items-center space-x-3">
+            <Switch checked={isYearly} onCheckedChange={setIsYearly} />
+            <span
+              className={`text-sm ${isYearly ? "text-foreground" : "text-muted-foreground"}`}
+            >
+              Pay yearly
+            </span>
+            {maxDiscountPercentage > 0 && (
+              <Badge
+                variant="secondary"
+                className="absolute left-full ml-2 top-1/2 -translate-y-1/2"
+              >
+                Save {maxDiscountPercentage}%
+              </Badge>
+            )}
+          </div>
         </div>
       )}
 
@@ -250,7 +194,7 @@ export const PricingTableCards = ({
               )}
               <CardHeader>
                 <CardTitle className="text-xl">{plan.title}</CardTitle>
-                <CardDescription>{plan.description || ""}</CardDescription>
+                <CardDescription>{plan.description}</CardDescription>
                 {!plan.isEnterprisePlan && (
                   <div className="mt-4">
                     <div className="flex items-end space-x-2">
@@ -298,8 +242,8 @@ export const PricingTableCards = ({
                         })()}
                       </span>
                     </div>
-                    {plan.interval.includes("per seat") &&
-                      plan.minSeats &&
+                    {plan.interval?.includes("per seat") &&
+                      plan.minSeats !== undefined &&
                       plan.minSeats > 1 && (
                         <p className="text-xs text-muted-foreground mt-1">
                           Minimum {plan.minSeats} seats,{" "}
@@ -315,9 +259,9 @@ export const PricingTableCards = ({
                         plan.priceYearly > 0) && (
                         <p className="text-xs text-muted-foreground mt-1">
                           Billed annually (
-                          {plan.currency ? currencySymbol(plan.currency) : "€"}
+                          {plan.currency ? currencySymbol(plan.currency) : "$"}
                           {plan.priceYearly}
-                          {plan.interval.includes("per seat")
+                          {plan.interval?.includes("per seat")
                             ? "/year per seat"
                             : "/year"}
                           )
@@ -352,25 +296,70 @@ export const PricingTableCards = ({
                       const usageComponent = plan.pricingData?.components?.find(
                         (comp) => {
                           if (comp.type !== "usage") return false;
-                          let featureName = "";
-                          if (comp.label) {
-                            featureName = comp.label.replace(/\s+usage$/i, "");
-                          } else if ((comp as any).component_name) {
-                            const name = (comp as any).component_name.replace(
-                              /^usage_/,
+
+                          const slugify = (s: string) =>
+                            s
+                              .toLowerCase()
+                              .trim()
+                              .replace(/\s+/g, "-")
+                              .replace(/[^a-z0-9-]/g, "-")
+                              .replace(/-+/g, "-")
+                              .replace(/^-|-$/g, "");
+
+                          const baseMainText = mainText
+                            .replace(/\s*\(.*?\)\s*$/, "")
+                            .trim();
+                          const mainTextSlug = slugify(baseMainText);
+
+                          let compSlug = "";
+                          if (
+                            typeof (comp as any).component_name === "string" &&
+                            (comp as any).component_name
+                          ) {
+                            const raw = (comp as any).component_name
+                              .replace(/^usage[_-]?/i, "")
+                              .replace(/[_-]?usage$/i, "");
+                            compSlug = slugify(raw);
+                          } else if (
+                            typeof (comp as any).unit_label === "string" &&
+                            (comp as any).unit_label
+                          ) {
+                            compSlug = slugify(
+                              (comp as any).unit_label as string
+                            );
+                          } else if (
+                            typeof (comp as any).label === "string" &&
+                            (comp as any).label
+                          ) {
+                            const raw = ((comp as any).label as string).replace(
+                              /\s+usage$/i,
                               ""
                             );
+                            compSlug = slugify(raw);
+                          }
+
+                          if (compSlug && mainTextSlug) {
+                            return compSlug === mainTextSlug;
+                          }
+
+                          // Fallback to normalized name equality
+                          let featureName = "";
+                          if ((comp as any).label) {
+                            featureName = (
+                              (comp as any).label as string
+                            ).replace(/\s+usage$/i, "");
+                          } else if ((comp as any).component_name) {
+                            const name = (
+                              (comp as any).component_name as string
+                            ).replace(/^usage_/, "");
                             featureName = name
                               .replace(/-/g, " ")
                               .replace(/\b\w/g, (l: string) => l.toUpperCase());
                           }
+                          const normalize = (s: string) =>
+                            s.toLowerCase().replace(/\s+/g, " ").trim();
                           return (
-                            mainText
-                              .toLowerCase()
-                              .includes(featureName.toLowerCase()) ||
-                            featureName
-                              .toLowerCase()
-                              .includes(mainText.toLowerCase().split(" ")[0])
+                            normalize(baseMainText) === normalize(featureName)
                           );
                         }
                       );
@@ -418,7 +407,7 @@ export const PricingTableCards = ({
               </CardContent>
               <CardFooter className="mt-auto">
                 <Button
-                  className="w-full cursor-pointer"
+                  className="w-full"
                   variant={
                     currentPlan
                       ? "secondary"
@@ -432,17 +421,20 @@ export const PricingTableCards = ({
                     if (plan.isEnterprisePlan && plan.enterpriseRedirectUrl) {
                       window.open(plan.enterpriseRedirectUrl, "_blank");
                     } else {
+                      const allowYearly =
+                        isYearly &&
+                        plan.priceYearly !== undefined &&
+                        !!plan.priceIdYearly;
                       const planWithBillingInfo = {
                         ...plan,
-                        selectedBillingInterval: isYearly
+                        selectedBillingInterval: allowYearly
                           ? "yearly"
                           : "monthly",
-                        selectedPrice:
-                          isYearly && plan.priceYearly
-                            ? plan.priceYearly
-                            : plan.priceMonthly || plan.price,
-                      };
-                      setSelectedPlan?.(planWithBillingInfo as Plan);
+                        selectedPrice: allowYearly
+                          ? (plan.priceYearly as number)
+                          : plan.priceMonthly || plan.price,
+                      } as Plan;
+                      setSelectedPlan?.(planWithBillingInfo);
                     }
                   }}
                 >

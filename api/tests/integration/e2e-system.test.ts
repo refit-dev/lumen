@@ -11,6 +11,7 @@ import {
   invoiceLineItems,
   subscriptionDetails,
   subscriptions,
+  subscriptionsScheduledChanges,
   subscriptionFeatures,
   customers,
   plans,
@@ -30,6 +31,7 @@ import {
   creditDefinitions,
   creditGrants,
   creditUsageTransactions,
+  billingTasks,
 } from "@lumen/common/schema";
 import {
   createFullTestEnvironment,
@@ -182,6 +184,8 @@ describe("End-to-End System Tests", () => {
       DELETE FROM ${payments};
       DELETE FROM ${invoiceLineItems};
       DELETE FROM ${invoices};
+      DELETE FROM ${billingTasks};
+      DELETE FROM ${subscriptionsScheduledChanges};
       DELETE FROM ${subscriptionFeatures};
       DELETE FROM ${subscriptionDetails};
       DELETE FROM ${metrics};

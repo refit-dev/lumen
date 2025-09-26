@@ -12,7 +12,8 @@
  * @param params - The parameters for adding a seat
  * @param params.organisationUserId - User ID (on your backend) of the organization who owns
  *   the subscription. This must match the User ID you used in the PricingTable component
- *   when the user first paid for the subscription
+ *   when the user first paid for the subscription (fallback if organizationId not provided)
+ * @param params.organizationId - Organization ID (preferred) - the internal Lumen organization ID
  * @param params.newUserId - User ID (on your backend) of the new user being added to
  *   the seat
  * @param params.metadata - Optional metadata to attach to the seat addition event
@@ -23,7 +24,8 @@
  * @returns Promise resolving to success response or error object
  */
 export const addSeat = async (params: {
-  organisationUserId: string;
+  organisationUserId?: string;
+  organizationId?: string;
   newUserId: string;
   metadata?: Record<string, any>;
   idempotencyKey?: string;
@@ -48,6 +50,14 @@ export const addSeat = async (params: {
       return { error };
     }
 
+    // Validate that either organizationId or organisationUserId is provided
+    if (!params.organizationId && !params.organisationUserId) {
+      const error =
+        "Either organizationId or organisationUserId must be provided";
+      console.error(error);
+      return { error };
+    }
+
     const apiUrl = params.apiUrl ?? "https://api.getlumen.dev";
 
     const response = await fetch(apiUrl + "/v1/seats/add", {
@@ -58,6 +68,7 @@ export const addSeat = async (params: {
       },
       body: JSON.stringify({
         user_id: params.organisationUserId,
+        organization_id: params.organizationId,
         created_user_id: params.newUserId,
         metadata: params.metadata,
         idempotency_key: params.idempotencyKey,
@@ -89,7 +100,8 @@ export const addSeat = async (params: {
  * @param params - The parameters for removing a seat
  * @param params.organisationUserId - User ID (on your backend) of the organization who owns
  *   the subscription. This must match the User ID you used in the PricingTable component
- *   when the user first paid for the subscription
+ *   when the user first paid for the subscription (fallback if organizationId not provided)
+ * @param params.organizationId - Organization ID (preferred) - the internal Lumen organization ID
  * @param params.removedUserId - User ID (on your backend) of the user being removed from the seat
  * @param params.metadata - Optional metadata to attach to the seat removal event
  * @param params.idempotencyKey - Optional idempotency key to prevent duplicate operations
@@ -99,7 +111,8 @@ export const addSeat = async (params: {
  * @returns Promise resolving to success response or error object
  */
 export const removeSeat = async (params: {
-  organisationUserId: string;
+  organisationUserId?: string;
+  organizationId?: string;
   removedUserId: string;
   metadata?: Record<string, any>;
   idempotencyKey?: string;
@@ -124,6 +137,14 @@ export const removeSeat = async (params: {
       return { error };
     }
 
+    // Validate that either organizationId or organisationUserId is provided
+    if (!params.organizationId && !params.organisationUserId) {
+      const error =
+        "Either organizationId or organisationUserId must be provided";
+      console.error(error);
+      return { error };
+    }
+
     const apiUrl = params.apiUrl ?? "https://api.getlumen.dev";
 
     const response = await fetch(apiUrl + "/v1/seats/remove", {
@@ -134,6 +155,7 @@ export const removeSeat = async (params: {
       },
       body: JSON.stringify({
         user_id: params.organisationUserId,
+        organization_id: params.organizationId,
         removed_user_id: params.removedUserId,
         metadata: params.metadata,
         idempotency_key: params.idempotencyKey,

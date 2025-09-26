@@ -1,10 +1,4 @@
-import {
-  pgTable,
-  text,
-  timestamp,
-  jsonb,
-  boolean,
-} from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, jsonb, boolean } from "drizzle-orm/pg-core";
 import { createPrefixedId, ID_PREFIXES } from "../utils";
 import {
   createInsertSchema,
@@ -47,3 +41,5 @@ export const pricesInsertSchema = createInsertSchema(prices);
 export const pricesUpdateSchema = createUpdateSchema(prices).extend({
   pricingData: priceDSLSchemaZod.optional(),
 });
+
+export type Price = typeof prices.$inferSelect;

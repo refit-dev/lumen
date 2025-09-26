@@ -51,6 +51,10 @@ export const invoices = pgTable("invoices", {
   pdfUrl: varchar("pdf_url", { length: 255 }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   notes: text("notes"),
+  // Document typing and linkage for cancellations/credit notes
+  documentType: text("document_type").default("standard").notNull(), // 'standard' | 'cancellation' | 'credit_note'
+  originalInvoiceId: text("original_invoice_id"),
+  cancellationOrCreditReason: text("cancellation_or_credit_reason"),
   // no deleted_at column, we will use the status column to check if the invoice is "deleted"
   // in the EU, you can only apply a credit note to an invoice that has been paid
 });
@@ -76,6 +80,10 @@ export const invoiceRelations = relations(invoices, ({ many, one }) => ({
   payment: one(payments, {
     fields: [invoices.id],
     references: [payments.invoiceId],
+  }),
+  originalInvoice: one(invoices, {
+    fields: [invoices.originalInvoiceId],
+    references: [invoices.id],
   }),
 }));
 
@@ -219,39 +227,3 @@ export const invoiceUpdateSchemaReq = invoiceInsertSchema
       .optional(),
     deletedLineItemIds: z.array(z.string()).optional(),
   });
-
-// export const creditNotes = pgTable("credit_notes", {
-//   id: text("id")
-//     .primaryKey()
-//     .$defaultFn(() => createPrefixedId(ID_PREFIXES.creditNote)),
-//   invoiceId: text("invoice_id")
-//     .notNull()
-//     .references(() => invoices.id),
-//   customerId: text("customer_id")
-//     .notNull()
-//     .references(() => customers.id),
-//   number: varchar("number", { length: 100 }).notNull(),
-//   status: varchar("status", { length: 20 }).notNull(), // issued, void
-//   total: integer("total").notNull(),
-//   reason: varchar("reason", { length: 50 }).notNull(), // duplicate, fraudulent, order_change, product_unsatisfactory, other
-//   description: text("description"),
-//   pdfUrl: varchar("pdf_url", { length: 255 }),
-//   createdAt: timestamp("created_at").defaultNow().notNull(),
-//   updatedAt: timestamp("updated_at").defaultNow().notNull(),
-// });
-
-// export const creditNoteItems = pgTable("credit_note_items", {
-//   id: text("id")
-//     .primaryKey()
-//     .$defaultFn(() => createPrefixedId(ID_PREFIXES.creditNoteItem)),
-//   creditNoteId: text("credit_note_id")
-//     .notNull()
-//     .references(() => creditNotes.id, { onDelete: "cascade" }),
-//   invoiceLineItemId: text("invoice_line_item_id")
-//     .notNull()
-//     .references(() => invoiceLineItems.id),
-//   type: varchar("type", { length: 20 }).notNull(), // refund, credit
-//   description: varchar("description", { length: 255 }).notNull(),
-//   amount: integer("amount").notNull(),
-//   createdAt: timestamp("created_at").defaultNow().notNull(),
-// });

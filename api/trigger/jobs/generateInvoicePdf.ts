@@ -120,7 +120,6 @@ export const generateInvoicePdfJob = task({
         const emailJobHandle = await sendInvoiceEmailJob.trigger({
           invoice,
           pdfBuffer: pdfResult.pdfBuffer!,
-          fileName: pdfResult.fileName,
           pdfUrl,
           invoiceNumber,
         });

@@ -70,6 +70,12 @@ type InvoiceWithLineItemsAPI = {
   taxJurisdiction?: string | null;
   taxCalculationMethod?: string | null;
   notes?: string | null; // Add notes field for payment links and other information
+  // Refund/correction fields
+  documentType?: "standard" | "cancellation" | "credit_note" | null;
+  originalInvoiceId?: string | null;
+  cancellationOrCreditReason?: string | null;
+  originalInvoiceNumber?: string | null;
+  originalIssueDate?: string | null;
 };
 
 // Type for the complete invoice data including customer and merchant
@@ -186,6 +192,18 @@ export function formatInvoiceWithDetailsToCompleteAPI(
     taxJurisdiction: invoiceWithDetails.taxJurisdiction,
     taxCalculationMethod: invoiceWithDetails.taxCalculationMethod,
     notes: invoiceWithDetails.notes,
+    documentType: invoiceWithDetails.documentType,
+    originalInvoiceId: invoiceWithDetails.originalInvoiceId,
+    cancellationOrCreditReason: invoiceWithDetails.cancellationOrCreditReason,
+    originalInvoiceNumber:
+      (invoiceWithDetails.originalInvoice &&
+        (invoiceWithDetails.originalInvoice.customerInvoiceNumber ||
+          invoiceWithDetails.originalInvoice.id)) ||
+      null,
+    originalIssueDate:
+      (invoiceWithDetails.originalInvoice &&
+        (toIsoOrNull(invoiceWithDetails.originalInvoice.issueDate) || null)) ||
+      null,
     lineItems: (invoiceWithDetails.lineItems || []).map((item: any) => ({
       id: item.id,
       description: item.description,
@@ -262,7 +280,11 @@ function getTaxReasonDescription(reasonCode: string): string | null {
 
   // Handle additional exemption reasons that might not be in the tax reason codes
   const additionalReasons: Record<string, string> = {
-    customer_exempt: "Tax Exempt Customer",
+    nonprofit_organization: "Nonprofit Organization",
+    government_entity: "Government Entity",
+    educational_institution: "Educational Institution",
+    resale: "Resale Certificate",
+    other: "Tax Exempt Customer",
     no_nexus: "No Tax Nexus",
     no_manual_rate_configured: "No Tax Rate Configured",
     calculation_error: "Tax Calculation Error",
@@ -677,6 +699,13 @@ export async function processInvoicePdfGeneration(
         ),
         taxReferences: taxInfo.taxReferences, // Add tax references to pdfData
         notes: invoice.notes === null ? undefined : invoice.notes, // Add notes for payment link handling
+        documentType: (invoice.documentType as any) || "standard",
+        originalInvoiceNumber:
+          invoice.originalInvoiceNumber ||
+          (invoice.originalInvoiceId ? invoice.originalInvoiceId : undefined),
+        originalIssueDate: invoice.originalIssueDate || undefined,
+        adjustmentReason:
+          (invoice.cancellationOrCreditReason as any) || undefined,
       };
 
       console.log("[processInvoicePdfGeneration] Created PDF data:", {
@@ -687,7 +716,18 @@ export async function processInvoicePdfGeneration(
       });
 
       console.log("Attempting to generate PDF for invoice:", invoiceId);
-      const pdfBlob = await pdf(<InvoiceDocument data={pdfData!} />).toBlob();
+
+      let pdfBlob: Blob | null = null;
+      if (
+        process.env.NODE_ENV === "development" &&
+        !process.env.GENERATE_PDFS // Set this env var to see PDFs locally
+      ) {
+        // Development code path
+        pdfBlob = await pdf(<div>mock blob</div>).toBlob();
+      } else {
+        // Production code path
+        pdfBlob = await pdf(<InvoiceDocument data={pdfData!} />).toBlob();
+      }
       const pdfBuffer = Buffer.from(await pdfBlob.arrayBuffer());
       console.log("Successfully generated PDF buffer for invoice:", invoiceId);
 

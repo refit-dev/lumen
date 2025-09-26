@@ -28,7 +28,23 @@ export default function PaymentSuccessPage() {
             <PaymentSuccessContent />
           </Suspense>
           <div className="pt-4">
-            <Button onClick={() => window.close()} className="w-full">
+            <Button
+              onClick={() => {
+                try {
+                  window.close();
+                } catch {
+                  // Fallback: redirect to a safe page if window.close() fails
+                  window.location.href = "/";
+                }
+                // Additional fallback with timeout in case window.close() is ignored
+                setTimeout(() => {
+                  if (!window.closed) {
+                    window.location.href = "/";
+                  }
+                }, 500);
+              }}
+              className="w-full"
+            >
               Close
             </Button>
           </div>

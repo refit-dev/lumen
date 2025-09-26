@@ -4,7 +4,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 
 import { Button } from "@/components/ui/button";
-import { useSession, useActiveOrganization } from "@/lib/auth-client";
+import { useSession } from "@/lib/auth-client";
 import { apiClient } from "@/lib/hono-client";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -160,7 +160,6 @@ const getSubscriptionStatus = (
 
 export default function DashboardPage() {
   const { data: session, isPending } = useSession();
-  const activeOrganization = useActiveOrganization();
   const router = useRouter();
   const [onboardingItems, setOnboardingItems] = useState<OnboardingItem[]>([]);
   const [metrics, setMetrics] = useState<DashboardMetrics>({
@@ -349,22 +348,50 @@ export default function DashboardPage() {
 
           setRecentPayments(payments.slice(0, 10)); // Show last 10 payments
 
-          // Generate chart data from payments (group by day)
+          // Build chart data for the selected time range, with zero-filled days
+          const formatDateKey = (date: Date): string => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, "0");
+            const day = String(date.getDate()).padStart(2, "0");
+            return `${year}-${month}-${day}`;
+          };
+
+          const endDate = new Date();
+          endDate.setHours(0, 0, 0, 0);
+          const startDate = new Date(endDate);
+          startDate.setDate(endDate.getDate() - (selectedTimeRange - 1));
+
+          // Initialize map with all days in range set to zero
           const chartDataMap = new Map<
             string,
             { amount: number; count: number }
           >();
-          payments.forEach((payment) => {
-            const dateKey = payment.createdAt.toISOString().split("T")[0];
-            const existing = chartDataMap.get(dateKey) || {
-              amount: 0,
-              count: 0,
-            };
-            chartDataMap.set(dateKey, {
-              amount: existing.amount + payment.amountCents,
-              count: existing.count + 1,
-            });
-          });
+          for (
+            let d = new Date(startDate);
+            d.getTime() <= endDate.getTime();
+            d.setDate(d.getDate() + 1)
+          ) {
+            chartDataMap.set(formatDateKey(d), { amount: 0, count: 0 });
+          }
+
+          // Aggregate payments that fall within the range
+          for (const payment of payments) {
+            const createdAt = new Date(payment.createdAt);
+            if (
+              createdAt.getTime() < startDate.getTime() ||
+              createdAt.getTime() > endDate.getTime() + 24 * 60 * 60 * 1000 - 1
+            ) {
+              continue;
+            }
+            const key = formatDateKey(createdAt);
+            if (chartDataMap.has(key)) {
+              const existing = chartDataMap.get(key)!;
+              chartDataMap.set(key, {
+                amount: existing.amount + payment.amountCents,
+                count: existing.count + 1,
+              });
+            }
+          }
 
           const chartData: PaymentChartData[] = Array.from(
             chartDataMap.entries()
@@ -374,8 +401,7 @@ export default function DashboardPage() {
               amount: data.amount,
               count: data.count,
             }))
-            .sort((a, b) => a.date.localeCompare(b.date))
-            .slice(-selectedTimeRange); // Use selected time range
+            .sort((a, b) => a.date.localeCompare(b.date));
 
           setPaymentChartData(chartData);
         }
@@ -477,7 +503,7 @@ export default function DashboardPage() {
     };
 
     loadDashboardData();
-  }, [session, activeOrganization, isPending, router, selectedTimeRange]);
+  }, [session, isPending, router, selectedTimeRange]);
 
   // Show loading state while session is being fetched
   if (isPending) {
@@ -938,7 +964,7 @@ export default function DashboardPage() {
                       >
                         <CartesianGrid
                           strokeDasharray="3 3"
-                          className="opacity-30"
+                          className="opacity-50"
                         />
                         <XAxis
                           dataKey="date"
@@ -947,12 +973,15 @@ export default function DashboardPage() {
                           className="text-xs"
                         />
                         <YAxis
-                          axisLine={false}
+                          axisLine={{ stroke: "#e5e7eb" }}
                           tickLine={false}
                           className="text-xs"
                           tickFormatter={(value) =>
                             selectedMetric === "volume"
-                              ? `$${value}`
+                              ? formatCurrency(
+                                  Number(value) * 100,
+                                  metrics.currency || "USD"
+                                )
                               : value.toString()
                           }
                         />
@@ -1034,7 +1063,11 @@ export default function DashboardPage() {
                     </div>
                     <div className="text-center">
                       <div className="text-2xl font-bold text-blue-600">
-                        {paymentChartData.length}
+                        {
+                          paymentChartData.filter(
+                            (d) => d.amount > 0 || d.count > 0
+                          ).length
+                        }
                       </div>
                       <div className="text-xs text-muted-foreground">
                         Days with Data
@@ -1042,24 +1075,20 @@ export default function DashboardPage() {
                     </div>
                     <div className="text-center">
                       <div className="text-2xl font-bold text-blue-600">
-                        {paymentChartData.length > 0
-                          ? selectedMetric === "volume"
-                            ? formatCurrency(
-                                paymentChartData.reduce(
-                                  (sum, data) => sum + data.amount,
-                                  0
-                                ) / paymentChartData.length,
-                                metrics.currency || "USD"
-                              )
-                            : Math.round(
-                                paymentChartData.reduce(
-                                  (sum, data) => sum + data.count,
-                                  0
-                                ) / paymentChartData.length
-                              ).toLocaleString()
-                          : selectedMetric === "volume"
-                            ? formatCurrency(0, metrics.currency || "USD")
-                            : "0"}
+                        {selectedMetric === "volume"
+                          ? formatCurrency(
+                              paymentChartData.reduce(
+                                (sum, data) => sum + data.amount,
+                                0
+                              ) / Math.max(selectedTimeRange, 1),
+                              metrics.currency || "USD"
+                            )
+                          : Math.round(
+                              paymentChartData.reduce(
+                                (sum, data) => sum + data.count,
+                                0
+                              ) / Math.max(selectedTimeRange, 1)
+                            ).toLocaleString()}
                       </div>
                       <div className="text-xs text-muted-foreground">
                         Daily Average

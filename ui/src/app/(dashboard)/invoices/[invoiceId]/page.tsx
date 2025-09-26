@@ -73,6 +73,7 @@ import {
 } from "@lumen/common/utils";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import Link from "next/link";
+import { toast } from "sonner";
 
 const removeFalsyValuesFromObject = (obj: Record<string, unknown>) => {
   return Object.fromEntries(Object.entries(obj).filter(([, value]) => !!value));
@@ -192,6 +193,21 @@ type Invoice = {
   status: string;
   customerInvoiceNumber?: string;
   notes?: string;
+  documentType?: "standard" | "cancellation" | "credit_note" | null;
+  originalInvoiceId?: string | null;
+  originalInvoice?: {
+    id: string;
+    customerInvoiceNumber?: string | null;
+  } | null;
+  adjustmentInvoices?: Array<{
+    id: string;
+    customerInvoiceNumber?: string | null;
+    documentType?: "cancellation" | "credit_note" | null;
+    totalAmountCents: number;
+    currency: string;
+    issueDate: string | null;
+    hasPdf?: boolean;
+  }>;
   lineItems?: Array<{
     id: string;
     description: string;
@@ -494,6 +510,28 @@ export default function InvoiceDetailsPage() {
     },
   });
 
+  const retryInvoicePaymentMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiClient.invoices[":id"]["retry-payment"].$post({
+        param: { id: invoiceId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to queue retry"
+        );
+      }
+      return data as { success: boolean; attemptNumber?: number };
+    },
+    onSuccess: () => {
+      toast.success("Payment retry queued");
+      queryClient.invalidateQueries({ queryKey: ["invoice", invoiceId] });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to queue retry");
+    },
+  });
+
   const { data: invoice, isLoading } = useQuery({
     queryKey: ["invoice", invoiceId],
     queryFn: async () => {
@@ -617,7 +655,7 @@ export default function InvoiceDetailsPage() {
   }, [isEditMode, invoice, form]);
 
   const handleNavigateBack = useCallback(() => {
-    router.back();
+    router.push("/invoices");
   }, [router]);
 
   const handleCopyId = useCallback(() => {
@@ -766,6 +804,24 @@ export default function InvoiceDetailsPage() {
   const isOverdue =
     daysUntilDue < 0 && invoice.status !== "paid" && invoice.status !== "void";
 
+  // Calculate payment timing for paid invoices
+  const paymentInfo = (() => {
+    if (invoice.status === "paid" && invoice.payment?.createdAt) {
+      const paymentDate = new Date(invoice.payment.createdAt);
+      const dueDate = new Date(invoice.dueDate);
+      const daysDifference = Math.ceil(
+        (paymentDate.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)
+      );
+
+      if (daysDifference <= 0) {
+        return { type: "on_time", days: Math.abs(daysDifference) };
+      } else {
+        return { type: "late", days: daysDifference };
+      }
+    }
+    return null;
+  })();
+
   return (
     <div className="container mx-auto py-8">
       {/* Header */}
@@ -820,6 +876,18 @@ export default function InvoiceDetailsPage() {
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
+            )}
+            {!isEditMode && invoice.status === "issued" && (
+              <Button
+                variant="outline"
+                onClick={() => retryInvoicePaymentMutation.mutate()}
+                disabled={retryInvoicePaymentMutation.isPending}
+              >
+                {retryInvoicePaymentMutation.isPending ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : null}
+                Retry Payment
+              </Button>
             )}
           </div>
         </div>
@@ -931,71 +999,87 @@ export default function InvoiceDetailsPage() {
 
         <Card
           className={`${
-            isOverdue
-              ? "bg-red-50 border-red-200"
-              : daysUntilDue <= 3 &&
-                  invoice.status !== "paid" &&
-                  invoice.status !== "void"
-                ? "bg-yellow-50 border-yellow-200"
-                : "bg-slate-50 border-slate-200"
+            invoice.status === "paid"
+              ? paymentInfo?.type === "late"
+                ? "bg-orange-50 border-orange-200"
+                : "bg-green-50 border-green-200"
+              : isOverdue
+                ? "bg-red-50 border-red-200"
+                : daysUntilDue <= 3 && invoice.status !== "void"
+                  ? "bg-yellow-50 border-yellow-200"
+                  : "bg-slate-50 border-slate-200"
           }`}
         >
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle
               className={`text-sm font-medium ${
-                isOverdue
-                  ? "text-red-900"
-                  : daysUntilDue <= 3 &&
-                      invoice.status !== "paid" &&
-                      invoice.status !== "void"
-                    ? "text-yellow-900"
-                    : "text-slate-900"
+                invoice.status === "paid"
+                  ? paymentInfo?.type === "late"
+                    ? "text-orange-900"
+                    : "text-green-900"
+                  : isOverdue
+                    ? "text-red-900"
+                    : daysUntilDue <= 3 && invoice.status !== "void"
+                      ? "text-yellow-900"
+                      : "text-slate-900"
               }`}
             >
-              Due Date
+              {invoice.status === "paid" ? "Payment Status" : "Due Date"}
             </CardTitle>
             <Calendar
               className={`h-4 w-4 ${
-                isOverdue
-                  ? "text-red-600"
-                  : daysUntilDue <= 3 &&
-                      invoice.status !== "paid" &&
-                      invoice.status !== "void"
-                    ? "text-yellow-600"
-                    : "text-slate-600"
+                invoice.status === "paid"
+                  ? paymentInfo?.type === "late"
+                    ? "text-orange-600"
+                    : "text-green-600"
+                  : isOverdue
+                    ? "text-red-600"
+                    : daysUntilDue <= 3 && invoice.status !== "void"
+                      ? "text-yellow-600"
+                      : "text-slate-600"
               }`}
             />
           </CardHeader>
           <CardContent>
             <div
               className={`text-lg font-semibold ${
-                isOverdue
-                  ? "text-red-900"
-                  : daysUntilDue <= 3 &&
-                      invoice.status !== "paid" &&
-                      invoice.status !== "void"
-                    ? "text-yellow-900"
-                    : "text-slate-900"
+                invoice.status === "paid"
+                  ? paymentInfo?.type === "late"
+                    ? "text-orange-900"
+                    : "text-green-900"
+                  : isOverdue
+                    ? "text-red-900"
+                    : daysUntilDue <= 3 && invoice.status !== "void"
+                      ? "text-yellow-900"
+                      : "text-slate-900"
               }`}
             >
               <LocaleAwareDate date={invoice.dueDate} />
             </div>
             <p
               className={`text-xs font-medium ${
-                isOverdue
-                  ? "text-red-600"
-                  : daysUntilDue <= 3 &&
-                      invoice.status !== "paid" &&
-                      invoice.status !== "void"
-                    ? "text-yellow-600"
-                    : "text-slate-600"
+                invoice.status === "paid"
+                  ? paymentInfo?.type === "late"
+                    ? "text-orange-600"
+                    : "text-green-600"
+                  : isOverdue
+                    ? "text-red-600"
+                    : daysUntilDue <= 3 && invoice.status !== "void"
+                      ? "text-yellow-600"
+                      : "text-slate-600"
               }`}
             >
-              {isOverdue
-                ? `${Math.abs(daysUntilDue)} days overdue`
-                : daysUntilDue === 0
-                  ? "Due today"
-                  : `${daysUntilDue} days remaining`}
+              {invoice.status === "paid"
+                ? paymentInfo?.type === "late"
+                  ? `Paid ${paymentInfo.days} day${paymentInfo.days !== 1 ? "s" : ""} late`
+                  : paymentInfo?.days === 0
+                    ? "Paid on due date"
+                    : `Paid ${paymentInfo?.days} day${paymentInfo?.days !== 1 ? "s" : ""} early`
+                : isOverdue
+                  ? `${Math.abs(daysUntilDue)} day${Math.abs(daysUntilDue) !== 1 ? "s" : ""} due`
+                  : daysUntilDue === 0
+                    ? "Due today"
+                    : `${daysUntilDue} day${daysUntilDue !== 1 ? "s" : ""} remaining`}
             </p>
           </CardContent>
         </Card>
@@ -1130,6 +1214,37 @@ export default function InvoiceDetailsPage() {
 
               {/* Basic Info Section */}
               <div className="space-y-4">
+                {invoice.documentType &&
+                  invoice.documentType !== "standard" && (
+                    <div>
+                      <Label className="text-sm font-semibold text-muted-foreground">
+                        Document Type
+                      </Label>
+                      <div className="mt-2">
+                        <Badge variant="outline">
+                          {invoice.documentType === "cancellation"
+                            ? "Cancellation"
+                            : "Credit Note"}
+                        </Badge>
+                      </div>
+                    </div>
+                  )}
+                {invoice.originalInvoiceId && (
+                  <div>
+                    <Label className="text-sm font-semibold text-muted-foreground">
+                      References Invoice
+                    </Label>
+                    <div className="mt-2 text-base font-mono">
+                      <Link
+                        href={`/invoices/${invoice.originalInvoiceId}`}
+                        className="text-blue-600 hover:underline"
+                      >
+                        {invoice.originalInvoice?.customerInvoiceNumber ||
+                          invoice.originalInvoiceId}
+                      </Link>
+                    </div>
+                  </div>
+                )}
                 {invoice.customerInvoiceNumber && (
                   <div>
                     <Label className="text-sm font-semibold text-muted-foreground">
@@ -1231,6 +1346,49 @@ export default function InvoiceDetailsPage() {
                   </div>
                 </>
               )}
+
+              {/* Related Documents (adjustments) */}
+              {invoice.adjustmentInvoices &&
+                invoice.adjustmentInvoices.length > 0 && (
+                  <>
+                    <Separator className="mt-4" />
+                    <div className="space-y-3 mt-4">
+                      <div>
+                        <Label className="text-sm font-semibold text-muted-foreground">
+                          Related Documents
+                        </Label>
+                      </div>
+                      <div className="space-y-2">
+                        {invoice.adjustmentInvoices.map((adj) => (
+                          <div
+                            key={adj.id}
+                            className="flex items-center justify-between"
+                          >
+                            <div className="flex items-center gap-2">
+                              <Badge variant="outline">
+                                {adj.documentType === "cancellation"
+                                  ? "Cancellation"
+                                  : "Credit Note"}
+                              </Badge>
+                              <Link
+                                href={`/invoices/${adj.id}`}
+                                className="text-blue-600 hover:underline font-mono"
+                              >
+                                {adj.customerInvoiceNumber || adj.id}
+                              </Link>
+                            </div>
+                            <div className="text-sm font-mono">
+                              {formatCurrency(
+                                adj.totalAmountCents,
+                                adj.currency
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
             </CardContent>
           </Card>
 

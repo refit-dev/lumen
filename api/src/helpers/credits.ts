@@ -32,7 +32,7 @@ import {
 } from "@lumen/common/schema";
 import { TransactionType } from "./index";
 import { z } from "zod";
-import { calculateNextBillingDate } from "./billing";
+import { calculateNextBillingDate } from "./billing-dates";
 import { PriceComponentSchemaType } from "@lumen/common";
 
 /**
@@ -1397,28 +1397,70 @@ export async function processRenewalAfterInvoice(
     return { renewalCount: 0 };
   }
 
-  // Get billing-triggered definitions for customer's plans
+  // Get billing-triggered definitions for customer's subscriptions (filtered by effective price)
   let renewalDefinitions: (typeof creditDefinitions.$inferSelect)[] = [];
+  const processedDefinitionIds = new Set<string>(); // Avoid duplicates
 
-  if (planIds.length > 0) {
-    // Query definitions for each planId separately
-    for (const planId of planIds) {
+  if (eligibleSubscriptions.length > 0) {
+    // Query definitions for each subscription separately to filter by effectivePriceId
+    for (const subscription of eligibleSubscriptions) {
+      // First get ALL credit definitions for this plan to see filtering in action
+      const allPlanDefs = await db_tx.query.creditDefinitions.findMany({
+        where: and(
+          eq(creditDefinitions.merchantId, merchantId),
+          eq(creditDefinitions.renewOnBilling, true),
+          eq(creditDefinitions.isActive, true),
+          eq(creditDefinitions.planId, subscription.planId),
+          isNull(creditDefinitions.deletedAt)
+        ),
+      });
+
+      // Then filter by price matching logic
       const defs = await db_tx.query.creditDefinitions.findMany({
         where: and(
           eq(creditDefinitions.merchantId, merchantId),
           eq(creditDefinitions.renewOnBilling, true),
           eq(creditDefinitions.isActive, true),
-          eq(creditDefinitions.planId, planId),
+          eq(creditDefinitions.planId, subscription.planId),
+          or(
+            isNull(creditDefinitions.priceId),
+            eq(creditDefinitions.priceId, subscription.effectivePriceId)
+          ),
           isNull(creditDefinitions.deletedAt)
         ),
       });
-      renewalDefinitions.push(...defs);
+
       console.log(
-        `[processRenewalAfterInvoice] Found credit definitions for plan`,
+        `[processRenewalAfterInvoice] Credit definition filtering for subscription ${subscription.id}:`,
         {
-          planId,
-          definitionCount: defs.length,
-          definitionIds: defs.map((d) => d.id),
+          allPlanDefs: allPlanDefs.map((d) => ({
+            id: d.id,
+            name: d.name,
+            priceId: d.priceId || "NULL",
+          })),
+          afterPriceFilter: defs.map((d) => ({
+            id: d.id,
+            name: d.name,
+            priceId: d.priceId || "NULL",
+          })),
+          subscriptionEffectivePrice: subscription.effectivePriceId,
+        }
+      );
+
+      // Only add definitions we haven't processed yet
+      const newDefs = defs.filter((d) => !processedDefinitionIds.has(d.id));
+      renewalDefinitions.push(...newDefs);
+      newDefs.forEach((d) => processedDefinitionIds.add(d.id));
+
+      console.log(
+        `[processRenewalAfterInvoice] Found credit definitions for subscription`,
+        {
+          subscriptionId: subscription.id,
+          planId: subscription.planId,
+          effectivePriceId: subscription.effectivePriceId,
+          definitionCount: newDefs.length,
+          definitionIds: newDefs.map((d) => d.id),
+          skippedDuplicates: defs.length - newDefs.length,
         }
       );
     }
@@ -1428,7 +1470,61 @@ export async function processRenewalAfterInvoice(
   let renewalCount = 0;
   let expiredCount = 0;
 
+  // Detect if any active subscription for this customer is on a seat-based plan
+  const seatBasedPlanIds = new Set<string>();
+  console.log(
+    `[processRenewalAfterInvoice] Detecting seat-based plans for ${eligibleSubscriptions.length} subscriptions`
+  );
+
+  for (const sub of eligibleSubscriptions) {
+    const plan = await db_tx.query.plans.findFirst({
+      where: eq(plans.id, sub.planId),
+    });
+    const price = await db_tx.query.prices.findFirst({
+      where: eq(prices.id, sub.effectivePriceId),
+    });
+
+    console.log(
+      `[processRenewalAfterInvoice] Checking subscription ${sub.id}:`,
+      {
+        planId: sub.planId,
+        effectivePriceId: sub.effectivePriceId,
+        priceComponents: price?.pricingData?.components?.map((c: any) => ({
+          type: c.type,
+          num_seats: c.num_seats,
+        })),
+      }
+    );
+
+    const hasSeatPerUnit = Array.isArray(price?.pricingData?.components)
+      ? price!.pricingData.components.some((c: any) => c.type === "per_unit")
+      : false;
+
+    console.log(
+      `[processRenewalAfterInvoice] Plan ${sub.planId} is seat-based: ${hasSeatPerUnit}`
+    );
+
+    if (hasSeatPerUnit) seatBasedPlanIds.add(sub.planId);
+  }
+
+  console.log(
+    `[processRenewalAfterInvoice] Detected ${seatBasedPlanIds.size} seat-based plans:`,
+    Array.from(seatBasedPlanIds)
+  );
+  console.log(
+    `[processRenewalAfterInvoice] Processing ${renewalDefinitions.length} renewal definitions:`,
+    renewalDefinitions.map((d) => ({
+      id: d.id,
+      name: d.name,
+      planId: d.planId,
+      expiryDays: d.expiryDays,
+    }))
+  );
+
   for (const definition of renewalDefinitions) {
+    console.log(
+      `[processRenewalAfterInvoice] ===== Processing definition ${definition.id} (${definition.name}) for plan ${definition.planId} =====`
+    );
     // Check if this definition should expire old credits with billing cycle
     if (definition.expiryDays === -1) {
       console.log(
@@ -1440,7 +1536,7 @@ export async function processRenewalAfterInvoice(
         }
       );
 
-      // Find and expire all existing active grants for this definition and customer
+      // Find and expire all existing active grants for this definition and customer (primary)
       const existingGrants = await db_tx.query.creditGrants.findMany({
         where: and(
           eq(creditGrants.merchantId, merchantId),
@@ -1497,21 +1593,215 @@ export async function processRenewalAfterInvoice(
 
         expiredCount++;
       }
+
+      // If seat-based: also expire existing active grants for all org members
+      if (seatBasedPlanIds.has(definition.planId!)) {
+        console.log(
+          `[processRenewalAfterInvoice] Processing seat-based expiry for definition ${definition.id}`
+        );
+
+        const primary = await db_tx.query.customers.findFirst({
+          where: and(
+            eq(customers.id, customerId),
+            eq(customers.merchantId, merchantId)
+          ),
+        });
+
+        console.log(`[processRenewalAfterInvoice] Primary customer org info:`, {
+          customerId: primary?.id,
+          customerOrganizationId: primary?.customerOrganizationId,
+          orgRole: primary?.orgRole,
+        });
+
+        const orgId = primary?.customerOrganizationId || null;
+        if (orgId) {
+          const members = await db_tx.query.customers.findMany({
+            where: and(
+              eq(customers.merchantId, merchantId),
+              eq(customers.customerOrganizationId, orgId),
+              isNull(customers.deletedAt)
+            ),
+          });
+
+          console.log(
+            `[processRenewalAfterInvoice] Found ${members.length} org members for expiry:`,
+            members.map((m) => ({
+              id: m.id,
+              role: m.orgRole,
+              externalId: m.externalCustomerId,
+            }))
+          );
+
+          for (const member of members) {
+            if (member.id === customerId) {
+              console.log(
+                `[processRenewalAfterInvoice] Skipping primary customer ${member.id} in member expiry (already handled)`
+              );
+              continue; // already handled primary above
+            }
+
+            const memberGrants = await db_tx.query.creditGrants.findMany({
+              where: and(
+                eq(creditGrants.merchantId, merchantId),
+                eq(creditGrants.customerId, member.id),
+                eq(creditGrants.creditDefinitionId, definition.id),
+                isNull(creditGrants.deletedAt),
+                isNull(creditGrants.expiryDate),
+                eq(creditGrants.status, "ACTIVE")
+              ),
+            });
+
+            console.log(
+              `[processRenewalAfterInvoice] Found ${memberGrants.length} grants to expire for member ${member.id}`,
+              memberGrants.map((g) => ({
+                id: g.id,
+                remaining: g.remainingAmount,
+              }))
+            );
+
+            for (const mGrant of memberGrants) {
+              if (mGrant.remainingAmount > 0) {
+                await createCreditTransaction(
+                  {
+                    merchantId,
+                    customerId: member.id,
+                    creditGrantId: mGrant.id,
+                    amount: mGrant.remainingAmount,
+                    applicationType: mGrant.applicationType,
+                    eventName: "expired",
+                    eventTimestamp: new Date(),
+                    featureId: mGrant.featureId || undefined,
+                    featureSlug: mGrant.featureSlug || undefined,
+                    priceId: mGrant.priceId || undefined,
+                    priceComponentId: mGrant.priceComponentId || undefined,
+                    currency: mGrant.currency || undefined,
+                    notes: "Expired with billing cycle (seat member)",
+                  },
+                  tx
+                );
+              }
+              await db_tx
+                .update(creditGrants)
+                .set({ status: "EXPIRED", updatedAt: new Date() })
+                .where(eq(creditGrants.id, mGrant.id));
+              expiredCount++;
+
+              console.log(
+                `[processRenewalAfterInvoice] Expired grant ${mGrant.id} for member ${member.id}`
+              );
+            }
+          }
+        } else {
+          console.log(
+            `[processRenewalAfterInvoice] No organization ID found for primary customer ${customerId}`
+          );
+        }
+      }
     }
 
-    // Create new grant (regardless of whether we expired old ones)
-    await createCreditGrant(
-      {
-        merchantId,
-        customerId,
-        creditDefinitionId: definition.id,
-        initialAmount: definition.refillAmount || definition.defaultAmount,
-        source: "refill",
-        notes: "Billing cycle renewal",
-      },
-      tx
+    // Create new grant(s)
+    const isSeatBasedForThisDef = seatBasedPlanIds.has(definition.planId!);
+    console.log(
+      `[processRenewalAfterInvoice] Creating renewal grants for definition ${definition.id} (${definition.name}), seat-based: ${isSeatBasedForThisDef}`
     );
-    renewalCount++;
+
+    if (isSeatBasedForThisDef) {
+      // Fan out to all organization members
+      const primary = await db_tx.query.customers.findFirst({
+        where: and(
+          eq(customers.id, customerId),
+          eq(customers.merchantId, merchantId)
+        ),
+      });
+
+      console.log(
+        `[processRenewalAfterInvoice] Primary customer for renewal:`,
+        {
+          customerId: primary?.id,
+          customerOrganizationId: primary?.customerOrganizationId,
+          orgRole: primary?.orgRole,
+        }
+      );
+
+      const orgId = primary?.customerOrganizationId || null;
+      if (orgId) {
+        const members = await db_tx.query.customers.findMany({
+          where: and(
+            eq(customers.merchantId, merchantId),
+            eq(customers.customerOrganizationId, orgId),
+            isNull(customers.deletedAt)
+          ),
+        });
+
+        console.log(
+          `[processRenewalAfterInvoice] Found ${members.length} org members for renewal:`,
+          members.map((m) => ({
+            id: m.id,
+            role: m.orgRole,
+            externalId: m.externalCustomerId,
+          }))
+        );
+
+        for (const member of members) {
+          console.log(
+            `[processRenewalAfterInvoice] Creating renewal grant for member ${member.id} (role: ${member.orgRole})`
+          );
+
+          await createCreditGrant(
+            {
+              merchantId,
+              customerId: member.id,
+              creditDefinitionId: definition.id,
+              initialAmount:
+                definition.refillAmount || definition.defaultAmount,
+              source: "refill",
+              notes: `Billing cycle renewal for ${member.orgRole === "primary" ? "primary customer" : "seat member"} ${member.id}`,
+            },
+            tx
+          );
+          renewalCount++;
+
+          console.log(
+            `[processRenewalAfterInvoice] Created renewal grant for member ${member.id}`
+          );
+        }
+      } else {
+        console.log(
+          `[processRenewalAfterInvoice] No org ID found, falling back to primary customer only`
+        );
+
+        // Fallback to just the primary
+        await createCreditGrant(
+          {
+            merchantId,
+            customerId,
+            creditDefinitionId: definition.id,
+            initialAmount: definition.refillAmount || definition.defaultAmount,
+            source: "refill",
+            notes: "Billing cycle renewal (no org)",
+          },
+          tx
+        );
+        renewalCount++;
+      }
+    } else {
+      console.log(
+        `[processRenewalAfterInvoice] Creating single renewal grant for non-seat plan, customer ${customerId}`
+      );
+
+      await createCreditGrant(
+        {
+          merchantId,
+          customerId,
+          creditDefinitionId: definition.id,
+          initialAmount: definition.refillAmount || definition.defaultAmount,
+          source: "refill",
+          notes: "Billing cycle renewal",
+        },
+        tx
+      );
+      renewalCount++;
+    }
   }
 
   console.log(`[processRenewalAfterInvoice] Completed renewal process`, {
@@ -1800,6 +2090,7 @@ export async function getCreditAllowanceForFeature(
           eq(creditGrants.customerId, customerId),
           eq(creditGrants.featureSlug, featureSlug),
           eq(creditGrants.applicationType, "usage"),
+          eq(creditGrants.status, "ACTIVE"), // Only count active grants
           or(
             gte(creditGrants.expiryDate, now),
             isNull(creditGrants.expiryDate)

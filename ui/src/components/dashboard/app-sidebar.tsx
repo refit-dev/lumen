@@ -14,6 +14,7 @@ import {
   Percent,
   DollarSign,
   Shield,
+  Wallet,
 } from "lucide-react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
@@ -128,6 +129,16 @@ const data = {
         },
       ],
     },
+    {
+      title: "Lumen Account & Billing",
+      items: [
+        {
+          title: "Account & Billing",
+          url: "/billing",
+          icon: Wallet,
+        },
+      ],
+    },
   ],
 };
 
@@ -152,6 +163,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             title: "Admin Panel",
             url: "/admin",
             icon: Shield,
+          },
+          {
+            title: "Internal Key Values",
+            url: "/admin/internal",
+            icon: Settings,
           },
         ],
       });

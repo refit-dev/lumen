@@ -13,9 +13,13 @@ import {
   prices,
   creditDefinitions,
   creditGrants,
+  payments,
+  customerOrganizations,
 } from "@lumen/common/schema";
+import { paymentRetries } from "@lumen/common/schema";
 import { invoices } from "@lumen/common/schema";
-import { and, eq, gt, gte, isNull, lte, ne, or } from "drizzle-orm";
+import { metrics } from "@lumen/common/schema";
+import { and, eq, gt, gte, isNull, lte, ne, or, lt } from "drizzle-orm";
 import { uploadFile, getObjectStorageUrl } from "../helpers/s3";
 import {
   generateLineItemObjectForComponent,
@@ -24,6 +28,8 @@ import {
   formatCustomerInvoiceNumber,
   triggerInvoicePdfGeneration,
   updateSubscriptionBillingCycle,
+  getOrCreateDunningConfig,
+  calculateUsageForComponent,
 } from "../helpers/billing";
 import {
   getActiveMonetaryCredits,
@@ -41,7 +47,6 @@ import {
   migrateSubscription,
   initiateTrialToPaymentUpgrade,
 } from "../helpers/billing";
-import { payments } from "@lumen/common/schema";
 import Stripe from "stripe";
 import { forceReconciliation } from "../lib/cacheSynchronizer";
 import { createPrefixedId, ID_PREFIXES } from "@lumen/common";
@@ -52,7 +57,11 @@ import {
   getPaymentProvider,
   processPayment,
   createOneTimePaymentLink,
+  chargeInvoice,
+  retryInvoicePayment,
 } from "../helpers/paymentprovider";
+import { enforceDunningEndAction } from "../helpers/dunning";
+import { createNotificationProvider } from "../helpers/notificationProvider";
 
 type Invoice = typeof invoices.$inferSelect;
 type Payment = typeof payments.$inferSelect;
@@ -162,6 +171,7 @@ interface PaymentContext {
   processedDetails: ProcessedSubscriptionDetail[];
   merchantId: string;
   currency: string;
+  seatAwareUsage?: boolean;
 }
 
 interface TransactionResult {
@@ -271,6 +281,17 @@ async function processSubscriptionDetails(
       };
     }
 
+    // Skip paused/unpaid/canceled subscriptions from billing
+    const subStatus = subDetailDbRecord.subscription.status as
+      | string
+      | undefined;
+    if (subStatus && ["paused", "unpaid", "canceled"].includes(subStatus)) {
+      console.log(
+        `Skipping billing for subscription ${subDetailDbRecord.subscriptionId} with status ${subStatus}`
+      );
+      continue;
+    }
+
     // Calculate billing period
     const billingPeriodStart =
       subDetailDbRecord.previousBillingDate ||
@@ -302,10 +323,25 @@ async function processSubscriptionDetails(
 // Helper function to fetch payment dependencies
 async function fetchPaymentDependencies(
   customerId: string,
-  merchantId: string
+  merchantId: string,
+  preferredPaymentMethodId?: string | null
 ): Promise<{
   paymentMethod: typeof paymentMethods.$inferSelect | null;
 }> {
+  // Prefer the explicitly set payment method on subscription details when available
+  if (preferredPaymentMethodId) {
+    const pm = await db.query.paymentMethods.findFirst({
+      where: and(
+        eq(paymentMethods.id, preferredPaymentMethodId),
+        isNull(paymentMethods.deletedAt)
+      ),
+    });
+    if (pm) {
+      return { paymentMethod: pm };
+    }
+  }
+
+  // Fallback: most recently used active method for the customer
   const paymentMethodResult = await db.query.paymentMethods.findFirst({
     where: and(
       eq(paymentMethods.customerId, customerId),
@@ -1108,6 +1144,42 @@ async function processPostInvoiceOperations(
   }
 }
 
+// Helper function to get all customers that should be billed
+async function getCustomersToBill(
+  context: PaymentContext
+): Promise<(typeof customers.$inferSelect)[]> {
+  // For non-seat-aware plans, just return the primary customer
+  if (!context.seatAwareUsage) {
+    return [context.customer];
+  }
+
+  // For seat-aware plans, get all organization members
+  if (!context.customer.customerOrganizationId) {
+    console.log(
+      `[getCustomersToBill] Seat-aware plan but customer ${context.customer.id} has no organization, treating as single customer`
+    );
+    return [context.customer];
+  }
+
+  // Get all customers in the organization
+  const orgCustomers = await db.query.customers.findMany({
+    where: and(
+      eq(
+        customers.customerOrganizationId,
+        context.customer.customerOrganizationId
+      ),
+      eq(customers.merchantId, context.merchantId),
+      isNull(customers.deletedAt)
+    ),
+  });
+
+  console.log(
+    `[getCustomersToBill] Found ${orgCustomers.length} customers in organization ${context.customer.customerOrganizationId}`
+  );
+
+  return orgCustomers;
+}
+
 // Helper function to generate charge line items for pricing components
 async function generateChargeLineItems(
   context: PaymentContext
@@ -1117,6 +1189,16 @@ async function generateChargeLineItems(
 > {
   console.log(
     `[generateChargeLineItems] Generating line items for ${context.processedDetails.length} components`
+  );
+
+  // Determine all customers to bill (for seat-based plans, this includes all org members)
+  const customersToBill = await getCustomersToBill(context);
+  console.log(
+    `[generateChargeLineItems] Will generate line items for ${customersToBill.length} customer(s)`,
+    {
+      isSeatAware: context.seatAwareUsage,
+      customerIds: customersToBill.map((c) => c.id),
+    }
   );
 
   // Check for pending scheduled changes that would affect pricing
@@ -1320,25 +1402,68 @@ async function generateChargeLineItems(
       // Note: bill_immediately defaults to true, so undefined should be treated as true
     }
 
-    const lineItem = await generateLineItemObjectForComponent(
-      componentToUse,
-      context.merchantId,
-      context.customer.id,
-      data.billingPeriodStart,
-      data.billingPeriodEnd,
-      data.subDetail.subscription.price.id,
-      data.subDetail.subscription.id
-    );
+    // For usage components, generate line items for each customer in the organization
+    if (componentToUse.type === "usage" && customersToBill.length > 1) {
+      console.log(
+        `[generateChargeLineItems] Generating usage line items for ${customersToBill.length} customers`
+      );
 
-    console.log(`[generateChargeLineItems] Generated line item`, {
-      componentId: data.component.component_id,
-      subtotalCents: lineItem.subtotalCents,
-      description: lineItem.description,
-      priceOverrideApplied: componentToUse !== data.component,
-    });
+      for (const customerToBill of customersToBill) {
+        const lineItem = await generateLineItemObjectForComponent(
+          componentToUse,
+          context.merchantId,
+          customerToBill.id,
+          data.billingPeriodStart,
+          data.billingPeriodEnd,
+          data.subDetail.subscription.price.id,
+          data.subDetail.subscription.id
+        );
 
-    totalAmountCents += lineItem.subtotalCents;
-    lineItems.push(lineItem);
+        // Add customer identifier to description for seat-based plans
+        if (lineItem.quantity && lineItem.quantity > 0) {
+          // Use email if available, otherwise use external customer ID
+          const customerIdentifier =
+            customerToBill.email ||
+            customerToBill.externalCustomerId ||
+            customerToBill.id;
+          lineItem.description = `${lineItem.description} (${customerIdentifier})`;
+
+          console.log(`[generateChargeLineItems] Generated usage line item`, {
+            componentId: data.component.component_id,
+            customerId: customerToBill.id,
+            customerEmail: customerToBill.email,
+            customerExternalId: customerToBill.externalCustomerId,
+            quantity: lineItem.quantity,
+            subtotalCents: lineItem.subtotalCents,
+            description: lineItem.description,
+          });
+
+          totalAmountCents += lineItem.subtotalCents;
+          lineItems.push(lineItem);
+        }
+      }
+    } else {
+      // For non-usage components or single customer, generate one line item
+      const lineItem = await generateLineItemObjectForComponent(
+        componentToUse,
+        context.merchantId,
+        context.customer.id,
+        data.billingPeriodStart,
+        data.billingPeriodEnd,
+        data.subDetail.subscription.price.id,
+        data.subDetail.subscription.id
+      );
+
+      console.log(`[generateChargeLineItems] Generated line item`, {
+        componentId: data.component.component_id,
+        subtotalCents: lineItem.subtotalCents,
+        description: lineItem.description,
+        priceOverrideApplied: componentToUse !== data.component,
+      });
+
+      totalAmountCents += lineItem.subtotalCents;
+      lineItems.push(lineItem);
+    }
   }
 
   console.log(
@@ -1378,10 +1503,14 @@ async function applyCreditWaterfall(
   // Step 1: Add usage credit line items (converted to monetary values)
   console.log(`[applyCreditWaterfall] Checking for usage credits`);
 
+  // Get all customers to check for credits (for seat-based plans)
+  const customersToBill = await getCustomersToBill(context);
+
   const usageCreditLineItems = await generateUsageCreditLineItems(
     {
       merchantId: context.merchantId,
       customerId: context.customer.id,
+      customersToBill,
       processedDetails: context.processedDetails,
       billingSessionId,
     },
@@ -1953,7 +2082,7 @@ async function createInvoiceAndLineItemsInDb(
     await triggerPdfGeneration(tx, newInvoice.id);
   } else {
     console.log(
-      `[createInvoiceAndLineItemsInDb] Skipping initial PDF generation for invoice ${newInvoice.id} because no payment method is on file – it will be generated after the checkout link is attached.`
+      `[createInvoiceAndLineItemsInDb] Skipping initial PDF generation for invoice ${newInvoice.id} because no payment method is on file. It will be generated after the checkout link is attached.`
     );
   }
 
@@ -2219,6 +2348,20 @@ function overrideComponentAmounts(
   return oldComponent;
 }
 
+// Helper function to get the next attempt number for payment retries
+// NOTE: This is not concurrency-safe if invoked in parallel for the same invoice.
+// For the MVP we run a single scheduled job daily, so the risk of duplicate
+// attempt numbers is acceptable. If we later introduce parallelism, we should
+// move this to a DB-side atomic increment or enforce uniqueness at write time.
+async function getNextAttemptNumber(invoiceId: string): Promise<number> {
+  const lastRetry = await db.query.paymentRetries.findFirst({
+    where: eq(paymentRetries.invoiceId, invoiceId),
+    orderBy: (paymentRetries, { desc }) => [desc(paymentRetries.attemptNumber)],
+  });
+
+  return (lastRetry?.attemptNumber || 0) + 1;
+}
+
 export const billingRouter = new Hono()
   // Route to check for subscriptions due for billing
   .post("/check-due", zValidator("json", checkDueSchema), async (c) => {
@@ -2398,18 +2541,35 @@ export const billingRouter = new Hono()
           processedDetails[0].subDetail.subscription.price.currency;
 
         // Step 5: Fetch payment dependencies
+        // Prefer payment method set on subscription details, if any
+        const preferredPaymentMethodId = processedDetails
+          .map((d) => d.subDetail.paymentMethodId)
+          .find((id) => !!id) as string | undefined;
         const { paymentMethod } = await fetchPaymentDependencies(
           customerId,
-          customer.merchantId
+          customer.merchantId,
+          preferredPaymentMethodId
         );
 
         // Step 6: Build payment context
+        // Check if this is a seat-based plan
+        let isSeatBasedPlan = false;
+        if (processedDetails.length > 0) {
+          const price = processedDetails[0].subDetail.subscription.price;
+          isSeatBasedPlan = Array.isArray(price.pricingData?.components)
+            ? price.pricingData.components.some(
+                (c: any) => c.type === "per_unit"
+              )
+            : false;
+        }
+
         const paymentContext: PaymentContext = {
           customer,
           paymentMethod: paymentMethod, // May be null for free plans
           processedDetails,
           merchantId,
           currency,
+          seatAwareUsage: isSeatBasedPlan,
         };
 
         // Draft invoices are now handled separately and not merged into regular billing
@@ -2722,4 +2882,338 @@ export const billingRouter = new Hono()
         );
       }
     }
-  );
+  )
+
+  // Dunning Management Endpoints
+  .post("/dunning/enforce-grace-periods", async (c) => {
+    const requestBody = await c.req.json();
+    const currentTimestamp = new Date(requestBody.timestamp || new Date());
+
+    console.log("Starting dunning grace period enforcement", {
+      timestamp: currentTimestamp,
+    });
+
+    try {
+      // Find subscriptions with expired grace periods
+      const expiredSubscriptions = await db.query.subscriptions.findMany({
+        where: and(
+          eq(subscriptions.status, "past_due"),
+          lte(subscriptions.gracePeriodEndsAt, currentTimestamp),
+          isNull(subscriptions.deletedAt)
+        ),
+      });
+
+      let processed = 0;
+
+      for (const subscription of expiredSubscriptions) {
+        // Get dunning config using hierarchical lookup
+        const dunningConfig = await getOrCreateDunningConfig(
+          subscription.merchantId,
+          subscription.planId
+        );
+
+        console.log(
+          `Enforcing dunning action for subscription ${subscription.id}`,
+          {
+            action: dunningConfig.endOfDunningAction,
+            gracePeriodEnded: subscription.gracePeriodEndsAt,
+          }
+        );
+
+        await db.transaction(async (tx) => {
+          await enforceDunningEndAction({
+            tx,
+            subscriptionId: subscription.id,
+            action: (dunningConfig.endOfDunningAction === "pause_subscription"
+              ? "pause_subscription"
+              : dunningConfig.endOfDunningAction === "cancel_subscription"
+                ? "cancel_subscription"
+                : "mark_as_unpaid") as any,
+            currentTimestamp,
+          });
+        });
+        processed++;
+      }
+
+      console.log(
+        `Dunning grace period enforcement completed: ${processed} subscriptions processed`
+      );
+
+      return c.json({
+        success: true,
+        processed,
+        timestamp: currentTimestamp.toISOString(),
+      });
+    } catch (error) {
+      console.error("Error enforcing dunning grace periods:", error);
+      return c.json(
+        {
+          error: "Failed to enforce dunning grace periods",
+          details: error instanceof Error ? error.message : String(error),
+        },
+        500
+      );
+    }
+  })
+
+  .post("/dunning/retry-payments", async (c) => {
+    const requestBody = await c.req.json();
+    const currentTimestamp = new Date(requestBody.timestamp || new Date());
+
+    console.log("Starting dunning payment retry process", {
+      timestamp: currentTimestamp,
+    });
+
+    try {
+      // Find subscriptions in dunning that are still within grace period
+      const pastDueSubscriptions = await db.query.subscriptions.findMany({
+        where: and(
+          eq(subscriptions.status, "past_due"),
+          gt(subscriptions.gracePeriodEndsAt, currentTimestamp),
+          isNull(subscriptions.deletedAt)
+        ),
+        with: {
+          customer: true,
+        },
+      });
+
+      let attempted = 0;
+      // For reporting back to the scheduled job:
+      // "succeeded" and "failed" here reflect queueing success, not payment results
+      let succeeded = 0;
+      let failed = 0;
+
+      for (const subscription of pastDueSubscriptions) {
+        try {
+          // Find the latest unpaid invoice for this subscription
+          const unpaidInvoice = await db.query.invoices.findFirst({
+            where: and(
+              eq(invoices.subscriptionId, subscription.id),
+              eq(invoices.status, "issued")
+            ),
+            orderBy: (invoices, { desc }) => [desc(invoices.createdAt)],
+          });
+
+          if (!unpaidInvoice) {
+            console.log(
+              `No unpaid invoice found for subscription ${subscription.id}`
+            );
+            continue;
+          }
+
+          // Get customer's payment method
+          const paymentMethod = await db.query.paymentMethods.findFirst({
+            where: and(
+              eq(paymentMethods.customerId, subscription.customerId),
+              isNull(paymentMethods.deletedAt)
+            ),
+            orderBy: (paymentMethods, { desc }) => [
+              desc(paymentMethods.lastUsedAt),
+            ],
+          });
+
+          if (!paymentMethod) {
+            console.log(
+              `No payment method found for customer ${subscription.customerId}`
+            );
+            continue;
+          }
+
+          attempted++;
+
+          console.log(`Retrying payment for subscription ${subscription.id}`, {
+            invoiceId: unpaidInvoice.id,
+            amountCents: unpaidInvoice.totalAmountCents,
+          });
+
+          let existingPayment = await db.query.payments.findFirst({
+            where: eq(payments.invoiceId, unpaidInvoice.id),
+            orderBy: (payments, { desc }) => [desc(payments.createdAt)],
+          });
+
+          if (!existingPayment) {
+            // this should never happen - we create the payment object with the invoice
+            // but just in case, we'll create it here
+            console.log(
+              `No payment found for invoice ${unpaidInvoice.id}, creating one`
+            );
+            const created = await db
+              .insert(payments)
+              .values({
+                merchantId: subscription.merchantId,
+                invoiceId: unpaidInvoice.id,
+                paymentMethodId: paymentMethod.id,
+                amountCents: unpaidInvoice.totalAmountCents,
+                currency: unpaidInvoice.currency,
+                status: "pending",
+              })
+              .returning();
+            existingPayment = created[0];
+          }
+
+          const attemptNumber = await getNextAttemptNumber(unpaidInvoice.id);
+
+          const [retryRecord] = await db
+            .insert(paymentRetries)
+            .values({
+              paymentId: existingPayment.id,
+              invoiceId: unpaidInvoice.id,
+              attemptNumber,
+              status: "pending",
+            })
+            .returning();
+
+          const queueResult = await retryInvoicePayment({
+            invoiceId: unpaidInvoice.id,
+            paymentRetryId: retryRecord.id,
+            attemptNumber,
+          });
+
+          if (queueResult.queued) {
+            succeeded++;
+          } else {
+            failed++;
+          }
+
+          console.log(
+            `Queued payment retry for subscription ${subscription.id}, invoice ${unpaidInvoice.id}, attempt #${attemptNumber}`
+          );
+        } catch (retryError) {
+          console.error(
+            `Error retrying payment for subscription ${subscription.id}:`,
+            retryError
+          );
+        }
+      }
+
+      console.log(
+        `Dunning payment retry queued: ${attempted} attempts scheduled`
+      );
+
+      return c.json({
+        success: true,
+        attempted,
+        succeeded,
+        failed,
+        timestamp: currentTimestamp.toISOString(),
+      });
+    } catch (error) {
+      console.error("Error during dunning payment retry:", error);
+      return c.json(
+        {
+          error: "Failed to retry dunning payments",
+          details: error instanceof Error ? error.message : String(error),
+        },
+        500
+      );
+    }
+  })
+  .post("/dunning/notify-grace-ending-soon", async (c) => {
+    try {
+      const requestBody = await c.req.json().catch(() => ({}));
+      const currentTimestamp = new Date(requestBody.timestamp || new Date());
+
+      const windowStart = new Date(
+        currentTimestamp.getTime() + 23 * 60 * 60 * 1000
+      );
+      const windowEnd = new Date(
+        currentTimestamp.getTime() + 24 * 60 * 60 * 1000
+      );
+
+      console.log("Starting grace-ending-soon notifications", {
+        windowStart: windowStart.toISOString(),
+        windowEnd: windowEnd.toISOString(),
+      });
+
+      const candidates = await db.query.subscriptions.findMany({
+        where: and(
+          eq(subscriptions.status, "past_due"),
+          gte(subscriptions.gracePeriodEndsAt, windowStart),
+          lt(subscriptions.gracePeriodEndsAt, windowEnd),
+          isNull(subscriptions.deletedAt)
+        ),
+        with: {
+          customer: true,
+        },
+      });
+
+      const notify = createNotificationProvider();
+      let notified = 0;
+
+      for (const sub of candidates) {
+        try {
+          const merchantRecord = await db.query.merchants.findFirst({
+            where: eq(merchants.id, sub.merchantId),
+          });
+
+          const merchantName =
+            merchantRecord?.displayName ||
+            merchantRecord?.legalName ||
+            "Your Service Provider";
+          const customerEmail = sub.customer?.email || null;
+          const merchantNotifyEmail =
+            merchantRecord?.billingEmail ||
+            merchantRecord?.supportEmail ||
+            null;
+
+          if (customerEmail) {
+            await notify.sendEmail({
+              to: customerEmail,
+              subject: `Action needed: Grace period ending soon`,
+              html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                  <h2>Update your payment method to avoid interruption</h2>
+                  <p>We couldn't collect your last payment. Your grace period ends on <strong>${sub.gracePeriodEndsAt?.toISOString()}</strong>.</p>
+                  <p>Please update your payment method to keep your subscription active.</p>
+                  <p>Best regards,<br>${merchantName}</p>
+                </div>
+              `,
+              from: "noreply@getlumen.dev",
+            });
+          }
+
+          if (merchantNotifyEmail) {
+            await notify.sendEmail({
+              to: merchantNotifyEmail,
+              subject: `Grace ending soon for subscription ${sub.id}`,
+              html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                  <h2>Grace period ends soon</h2>
+                  <p>Subscription ${sub.id} (customer: ${sub.customer?.email || "unknown"}) is approaching grace period end.</p>
+                  <p>Grace period end: <strong>${sub.gracePeriodEndsAt?.toISOString()}</strong></p>
+                </div>
+              `,
+              from: "noreply@getlumen.dev",
+            });
+          }
+
+          notified++;
+        } catch (e) {
+          console.error(
+            `Failed to send grace-ending-soon notifications for subscription ${sub.id}`,
+            e
+          );
+        }
+      }
+
+      console.log(
+        `Grace-ending-soon notifications completed for ${notified} subscriptions`
+      );
+
+      return c.json({
+        success: true,
+        notified,
+        windowStart: windowStart.toISOString(),
+        windowEnd: windowEnd.toISOString(),
+      });
+    } catch (error) {
+      console.error("Error during grace-ending-soon notifications:", error);
+      return c.json(
+        {
+          error: "Failed to send grace-ending-soon notifications",
+          details: error instanceof Error ? error.message : String(error),
+        },
+        500
+      );
+    }
+  });

@@ -8,6 +8,7 @@ import {
   varchar,
   index,
   unique,
+  pgEnum,
 } from "drizzle-orm/pg-core";
 import { createPrefixedId, ID_PREFIXES } from "../utils";
 import { merchants } from "./merchants";
@@ -22,6 +23,16 @@ import {
   createInsertSchema,
   createUpdateSchema,
 } from "drizzle-zod";
+
+// Subscription status enum for dunning management
+export const subscriptionStatusEnum = pgEnum("subscription_status", [
+  "active",
+  "trialing",
+  "past_due",
+  "paused",
+  "unpaid",
+  "canceled",
+]);
 
 export const subscriptions = pgTable(
   "subscriptions",
@@ -56,6 +67,11 @@ export const subscriptions = pgTable(
 
     startTimestamp: timestamp("start_timestamp").defaultNow().notNull(),
     endTimestamp: timestamp("end_timestamp"),
+
+    // Dunning management columns
+    status: subscriptionStatusEnum("status").default("active").notNull(),
+    gracePeriodEndsAt: timestamp("grace_period_ends_at"),
+
     createdAt: timestamp("created_at").defaultNow().notNull(),
     deletedAt: timestamp("deleted_at"),
   },
@@ -74,6 +90,12 @@ export const subscriptions = pgTable(
 
     // For stable subscription ID lookups
     index("idx_subscriptions_stable_id").on(table.stableSubscriptionId),
+
+    // Index for dunning queries (past_due subscriptions with grace periods)
+    index("idx_subscriptions_status_grace_period").on(
+      table.status,
+      table.gracePeriodEndsAt
+    ),
   ]
 );
 

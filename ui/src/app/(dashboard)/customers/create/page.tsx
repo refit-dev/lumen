@@ -8,10 +8,10 @@ import {
   customersInsertSchemaReq,
 } from "@lumen/common/schema";
 
-import { useEffect, useCallback } from "react";
+import { useEffect, useCallback, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, ExternalLink, Info } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import {
   customerCountries,
@@ -21,6 +21,17 @@ import {
 import { randomCustomer } from "@/lib/random";
 import { useQuery } from "@tanstack/react-query";
 import { useStore } from "@tanstack/react-form";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectTrigger,
+  SelectContent,
+  SelectItem,
+  SelectValue,
+} from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
 
 export default function CreateCustomerPage() {
   const router = useRouter();
@@ -68,7 +79,7 @@ export default function CreateCustomerPage() {
       billingStateProvince: "",
       billingPostalCode: "",
       taxId: "",
-      taxExemptionReason: "no",
+      taxExemptionReason: "",
       taxRateDefinitionId: "default",
       taxCalculationMethod: "default",
     },
@@ -90,19 +101,55 @@ export default function CreateCustomerPage() {
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           const { taxRateDefinitionId, taxCalculationMethod, ...restValue } =
             value;
+
+          // Determine tax treatment based on UI state
+          const treatment = selectedTaxTreatment;
+
           submitData = {
             ...restValue,
-            taxExempt:
-              value.taxExemptionReason === "reverse_charge" ||
-              value.taxExemptionReason === "customer_exempt",
+            taxExempt: treatment === "exempt",
           };
 
-          // Convert frontend values to backend format - only include if not default
-          if (value.taxRateDefinitionId !== "default") {
-            submitData.taxRateDefinitionId = value.taxRateDefinitionId;
+          // Map calculation method
+          if (treatment === "auto") {
+            submitData.taxCalculationMethod = "auto" as
+              | "auto"
+              | "manual"
+              | "default";
+          } else if (treatment === "manual") {
+            submitData.taxCalculationMethod = "manual" as
+              | "auto"
+              | "manual"
+              | "default";
+          } else if (treatment === "default") {
+            submitData.taxCalculationMethod = "default" as
+              | "auto"
+              | "manual"
+              | "default";
+          } else if (treatment === "exempt") {
+            // Keep merchant default calculation method in the background
+            submitData.taxCalculationMethod = (
+              taxConfig?.autoTaxCalculation ? "auto" : "default"
+            ) as "auto" | "manual" | "default";
+            // Pass the detailed exemption reason
+            const reason =
+              selectedExemptionReason === "other"
+                ? exemptionOtherText.trim()
+                : selectedExemptionReason;
+            if (reason) {
+              submitData = {
+                ...(submitData as object),
+                taxExemptionReason: reason,
+              } as typeof submitData;
+            }
           }
-          if (value.taxCalculationMethod !== "default") {
-            submitData.taxCalculationMethod = value.taxCalculationMethod;
+
+          // Convert frontend values to backend format - only include if not default
+          if (
+            treatment === "manual" &&
+            value.taxRateDefinitionId !== "default"
+          ) {
+            submitData.taxRateDefinitionId = value.taxRateDefinitionId;
           }
         }
 
@@ -150,6 +197,27 @@ export default function CreateCustomerPage() {
   // Subscribe to form values so the component re-renders when they change
   const formValues = useStore(form.store, (state) => state.values);
 
+  // Local UI state for tax treatment and exemption reasons
+  const [selectedTaxTreatment, setSelectedTaxTreatment] = useState<
+    "auto" | "manual" | "default" | "exempt"
+  >("default");
+  const [exemptionDialogOpen, setExemptionDialogOpen] = useState(false);
+  const [selectedExemptionReason, setSelectedExemptionReason] =
+    useState<string>("nonprofit_organization");
+  const [exemptionOtherText, setExemptionOtherText] = useState("");
+
+  // Initialize default tax treatment based on merchant config - UI only
+  useEffect(() => {
+    if (paymentProvider?.provider === "dodo") return;
+    if (taxConfig?.autoTaxCalculation) {
+      setSelectedTaxTreatment("auto");
+    } else {
+      setSelectedTaxTreatment("default");
+    }
+  }, [taxConfig?.autoTaxCalculation, paymentProvider]);
+
+  // No longer mirror dropdown into form field; we use local treatment state
+
   const handleNavigateBack = useCallback(() => {
     router.back();
   }, [router]);
@@ -180,39 +248,9 @@ export default function CreateCustomerPage() {
     }
   }, [formValues.billingCountry, formValues.billingStateProvince, form]);
 
-  // Update calculation method based on tax exemption reason selection
-  // Only run for non-Dodo payment providers
-  useEffect(() => {
-    if (paymentProvider?.provider === "dodo") return;
+  // No longer synchronize form field with UI state - handle only on submit
 
-    const { taxExemptionReason: reason, taxCalculationMethod: method } =
-      formValues;
-
-    if (reason === "no_manual" && method !== "manual") {
-      form.setFieldValue("taxCalculationMethod", "manual");
-    } else if (reason === "no_auto" && method !== "auto") {
-      form.setFieldValue("taxCalculationMethod", "auto");
-    } else if (reason === "no" && method !== "default") {
-      form.setFieldValue("taxCalculationMethod", "default");
-    } else if (
-      (reason === "reverse_charge" || reason === "customer_exempt") &&
-      method === "manual"
-    ) {
-      // Reset to merchant's default calculation mode when selecting exemptions
-      const fallbackMethod = taxConfig?.autoTaxCalculation ? "auto" : "default";
-      form.setFieldValue("taxCalculationMethod", fallbackMethod);
-    }
-  }, [
-    formValues.taxExemptionReason,
-    formValues.taxCalculationMethod,
-    taxConfig,
-    form,
-    formValues,
-    paymentProvider,
-  ]);
-
-  // Ensure auto tax method is not set for unsupported countries
-  // Only run for non-Dodo payment providers
+  // Ensure auto tax method is not set for unsupported countries - UI state only
   useEffect(() => {
     if (paymentProvider?.provider === "dodo") return;
 
@@ -220,22 +258,18 @@ export default function CreateCustomerPage() {
       (c) => c.value === formValues.billingCountry
     );
 
-    if (!isSupported && formValues.taxCalculationMethod === "auto") {
+    if (!isSupported && selectedTaxTreatment === "auto") {
       // Reset to default/manual when automatic not allowed
       const fallbackMethod = taxConfig?.defaultTaxRate ? "default" : "manual";
-      form.setFieldValue("taxCalculationMethod", fallbackMethod);
-
-      if (formValues.taxExemptionReason === "no_auto") {
-        form.setFieldValue("taxExemptionReason", "no");
-      }
+      setSelectedTaxTreatment(
+        fallbackMethod === "default" ? "default" : "manual"
+      );
     }
   }, [
     formValues.billingCountry,
-    formValues.taxCalculationMethod,
-    formValues.taxExemptionReason,
-    form,
     taxConfig,
     paymentProvider,
+    selectedTaxTreatment,
   ]);
 
   useEffect(() => {
@@ -404,99 +438,70 @@ export default function CreateCustomerPage() {
             // Stripe or no payment provider - show full tax configuration
             <>
               {/* Smart tax treatment dropdown */}
-              <form.AppField
-                name="taxExemptionReason"
-                children={(field) => {
-                  const isSupportedCountry = supportedCustomerCountries.some(
-                    (c) => c.value === formValues.billingCountry
-                  );
+              {(() => {
+                const isSupportedCountry = supportedCustomerCountries.some(
+                  (c) => c.value === formValues.billingCountry
+                );
+                const autoAllowed =
+                  isSupportedCountry && taxConfig?.autoTaxCalculation;
 
-                  const options: { label: string; value: string }[] = [];
+                const currentValue = selectedTaxTreatment;
 
-                  const autoAllowed =
-                    isSupportedCountry && taxConfig?.autoTaxCalculation;
-
-                  if (autoAllowed) {
-                    // Merchant default is automatic & country supported
-                    options.push({
-                      label: "Calculate automatically based on location",
-                      value: "no_auto",
-                    });
-                    options.push({
-                      label: "Use specific tax rate",
-                      value: "no_manual",
-                    });
-                  } else {
-                    // Automatic calc not available (either merchant manual or country unsupported)
-                    if (taxConfig?.defaultTaxRate) {
-                      const rate = (
-                        parseFloat(taxConfig.defaultTaxRate) * 100
-                      ).toFixed(2);
-                      options.push({
-                        label: `Apply default rate (${rate}%)`,
-                        value: "no",
-                      });
-                    } else {
-                      options.push({
-                        label: "No tax (default rate not set)",
-                        value: "no",
-                      });
-                    }
-
-                    // Manual always available
-                    options.push({
-                      label: "Use specific tax rate",
-                      value: "no_manual",
-                    });
-
-                    // Only allow auto if explicitly permitted
-                    if (taxConfig?.autoTaxCalculation && isSupportedCountry) {
-                      options.push({
-                        label: "Calculate automatically based on location",
-                        value: "no_auto",
-                      });
-                    }
-                  }
-
-                  // Always include exemption options
-                  options.push({
-                    label: "Reverse charge (B2B VAT)",
-                    value: "reverse_charge",
-                  });
-                  options.push({
-                    label: "Tax exempt",
-                    value: "customer_exempt",
-                  });
-
-                  return (
-                    <field.Dropdown
-                      label="Tax Treatment"
-                      options={options}
-                      defaultValue={autoAllowed ? "no_auto" : "no"}
-                    />
-                  );
-                }}
-              />
+                return (
+                  <div className="space-y-2">
+                    <Label>Tax Treatment</Label>
+                    <Select
+                      value={currentValue}
+                      onValueChange={(val) => {
+                        if (val === "exempt") {
+                          setSelectedTaxTreatment("exempt");
+                          setExemptionDialogOpen(true);
+                          return;
+                        }
+                        setSelectedTaxTreatment(
+                          val as "auto" | "manual" | "default" | "exempt"
+                        );
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select tax treatment" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {autoAllowed ? (
+                          <>
+                            <SelectItem value="auto">
+                              Calculate automatically based on location
+                            </SelectItem>
+                            <SelectItem value="manual">
+                              Use specific tax rate
+                            </SelectItem>
+                            <SelectItem value="exempt">Tax exempt</SelectItem>
+                          </>
+                        ) : (
+                          <>
+                            <SelectItem value="default">
+                              {taxConfig?.defaultTaxRate
+                                ? `Apply default rate (${(
+                                    parseFloat(taxConfig.defaultTaxRate) * 100
+                                  ).toFixed(2)}%)`
+                                : "No tax (default rate not set)"}
+                            </SelectItem>
+                            <SelectItem value="manual">
+                              Use specific tax rate
+                            </SelectItem>
+                            <SelectItem value="exempt">Tax exempt</SelectItem>
+                          </>
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                );
+              })()}
 
               {/* Show description for selected option */}
               <div className="text-xs text-gray-600">
                 {(() => {
-                  const exemptionReason = formValues.taxExemptionReason;
-                  const calcMethod = formValues.taxCalculationMethod;
-
-                  if (exemptionReason === "reverse_charge") {
-                    return (
-                      <p className="flex items-start gap-1.5">
-                        <span className="text-green-600 mt-0.5">✓</span>
-                        <span>
-                          No tax will be charged. The customer is responsible
-                          for paying VAT directly to their tax authority
-                          (reverse charge mechanism).
-                        </span>
-                      </p>
-                    );
-                  }
-                  if (exemptionReason === "customer_exempt") {
+                  if (selectedTaxTreatment === "exempt") {
                     return (
                       <p className="flex items-start gap-1.5">
                         <span className="text-green-600 mt-0.5">✓</span>
@@ -507,7 +512,7 @@ export default function CreateCustomerPage() {
                       </p>
                     );
                   }
-                  if (calcMethod === "auto") {
+                  if (selectedTaxTreatment === "auto") {
                     return (
                       <p className="flex items-start gap-1.5">
                         <span className="text-green-600 mt-0.5">✓</span>
@@ -519,7 +524,7 @@ export default function CreateCustomerPage() {
                       </p>
                     );
                   }
-                  if (calcMethod === "manual") {
+                  if (selectedTaxTreatment === "manual") {
                     return (
                       <p className="flex items-start gap-1.5">
                         <span className="text-green-600 mt-0.5">✓</span>
@@ -530,7 +535,7 @@ export default function CreateCustomerPage() {
                       </p>
                     );
                   }
-                  if (calcMethod === "default" && taxConfig) {
+                  if (selectedTaxTreatment === "default" && taxConfig) {
                     if (taxConfig.autoTaxCalculation) {
                       return (
                         <p className="flex items-start gap-1.5">
@@ -572,7 +577,7 @@ export default function CreateCustomerPage() {
               </div>
 
               {/* Show tax rate dropdown only when manual rate is selected */}
-              {formValues.taxCalculationMethod === "manual" && (
+              {selectedTaxTreatment === "manual" && (
                 <div className="space-y-3">
                   {taxRateDefinitions && taxRateDefinitions.length > 0 ? (
                     <form.AppField
@@ -620,6 +625,112 @@ export default function CreateCustomerPage() {
                   children={(field) => <field.TextField label="" />}
                 />
               </div>
+              {/* Exemption reason selection dialog */}
+              <Dialog
+                open={exemptionDialogOpen}
+                onOpenChange={setExemptionDialogOpen}
+              >
+                <DialogContent>
+                  <DialogTitle>Select tax exemption reason</DialogTitle>
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-start gap-2 rounded-md border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+                      <Info className="h-4 w-4 mt-0.5" />
+                      <p>
+                        Tax-exempt customers are legally exempt from tax
+                        collection (for eg, some non-profits, overseas sales
+                        etc.). Only select this if you have a valid exemption
+                        certificate for the customer OR if you know what
+                        you&apos;re doing.
+                      </p>
+                    </div>
+                    <RadioGroup
+                      value={selectedExemptionReason}
+                      onValueChange={(v) => setSelectedExemptionReason(v)}
+                    >
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem
+                          value="nonprofit_organization"
+                          id="exempt-np"
+                        />
+                        <label htmlFor="exempt-np" className="text-sm">
+                          Nonprofit organization
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem
+                          value="government_entity"
+                          id="exempt-gov"
+                        />
+                        <label htmlFor="exempt-gov" className="text-sm">
+                          Government entity
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem
+                          value="educational_institution"
+                          id="exempt-edu"
+                        />
+                        <label htmlFor="exempt-edu" className="text-sm">
+                          Educational institution
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="resale" id="exempt-resale" />
+                        <label htmlFor="exempt-resale" className="text-sm">
+                          Resale certificate
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="other" id="exempt-other" />
+                        <label htmlFor="exempt-other" className="text-sm">
+                          Other
+                        </label>
+                      </div>
+                    </RadioGroup>
+                    {selectedExemptionReason === "other" && (
+                      <div className="pt-2">
+                        <Input
+                          placeholder="Enter exemption reason"
+                          value={exemptionOtherText}
+                          onChange={(e) =>
+                            setExemptionOtherText(e.target.value)
+                          }
+                        />
+                      </div>
+                    )}
+                    <div className="pt-2 flex items-center justify-end gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => {
+                          setExemptionDialogOpen(false);
+                          const fallback = taxConfig?.autoTaxCalculation
+                            ? "auto"
+                            : "default";
+                          setSelectedTaxTreatment(fallback);
+                          // Do not mutate form field here; local state drives UI
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        onClick={() => {
+                          setExemptionDialogOpen(false);
+                          // Persist selected reason into form for backend
+                          const reason =
+                            selectedExemptionReason === "other"
+                              ? exemptionOtherText.trim()
+                              : selectedExemptionReason;
+                          if (reason) {
+                            form.setFieldValue("taxExemptionReason", reason);
+                          }
+                        }}
+                      >
+                        Save
+                      </Button>
+                    </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
             </>
           )}
         </div>

@@ -15,6 +15,7 @@ import {
 import { db } from "../db/client";
 
 export * from "./api_keys";
+export * from "./isProdOrStaging";
 
 export type Price = typeof prices.$inferSelect;
 export type DatabaseType = typeof db;

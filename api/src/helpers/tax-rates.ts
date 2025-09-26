@@ -137,6 +137,41 @@ export const taxReasonCodes = {
     short_description: "Calculation Error",
     tax_type: "error",
   },
+  21: {
+    snake_case: "nonprofit_organization",
+    full_description:
+      "Nonprofit Organization: Customer is a qualified nonprofit organization exempt from tax collection.",
+    short_description: "Nonprofit Exempt",
+    tax_type: "exempt",
+  },
+  22: {
+    snake_case: "government_entity",
+    full_description:
+      "Government Entity: Customer is a government entity exempt from tax collection.",
+    short_description: "Government Exempt",
+    tax_type: "exempt",
+  },
+  23: {
+    snake_case: "educational_institution",
+    full_description:
+      "Educational Institution: Customer is an educational institution exempt from tax collection.",
+    short_description: "Educational Exempt",
+    tax_type: "exempt",
+  },
+  24: {
+    snake_case: "resale_certificate",
+    full_description:
+      "Resale Certificate: Customer has provided a valid resale certificate for tax exemption.",
+    short_description: "Resale Exempt",
+    tax_type: "exempt",
+  },
+  25: {
+    snake_case: "custom_exemption",
+    full_description:
+      "Custom Exemption: Customer is exempt from tax collection for other specified reasons.",
+    short_description: "Custom Exempt",
+    tax_type: "exempt",
+  },
 } as const;
 
 export const taxMatrix = {
@@ -161,6 +196,11 @@ export const taxMatrix = {
     "18": taxReasonCodes[18].full_description,
     "19": taxReasonCodes[19].full_description,
     "20": taxReasonCodes[20].full_description,
+    "21": taxReasonCodes[21].full_description,
+    "22": taxReasonCodes[22].full_description,
+    "23": taxReasonCodes[23].full_description,
+    "24": taxReasonCodes[24].full_description,
+    "25": taxReasonCodes[25].full_description,
   },
   tax_matrix: {
     US: {
@@ -359,6 +399,70 @@ export function getCanadaPstRate(province?: string | null): {
       type: null,
     }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Tax Exemption Reason Mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * Map customer exemption reasons to their corresponding tax reason codes
+ * This provides a centralized mapping for all tax exemption scenarios
+ */
+export const exemptionReasonMapping = {
+  // System-level exemptions (automatic/calculated)
+  reverse_charge: 1,
+  calculation_error: 20,
+
+  // Customer-specific exemptions (user-selected)
+  nonprofit_organization: 21,
+  government_entity: 22,
+  educational_institution: 23,
+  resale: 24,
+
+  // Fallbacks
+  other: 25, // Custom exemption text
+} as const;
+
+/**
+ * Get the appropriate reason code for a given exemption reason
+ * @param exemptionReason - The exemption reason string
+ * @returns The corresponding tax reason code
+ */
+export function getExemptionReasonCode(
+  exemptionReason: string
+): keyof typeof taxReasonCodes {
+  // Check if it's a predefined exemption reason
+  if (exemptionReason in exemptionReasonMapping) {
+    return exemptionReasonMapping[
+      exemptionReason as keyof typeof exemptionReasonMapping
+    ];
+  }
+
+  // For any custom text or unknown reasons, use the custom exemption code
+  return exemptionReasonMapping.other;
+}
+
+/**
+ * Get enhanced full description for exemption reasons, including custom text when applicable
+ * @param exemptionReason - The original exemption reason (e.g., "nonprofit_organization" or custom text)
+ * @param reasonCode - The tax reason code
+ * @returns Enhanced description that includes custom reason when applicable
+ */
+export function getExemptionFullDescription(
+  exemptionReason: string,
+  reasonCode: keyof typeof taxReasonCodes
+): string {
+  const reasonInfo = getTaxReasonInfo(reasonCode);
+
+  if (reasonCode === 25) {
+    // custom_exemption code
+    // For custom exemptions, include the actual reason in the description
+    return `Custom Exemption: ${exemptionReason}`;
+  }
+
+  // For all other cases, use the standard description
+  return reasonInfo.full_description;
 }
 
 // ---------------------------------------------------------------------------

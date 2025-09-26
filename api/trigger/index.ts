@@ -6,3 +6,5 @@ export * from "./jobs/reconcileMetricsCache";
 export * from "./jobs/collectPayment";
 export * from "./jobs/creditRenewal";
 export * from "./jobs/creditExpiration";
+export * from "./jobs/retryDunningPayments";
+export * from "./jobs/notifyGraceEndingSoon";

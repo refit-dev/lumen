@@ -413,7 +413,7 @@ export default function InvoicesPage() {
         effectiveTaxRate: 0,
         jurisdiction: "exempt",
         calculationMethod: "exempt",
-        exemptionReason: "customer_exempt",
+        exemptionReason: "other",
       });
     } else if (taxCalculationMethod === "manual") {
       const taxAmount = manualTaxAmountCents || subtotal * (manualTaxRate || 0);

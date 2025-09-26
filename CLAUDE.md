@@ -83,6 +83,22 @@
 - Reason code added: `b2c_tax_not_supported` (code 21) to clearly flag B2C cases.
 - First-time and trial-to-paid flows store tax metadata in payment/invoice; renewals re-calculate taxes using the engine.
 
+#### 3.5.0.1 Tax Setup UI (Onboarding Wizard)
+
+- The `/tax` page shows a guided wizard until tax is configured.
+- Configuration is considered complete when either:
+  - `merchant_tax_config.auto_tax_calculation = true`, or
+  - `merchant_tax_config.default_tax_rate` is set (including `0` for 0%).
+- Completion signal comes from `GET /merchants/checkonboarding` (`hasTax`).
+- Wizard flow:
+  - Step 1: Audience selection (B2B vs B2B+B2C)
+  - Step 2: Method selection
+    - Automatic (B2B only; consumers 0% by default; explicit acknowledgement required)
+    - Single default rate (enter %)
+    - Advanced manual rates (marks default rate as 0% to complete onboarding; rates can be created and assigned later)
+  - Step 3: Review & confirm → saves via `POST /tax/config/update`.
+- For US merchants choosing Automatic, the page recommends configuring state nexus after saving.
+
 ### 3.5.1 Seat-Based Pricing & Mid-Cycle Billing
 
 - **Seat Management**: API endpoints for adding/removing seats with event tracking
@@ -144,6 +160,13 @@
   - Validation endpoints for API key verification
   - Automatic webhook provisioning: When saving a valid Dodo API key, the system attempts to auto-create a webhook endpoint in Dodo using the authenticated API client and stores the returned signing secret securely. The webhook URL used is `${API_URL}/v1/public/webhook-dodo/{merchantId}`. If auto-creation fails, the save still succeeds and the webhook can be configured later.
 
+### 3.9.1 Payment Method Selection & Failover (Subscriptions)
+
+- For subscription renewals and subscription-related charges, the system now prefers the payment method configured on the subscription (`subscription_details.payment_method_id`).
+- If that is not set, we fall back to the customer's most recently used active payment method (`payment_methods.last_used_at` DESC).
+- On payment failure webhooks for recurring charges, we immediately attempt charging the next available customer payment method (excluding ones already tried for that payment). We track attempted payment method IDs on the `payments.metadata.attempted_payment_method_ids` field.
+- We continue retrying one alternative method per failure webhook until all methods are exhausted; only then do we enter the dunning flow. This preserves existing dunning behavior and grace-period handling once failover options are depleted.
+
 ### 3.10 Trial & Free Plan System
 
 - **Trial Plans**: Dedicated trial plan creation with parent plan relationships
@@ -166,6 +189,17 @@
 - Multi-tenant isolation enforced for all operations
 - Key rotation capability for publishable keys (auto-revokes old keys)
 - Only return key prefixes (first 4 chars) in UI/API responses, never full values
+
+### 6.1 Admin-Only Internal Key Values Management
+
+- Admins (Better Auth `role = "admin"`) can manage global internal key/value pairs used by backend logic.
+- API: Protected endpoints mounted at `/v1/internal/internal-key-values`.
+  - `GET /v1/internal/internal-key-values` → list active rows
+  - `GET /v1/internal/internal-key-values/:key` → fetch single row
+  - `PUT /v1/internal/internal-key-values/:key` → upsert JSON `value`
+- AuthZ: Requires session user with admin role OR secret API key with `admin` permission.
+- UI: Admin-only page at `/admin/internal` (in the dashboard) to view and edit entries.
+- Storage: `common/src/db/schema/internal_key_values.ts` (JSONB `value`, soft-delete via `deletedAt`).
 
 ## 7. Development Phase Notes
 

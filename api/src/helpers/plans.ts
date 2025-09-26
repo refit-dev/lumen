@@ -8,6 +8,7 @@ import {
   plans,
   subscriptions,
   pricingTablePlans,
+  planEnrollmentRules,
   featureMetrics,
   creditDefinitions,
   creditDefinitionsInsertSchema,
@@ -56,7 +57,8 @@ export async function getActiveSubscriptionCountForPlan(
       inArray(subscriptions.planId, planIds),
       eq(subscriptions.merchantId, merchantId),
       isNull(subscriptions.deletedAt),
-      isNull(subscriptions.endTimestamp)
+      isNull(subscriptions.endTimestamp),
+      inArray(subscriptions.status, ["active", "trialing", "past_due"])
     ),
   });
 
@@ -1930,6 +1932,25 @@ export async function editPlan(
             eq(pricingTablePlans.planId, planId), // old plan ID
             eq(pricingTablePlans.merchantId, merchantId),
             isNull(pricingTablePlans.deletedAt)
+          )
+        );
+
+      // ----------------------------------------------------------
+      // 1.9b Update enrollment rules to point to the new plan version
+      //     Ensures auto-enrollment rules track the latest internal plan ID
+      // ----------------------------------------------------------
+      console.log("[editPlan] Updating enrollment rule references");
+      await tx
+        .update(planEnrollmentRules)
+        .set({
+          planId: newPlan.id,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(planEnrollmentRules.planId, planId), // old plan ID
+            eq(planEnrollmentRules.merchantId, merchantId),
+            isNull(planEnrollmentRules.deletedAt)
           )
         );
 

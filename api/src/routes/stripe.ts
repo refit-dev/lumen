@@ -173,6 +173,9 @@ export const stripeRouter = new Hono()
         webhookEndpoint = await stripeClient.webhookEndpoints.create({
           enabled_events: [
             "payment_intent.succeeded",
+            "payment_intent.payment_failed",
+            "setup_intent.succeeded",
+            "setup_intent.setup_failed",
             "checkout.session.completed",
           ],
           url: !WEBHOOK_BASE_URL.includes("localhost")

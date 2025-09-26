@@ -15,11 +15,37 @@ import {
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
+import { relations } from "drizzle-orm";
 import { z } from "zod";
 
 export type Customer = z.infer<typeof customersSelectSchema>;
 
 export type CustomerFromApi = z.infer<typeof customerSelectSchemaAPI>;
+
+export const customerOrganizations = pgTable("customer_organizations", {
+  id: text("id")
+    .primaryKey()
+    .$defaultFn(() => createPrefixedId(ID_PREFIXES.customerOrganization)),
+  merchantId: text("merchant_id")
+    .notNull()
+    .references(() => merchants.id),
+  name: text("name"),
+  externalOrgId: text("external_org_id"),
+  billingCustomerId: text("billing_customer_id"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  deletedAt: timestamp("deleted_at"),
+});
+
+export const customerOrganizationsSelectSchema = createSelectSchema(
+  customerOrganizations
+);
+export const customerOrganizationsInsertSchema = createInsertSchema(
+  customerOrganizations
+);
+export const customerOrganizationsUpdateSchema = createUpdateSchema(
+  customerOrganizations
+);
 
 export const customers = pgTable("customers", {
   id: text("id")
@@ -46,7 +72,7 @@ export const customers = pgTable("customers", {
   businessName: text("business_name"),
   taxId: text("tax_id"),
   taxExempt: boolean("tax_exempt").default(false),
-  taxExemptionReason: text("tax_exemption_reason"), // reverse_charge or customer_exempt
+  taxExemptionReason: text("tax_exemption_reason"), // nonprofit_organization, government_entity, educational_institution, resale, reverse_charge, or custom text
   taxExemptionCertificate: text("tax_exemption_certificate"),
   taxRateDefinitionId: text("tax_rate_definition_id").references(
     () => taxRateDefinitions.id
@@ -62,6 +88,11 @@ export const customers = pgTable("customers", {
   preferredCurrency: text("preferred_currency").default("USD"),
 
   metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+  // Organization support (seats-as-customers)
+  customerOrganizationId: text("customer_organization_id").references(
+    () => customerOrganizations.id
+  ),
+  orgRole: text("org_role"), // 'primary' | 'member' | null
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
   deletedAt: timestamp("deleted_at"),
@@ -113,3 +144,18 @@ export const customersInsertSchemaUI = customersInsertSchema
     name: z.string(),
     metadata: z.record(z.unknown()).optional(),
   });
+
+// Relations
+export const customerOrganizationsRelations = relations(
+  customerOrganizations,
+  ({ many }) => ({
+    customers: many(customers),
+  })
+);
+
+export const customersRelations = relations(customers, ({ one }) => ({
+  organization: one(customerOrganizations, {
+    fields: [customers.customerOrganizationId],
+    references: [customerOrganizations.id],
+  }),
+}));

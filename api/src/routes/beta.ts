@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
-import { slackLog } from "../helpers/slack";
+import { createNotificationProvider } from "../helpers/notificationProvider";
+import { env } from "../env";
 
 // Used when users request access to Beta features
 export const betaRouter = new Hono().post(
@@ -16,18 +17,19 @@ export const betaRouter = new Hono().post(
     })
   ),
   async (c) => {
+    const notify = createNotificationProvider({ NODE_ENV: env.NODE_ENV });
     const userEmail = c.get("user")?.email;
     const json = c.req.valid("json");
     const { metadata } = json;
     try {
       if (metadata?.paymentProvider) {
-        await slackLog(
-          `Beta request\n${userEmail}\n${metadata.paymentProvider}`
-        );
+        await notify.sendSlack({
+          text: `Beta request\n${userEmail}\n${metadata.paymentProvider}`,
+        });
       } else {
-        await slackLog(
-          `Weird Beta request\n${userEmail}\n${JSON.stringify(json, null, 2)}`
-        );
+        await notify.sendSlack({
+          text: `Weird Beta request\n${userEmail}\n${JSON.stringify(json, null, 2)}`,
+        });
       }
       return c.json({ message: "Beta request sent successfully" }, 200);
     } catch (error) {

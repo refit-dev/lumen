@@ -92,15 +92,6 @@ describe("Merchant", () => {
     // Authenticate the user
     const authResult = await authenticateTestUser(user.email, user.password);
 
-    // Create a test organization for this test
-    const org = await createTestOrganization({
-      userId: user.id,
-      email: user.email,
-      password: user.password,
-      name: "API Integration Test Org",
-      slug: `api-int-test-org-${Date.now()}`,
-    });
-
     // Create API client
     const apiClient = createTestApiClient(authResult.cookies.sessionToken);
 
@@ -109,8 +100,6 @@ describe("Merchant", () => {
       "onboarding-create-merchant"
     ].$post({
       json: {
-        userId: user.id,
-        organizationId: org.id,
         legalName: "Test Merchant for API Testing",
         displayName: "API Test Merchant",
         addressLine1: "123 Main St",

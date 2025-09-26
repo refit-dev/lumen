@@ -1,8 +1,17 @@
-import { describe, it, beforeEach, expect } from "bun:test";
+import {
+  describe,
+  it,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll,
+  expect,
+} from "bun:test";
 import {
   createFullTestEnvironment,
   authenticateTestUser,
   createTestApiClient,
+  cleanupDataFull,
 } from "../test-helpers";
 import { Customer } from "../test-helpers/types";
 import { createTestCustomer } from "../test-helpers/data/customer";
@@ -12,6 +21,16 @@ describe("Customers API", () => {
   let merchantId: string;
   let sessionToken: string;
   let testCustomer: Customer;
+
+  beforeAll(async () => {
+    // Do a full cleanup before any tests run
+    await cleanupDataFull({ deleteTestSetupData: true });
+  });
+
+  afterAll(async () => {
+    // Full cleanup after all tests are done
+    await cleanupDataFull({ deleteTestSetupData: true });
+  });
 
   beforeEach(async () => {
     // Set up a test environment
@@ -28,6 +47,11 @@ describe("Customers API", () => {
       email: `customer-${Date.now()}@example.com`,
       name: "Test Customer",
     });
+  });
+
+  afterEach(async () => {
+    // Cleanup all DB data after each test for isolation
+    await cleanupDataFull({ deleteTestSetupData: true });
   });
 
   it("should list all customers for a merchant", async () => {

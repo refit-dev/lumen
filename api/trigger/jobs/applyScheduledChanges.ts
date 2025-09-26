@@ -50,6 +50,48 @@ export const applyScheduledChangesJob = schedules.task({
       "Scheduled changes are now processed during billing - no action needed"
     );
 
+    // Enforce dunning grace periods - check for subscriptions that have exceeded their grace period
+    // run this every 10 minutes
+    if (currentTimestamp.getMinutes() % 10 === 0) {
+      try {
+        const dunningResp = await fetch(
+          `${triggerEnv.API_URL}/trigger/billing/dunning/enforce-grace-periods`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${triggerEnv.TRIGGER_API_ACCESS_KEY}`,
+            },
+            body: JSON.stringify({
+              timestamp: currentTimestamp.toISOString(),
+            }),
+          }
+        );
+
+        if (!dunningResp.ok) {
+          const txt = await dunningResp.text();
+          logger.warn(
+            "Dunning grace period enforcement endpoint returned non-OK",
+            {
+              status: dunningResp.status,
+              body: txt,
+            }
+          );
+        } else {
+          const { processed } = (await dunningResp.json()) as {
+            processed: number;
+          };
+          logger.info("Processed dunning grace period expirations", {
+            processed,
+          });
+        }
+      } catch (dErr) {
+        logger.error("Failed to trigger dunning grace period endpoint", {
+          error: dErr instanceof Error ? dErr.message : String(dErr),
+        });
+      }
+    }
+
     logger.info("Finished processing scheduled changes");
 
     // Check if it's the top of the hour (minute is 0)

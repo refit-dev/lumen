@@ -5,6 +5,9 @@ import { useSession, signOut, admin } from "@/lib/auth-client";
 import { useRouter } from "next/navigation";
 import { CommandPalette } from "./command-palette";
 import { LogOut, Settings, Shield, UserX } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Badge } from "@/components/ui/badge";
+import { YC_ENROLLMENT_FEATURE_SLUG } from "@lumen/common/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -14,12 +17,37 @@ import {
 } from "@/components/ui/dropdown-menu";
 // import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 
+interface FeatureEntitlement {
+  entitled: boolean | null;
+  feature: { slug: string; value: boolean | string | number | null } | null;
+}
+
+const getEntitlements = async () => {
+  const res = await fetch("/api/lumen/entitlements/{customerId}", {
+    credentials: "include",
+  });
+  return res.json();
+};
+
 export function UserNav() {
   const { data: session } = useSession();
   const router = useRouter();
+  const [entitlements, setEntitlements] = useState<FeatureEntitlement[]>([]);
 
   // Check if currently impersonating a user
   const isImpersonating = session?.session?.impersonatedBy;
+
+  useEffect(() => {
+    getEntitlements().then((data) => {
+      setEntitlements(data.entitlements || []);
+    });
+  }, []);
+
+  const hasYcEntitlement = useMemo(
+    () =>
+      entitlements.some((e) => e?.feature?.slug === YC_ENROLLMENT_FEATURE_SLUG),
+    [entitlements]
+  );
 
   const handleStopImpersonating = async () => {
     try {
@@ -61,6 +89,11 @@ export function UserNav() {
                       isImpersonating ? "text-orange-800" : "text-foreground"
                     }`}
                   >
+                    {hasYcEntitlement ? (
+                      <Badge className="mr-2 bg-orange-50 text-orange-700 border-orange-200">
+                        YC
+                      </Badge>
+                    ) : null}
                     {session?.merchant?.displayName || "No Company"}
                     {isImpersonating && (
                       <span className="ml-2 text-xs font-normal text-orange-600">

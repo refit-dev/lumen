@@ -13,7 +13,7 @@ import { db } from "../../src/db/client";
 import Stripe from "stripe";
 import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
-import { setTimeout as sleep } from "timers/promises";
+import { sleep } from "../test-helpers/sleep";
 import path from "path";
 import {
   invoices,
@@ -52,17 +52,20 @@ import {
   createTestPrice,
   createTestCustomer,
   createTestApiClient,
-  createTestStripe,
   clearEventData,
 } from "../test-helpers";
 import { FeatureValue } from "../test-helpers/data/feature";
-import { calculateNextBillingDate } from "../../src/helpers/billing";
+import { calculateNextBillingDate } from "../../src/helpers/billing-dates";
 import { collectPaymentJob } from "../../trigger/jobs/collectPayment";
 import { z } from "zod";
 import { env } from "../../src/env";
 import { testEnv } from "../test-env";
 import questDbService from "../../src/db/questDbService";
 import { collectPaymentPayloadSchema } from "../../trigger/helpers/collectPayment";
+import {
+  createPaymentProvider,
+  PaymentProviderAdapter,
+} from "../test-helpers/paymentProvider";
 
 // Define the type for batch items based on the job payload schema
 type BatchItem = { payload: z.infer<typeof collectPaymentPayloadSchema> };
@@ -80,41 +83,6 @@ type MockRunResult = {
   error?: string;
   payload: z.infer<typeof collectPaymentPayloadSchema>;
 };
-
-// Helper function for finding Stripe CLI
-async function findStripeCLI(): Promise<string | null> {
-  // Try to find it on PATH
-  try {
-    const proc = await Bun.spawn(["which", "stripe"], {
-      stdout: "pipe",
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const result = stdout.trim();
-    if (result) {
-      return result;
-    }
-  } catch (e) {
-    console.error("Failed to find Stripe CLI:", e);
-  }
-
-  // Common places to look for stripe CLI
-  const possiblePaths = [
-    "/usr/local/bin/stripe",
-    "/opt/homebrew/bin/stripe",
-    path.join(process.env.HOME || "", ".local/bin/stripe"),
-  ];
-
-  for (const p of possiblePaths) {
-    try {
-      await fs.access(p, fs.constants.X_OK);
-      return p;
-    } catch (e) {
-      // Ignore errors if file doesn't exist
-    }
-  }
-
-  return null;
-}
 
 const cleanupDataFull = async () => {
   // Execute cleanup in multiple batches to handle foreign key constraints properly
@@ -188,6 +156,7 @@ describe("Multiple Price Billing Integration Tests", () => {
   let tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
   let tempMerchantIdFile = "/tmp/test_merchant_id.txt";
   let foundStripeCLIPath: string | null = null;
+  let paymentProvider: PaymentProviderAdapter;
 
   // Clean up function for the webhook process
   const cleanupWebhook = async () => {
@@ -207,39 +176,6 @@ describe("Multiple Price Billing Integration Tests", () => {
     stripeClient = new Stripe(stripeSecretKey, {
       apiVersion: "2025-02-24.acacia",
     });
-
-    // Find Stripe CLI path once
-    foundStripeCLIPath = await findStripeCLI();
-    if (foundStripeCLIPath) {
-      console.log(`Found Stripe CLI at: ${foundStripeCLIPath}`);
-
-      // Get and store the webhook secret
-      const secretProcess = spawn(foundStripeCLIPath, [
-        "listen",
-        "--forward-to",
-        `${apiUrl}/public/webhook`, // we don't need merchantId here to get the secret - it's always the same
-        "--print-secret",
-        "--api-key",
-        stripeSecretKey,
-      ]);
-
-      // Collect the secret from stdout
-      secretProcess.stdout.on("data", (data) => {
-        stripeWebhookSecret = data.toString();
-      });
-
-      await new Promise<void>((resolve) => {
-        secretProcess.on("close", async () => {
-          // Clean up and save the secret
-          await fs.writeFile(tempWebhookSecretFile, stripeWebhookSecret);
-          // this is read in the webhook listener for dev env
-          console.log(`Saved webhook secret to ${tempWebhookSecretFile}`);
-          resolve();
-        });
-      });
-    } else {
-      console.warn("Stripe CLI not found. Webhook tests might be affected.");
-    }
   });
 
   afterAll(async () => {
@@ -282,17 +218,13 @@ describe("Multiple Price Billing Integration Tests", () => {
     // 1. Set up a test environment
     const { user: testUser, merchant } = await createFullTestEnvironment();
     merchantId = merchant.id;
+    paymentProvider = await createPaymentProvider();
 
     // Save merchant ID to temp file for webhook
     await fs.writeFile(tempMerchantIdFile, merchantId);
 
     // Create Stripe integration for the merchant
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // 2. Authenticate to get a token for API calls
     const authResponse = await authenticateTestUser(
@@ -374,39 +306,7 @@ describe("Multiple Price Billing Integration Tests", () => {
     planId = planCreationResult.plan.id;
 
     // Start webhook listener in a separate process
-    try {
-      console.log(`Starting webhook listener for merchant ${merchantId}...`);
-
-      // Start the webhook listener only if we found the Stripe CLI
-      if (foundStripeCLIPath) {
-        // Now start the actual webhook listener
-        webhookProcess = spawn(
-          foundStripeCLIPath,
-          [
-            "listen",
-            "--forward-to",
-            `${apiUrl}/public/webhook/${merchantId}`,
-            "--api-key",
-            stripeSecretKey,
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-          }
-        );
-        // Give some time for the webhook process to start
-        console.log(`Webhook listener started with PID ${webhookProcess.pid}`);
-      } else {
-        console.log(
-          "Stripe CLI not found, webhook listener will not be started"
-        );
-        console.log(
-          "This test will still run but may not properly test the webhook handling"
-        );
-      }
-    } catch (error) {
-      console.error("Failed to start webhook listener:", error);
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
 
     // Mock the batchTrigger for payment collection
     batchTriggerSpy = spyOn(collectPaymentJob, "batchTrigger");
@@ -1425,7 +1325,7 @@ describe("Multiple Price Billing Integration Tests", () => {
     expect(eventResponse.status).toBe(202);
 
     // Wait for event processing to complete
-    await sleep(500);
+    await sleep(500, { alsoSleepInStripeMock: true });
 
     // Set all subscription details to be due now
     const dueDate = new Date(testStartTime.getTime() - 60000); // 1 minute ago
@@ -1730,7 +1630,7 @@ describe("Multiple Price Billing Integration Tests", () => {
     expect(eventResponse.status).toBe(202);
 
     // Wait for event processing to complete
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500, { alsoSleepInStripeMock: true });
 
     // Set the next billing date to be due now
     const dueDate = new Date(testStartTime.getTime() - 60000); // 1 minute ago
@@ -2077,9 +1977,6 @@ describe("Multiple Price Billing Integration Tests", () => {
 
   it("should properly handle leap year billing dates (Feb 29)", async () => {
     // Import the calculateNextBillingDate function for direct testing
-    const { calculateNextBillingDate } = await import(
-      "../../src/helpers/billing"
-    );
 
     // Create a price with a yearly recurrence rule
     const yearlyPrice = await createTestPrice({
@@ -2275,9 +2172,6 @@ describe("Multiple Price Billing Integration Tests", () => {
 
     // Verify initial next billing date - should be Feb 28 (no Feb 31)
     // Calculate expected next billing date using the billing helper
-    const { calculateNextBillingDate } = await import(
-      "../../src/helpers/billing"
-    );
     const component = monthEndPrice.pricingData.components[0];
 
     // Next date after Jan 31 should be Feb 28 (or 29 in leap years)
@@ -2499,11 +2393,6 @@ describe("Multiple Price Billing Integration Tests", () => {
     });
 
     expect(updatedDetails.length).toBe(3);
-
-    // Get the billing helper for calculations
-    const { calculateNextBillingDate } = await import(
-      "../../src/helpers/billing"
-    );
 
     // For each component, verify:
     // 1. Cycles billed was incremented
@@ -2869,7 +2758,7 @@ describe("Multiple Price Billing Integration Tests", () => {
     expect(eventResponse.status).toBe(202);
 
     // Wait for event processing to complete
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500, { alsoSleepInStripeMock: true });
 
     // Set the next billing date to be due now
     const dueDate = new Date(testStartTime.getTime() - 60000); // 1 minute ago
@@ -3145,7 +3034,7 @@ describe("Multiple Price Billing Integration Tests", () => {
     expect(eventResponse.status).toBe(202);
 
     // Wait for event processing to complete
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500, { alsoSleepInStripeMock: true });
 
     // Set the next billing date to be due now
     const dueDate = new Date(testStartTime.getTime() - 60000); // 1 minute ago
@@ -3345,11 +3234,6 @@ describe("Multiple Price Billing Integration Tests", () => {
   it("should handle DST transitions correctly when calculating next billing date", async () => {
     // This test is particularly important for recurring billing that might cross DST boundaries
     // We'll create a subscription that spans a DST transition and verify billing dates are calculated correctly
-
-    const { calculateNextBillingDate } = await import(
-      "../../src/helpers/billing"
-    );
-
     // Choose an LA timezone since it observes DST
     const timezone = "America/Los_Angeles";
     const customer = await createTestCustomer({

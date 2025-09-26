@@ -10,7 +10,7 @@ import { PlanSelect } from "../../test-helpers/types";
 import { FeatureValue } from "../../test-helpers/data/feature";
 import { APIPlanWithFeatures } from "../../../src/helpers";
 import { EditPlanInput } from "../../../src/helpers/plans";
-import { FeatureType } from "@lumen/common/schema";
+import { FeatureType, PlanWithFeaturesAndPrices } from "@lumen/common/schema";
 
 describe("Plans API", () => {
   let merchantId: string;
@@ -2914,5 +2914,71 @@ describe("Basic Plan Operations", () => {
       expect(annualComp).toBeDefined();
       expect((annualComp as any).amount_cents).toBe(updatedYearlyAmount * 12);
     }
+  });
+
+  it("If create plan with usagePricePerUnit === 0, no usage pricing component should be created", async () => {
+    const client = createTestApiClient(sessionToken);
+
+    const planData = {
+      planName: "Test usage based with zero",
+      planDescription: "",
+      commitMessage: "Created plan",
+      newFeatures: [
+        {
+          featureName: "Test usage based with zero",
+          slug: "test-usage-based-with-zero",
+          eventName: "test-usage-based-with-zero",
+          isUsageBased: true,
+          usagePricePerUnit: 0, // we are testing this
+          hasCreditAllowance: true,
+          creditAllowanceAmount: 33,
+          creditAllowanceRenewal: "monthly" as const,
+          trialCreditAllowance: 0,
+        },
+      ],
+      currency: "USD",
+      monthlyPrice: 0,
+      hasYearlyPrice: false,
+      showInPricingTable: true,
+      isEnterprisePlan: false,
+      isSeatBased: false,
+      billImmediately: true,
+    };
+
+    const response = await client.plans.$post({
+      json: planData,
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as
+      | {
+          plans: PlanWithFeaturesAndPrices[];
+        }
+      | {
+          error: string;
+        };
+    if ("error" in body) {
+      throw new Error(`Failed to create plan: ${body.error}`);
+    }
+
+    expect(body.plans).toBeDefined();
+    expect(body.plans.length).toBe(1);
+    const plan = body.plans[0];
+
+    expect(plan.prices).toBeDefined();
+    expect(plan.prices.length).toBe(1);
+
+    const price = plan.prices[0];
+    expect(price.pricingData).toBeDefined();
+    expect(price.pricingData.components).toBeDefined();
+
+    // Verify only fixed component exists, no usage component
+    expect(price.pricingData.components.length).toBe(1);
+
+    const component = price.pricingData.components[0];
+
+    // Verify fixed component properties
+    expect(component.type).toEqual("fixed");
+    expect((component as any).amount_cents).toBe(0);
   });
 });

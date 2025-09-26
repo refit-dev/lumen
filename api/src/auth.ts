@@ -7,10 +7,10 @@ import { db } from "./db/client";
 import { getMerchantByUserId, getOrganizationsByUserId } from "@lumen/common";
 import { env } from "./env";
 import { EnhancedSession } from "@lumen/common";
-import { sendEmail } from "./helpers/emails";
-import { slackLog } from "./helpers/slack";
+import { createNotificationProvider } from "./helpers/notificationProvider";
 import { getSecretOrEnvVar } from "./helpers/secrets";
-import { LumenPlugin } from "@getlumen/better-auth";
+import { LumenPlugin } from "@getlumen/better-auth"; // For debugging, use ../../packages/better-auth & npm run build in packages/better-auth
+import { isProdOrStaging } from "./helpers";
 
 const {
   CORS_ORIGIN,
@@ -31,6 +31,11 @@ if (NODE_ENV === "staging" || NODE_ENV === "production") {
     throwOnStagingOrProdError: true,
   });
 }
+
+const notify = createNotificationProvider({
+  NODE_ENV,
+  RESEND_API_KEY: resendApiKey,
+});
 
 // Custom session handler to add merchant data
 const enhanceSessionWithMerchant = customSession(
@@ -102,7 +107,6 @@ const trustedOriginList = Array.from(
 
 console.log("[AUTH DEBUG] NODE_ENV:", NODE_ENV);
 console.log("[AUTH DEBUG] DEV_SKIP_EMAIL_CHECK:", DEV_SKIP_EMAIL_CHECK);
-const isProdOrStaging = NODE_ENV !== "development" && NODE_ENV !== "test";
 const effectiveRequireEmailVerification =
   isProdOrStaging || !DEV_SKIP_EMAIL_CHECK;
 const effectiveSendOnSignUp = isProdOrStaging || !DEV_SKIP_EMAIL_CHECK;
@@ -119,7 +123,7 @@ const lumenApiKey = await getSecretOrEnvVar({
   throwOnStagingOrProdError: true,
 });
 
-const authConfig: BetterAuthOptions = {
+const authConfig = {
   database: drizzleAdapter(db, {
     provider: "pg",
   }),
@@ -129,6 +133,7 @@ const authConfig: BetterAuthOptions = {
       httpOnly: true,
       sameSite: "none", // Allows CORS-based cookie sharing across subdomains
       partitioned: true, // New browser standards will mandate this for foreign cookies
+      ...(API_URL.includes("getlumen.dev") && { domain: ".getlumen.dev" }),
     },
   },
   session: {
@@ -161,29 +166,11 @@ const authConfig: BetterAuthOptions = {
     enabled: true,
     requireEmailVerification: effectiveRequireEmailVerification, // Require verification in prod/staging OR when DEV_SKIP_EMAIL_CHECK is false
     sendResetPassword: async ({ user, url, token }, request) => {
-      if (NODE_ENV === "development") {
-        // In development, just log the password reset details
-        console.log("\n=== PASSWORD RESET (DEVELOPMENT MODE) ===");
-        console.log(`To: ${user.email}`);
-        console.log(`Reset URL: ${url}`);
-        console.log(`Token: ${token}`);
-        console.log("==========================================\n");
-        return;
-      }
-
-      // In production, send actual email using Resend
-      if (!resendApiKey) {
-        console.error(
-          `Resend API key MUST be available for password reset emails in environment: ${NODE_ENV}`
-        );
-        return;
-      }
-
       try {
-        const res = await sendEmail({
+        const res = await notify.sendEmail({
           to: user.email,
           subject: "Reset your password",
-          body: `
+          html: `
               <h1>Reset your password</h1>
               <p>Hello ${user.name || user.email},</p>
               <p>We received a request to reset your password. Click the button below to reset it:</p>
@@ -197,7 +184,6 @@ const authConfig: BetterAuthOptions = {
               <p>Best regards,<br>The Lumen Team</p>
             `,
           from: "Lumen <noreply@getlumen.dev>",
-          resendApiKey,
         });
         if (!res.success) {
           throw new Error("Failed to send password reset email");
@@ -211,29 +197,11 @@ const authConfig: BetterAuthOptions = {
     sendOnSignUp: effectiveSendOnSignUp, // Auto-send in prod OR when DEV_SKIP_EMAIL_CHECK is false
     autoSignInAfterVerification: true, // Auto sign in after email verification
     sendVerificationEmail: async ({ user, url, token }, request) => {
-      if (NODE_ENV === "development") {
-        // In development, just log the verification details
-        console.log("\n=== EMAIL VERIFICATION (DEVELOPMENT MODE) ===");
-        console.log(`To: ${user.email}`);
-        console.log(`Verification URL: ${url}`);
-        console.log(`Token: ${token}`);
-        console.log("===============================================\n");
-        return;
-      }
-
-      // In production, send actual email using Resend
-      if (!resendApiKey) {
-        console.error(
-          `Resend API key MUST be available for email verification in environment: ${NODE_ENV}`
-        );
-        return;
-      }
-
       try {
-        await sendEmail({
+        await notify.sendEmail({
           to: user.email,
           subject: "Verify your email address",
-          body: `
+          html: `
               <h1>Verify your email address</h1>
               <p>Hello ${user.name || user.email},</p>
               <p>Thank you for signing up! Please click the button below to verify your email address:</p>
@@ -247,7 +215,6 @@ const authConfig: BetterAuthOptions = {
               <p>Best regards,<br>The Lumen Team</p>
             `,
           from: "Lumen <noreply@getlumen.dev>",
-          resendApiKey,
         });
       } catch (error) {
         console.error("Failed to send verification email:", error);
@@ -274,9 +241,9 @@ const authConfig: BetterAuthOptions = {
         if (host?.includes("getlumen.dev")) {
           try {
             const email = ctx.context.newSession?.user.email || ctx.body.email;
-            await slackLog(
-              `name: ${ctx.context.newSession?.user.name}\n${email}\npath: ${ctx.path}\nhost: ${host}`
-            );
+            await notify.sendSlack({
+              text: `name: ${ctx.context.newSession?.user.name}\n${email}\npath: ${ctx.path}\nhost: ${host}`,
+            });
           } catch (err) {
             console.error("Failed to log user creation to slack:", err);
           }

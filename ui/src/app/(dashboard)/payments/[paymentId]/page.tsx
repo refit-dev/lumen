@@ -27,7 +27,7 @@ import {
   RefreshCw,
   ExternalLink,
 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Tooltip,
   TooltipContent,
@@ -40,8 +40,20 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LocaleAwareDate } from "@/components/ui/locale-aware-date";
 import { formatCurrency } from "@lumen/common/utils";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogHeader,
+  DialogFooter,
+  DialogDescription,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { parseStringToCents } from "@/components/form/Number2DecimalsField";
 import { checkTestMode } from "@/lib/utils";
+import { toast } from "sonner";
 
 // Types
 interface PaymentDetail {
@@ -186,6 +198,10 @@ export default function PaymentDetailsPage() {
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [isTestMode, setIsTestMode] = useState(false);
+  const queryClient = useQueryClient();
+  const [refundModalOpen, setRefundModalOpen] = useState(false);
+  const [isPartialRefund, setIsPartialRefund] = useState(false);
+  const [refundAmountInput, setRefundAmountInput] = useState("");
 
   // Fetch payment data
   const {
@@ -208,6 +224,24 @@ export default function PaymentDetailsPage() {
     enabled: !!paymentId,
   });
 
+  // Fetch minimal subscription status for refund options
+  const { data: linkedSubscription } = useQuery({
+    queryKey: ["subscription-status", payment?.subscriptionStableId],
+    queryFn: async () => {
+      if (!payment?.subscriptionStableId) return null;
+      const response = await apiClient.subscriptions[":id"].$get({
+        param: { id: payment.subscriptionStableId },
+      });
+      const data = await response.json();
+      if ("error" in data || !data.subscription) return null;
+      return data.subscription as {
+        status: string;
+        endTimestamp: string | null;
+      };
+    },
+    enabled: !!payment?.subscriptionStableId,
+  });
+
   const handleNavigateBack = useCallback(() => {
     router.push("/payments");
   }, [router]);
@@ -215,6 +249,79 @@ export default function PaymentDetailsPage() {
   const handleCopyId = useCallback((id: string) => {
     navigator.clipboard.writeText(id);
   }, []);
+
+  const retryInvoicePaymentMutation = useMutation({
+    mutationFn: async (invoiceId: string) => {
+      const response = await apiClient.invoices[":id"]["retry-payment"].$post({
+        param: { id: invoiceId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to queue retry"
+        );
+      }
+      return data as { success: boolean; attemptNumber?: number };
+    },
+    onSuccess: () => {
+      toast.success("Payment retry queued");
+      if (payment?.customer?.id) {
+        queryClient.invalidateQueries({
+          queryKey: ["payments", payment.customer.id],
+        });
+      }
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to queue retry");
+    },
+  });
+
+  const refundPaymentMutation = useMutation({
+    mutationFn: async ({
+      amountCents,
+      terminate,
+    }: {
+      amountCents?: number;
+      terminate?: boolean;
+    }) => {
+      if (!payment?.subscriptionStableId) {
+        throw new Error("Refunds are only supported for subscription payments");
+      }
+      const response = await apiClient.subscriptions[":id"].refunds.$post({
+        param: { id: payment.subscriptionStableId },
+        json: { paymentId, amountCents, terminateSubscription: !!terminate },
+      });
+      const data = await response.json();
+      if ("error" in data) {
+        throw new Error(String(data.error));
+      }
+      return data as {
+        success: boolean;
+        refund?: { id: string; status: string; amountCents: number };
+      };
+    },
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success("Refund issued successfully");
+        queryClient.invalidateQueries({ queryKey: ["payment", paymentId] });
+        if (payment?.customer?.id) {
+          queryClient.invalidateQueries({
+            queryKey: ["payments", payment.customer.id],
+          });
+        }
+        setRefundModalOpen(false);
+        setRefundAmountInput("");
+        setIsPartialRefund(false);
+      } else {
+        toast.error("Refund failed");
+      }
+    },
+    onError: (err: unknown) => {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to issue refund"
+      );
+    },
+  });
 
   const handleViewInvoice = useCallback(async () => {
     if (!payment?.invoice?.hasPdf || !payment.invoiceId) return;
@@ -348,6 +455,23 @@ export default function PaymentDetailsPage() {
               ESC
             </kbd>
           </Button>
+          <div>
+            {payment.status === "succeeded" &&
+              payment.refundStatus !== "full" &&
+              !!payment.subscriptionStableId && (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setIsPartialRefund(false);
+                    setRefundAmountInput("");
+                    setRefundModalOpen(true);
+                  }}
+                >
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                  Refund
+                </Button>
+              )}
+          </div>
         </div>
 
         {/* Title and ID Section */}
@@ -939,6 +1063,22 @@ export default function PaymentDetailsPage() {
                       <ExternalLink className="h-4 w-4 mr-1" />
                       View Full Invoice Details
                     </Button>
+                    {payment.invoice.status === "issued" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="ml-2"
+                        onClick={() =>
+                          retryInvoicePaymentMutation.mutate(payment.invoiceId!)
+                        }
+                        disabled={retryInvoicePaymentMutation.isPending}
+                      >
+                        {retryInvoicePaymentMutation.isPending ? (
+                          <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                        ) : null}
+                        Retry Payment
+                      </Button>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -1054,6 +1194,173 @@ export default function PaymentDetailsPage() {
               </div>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Refund Modal */}
+      <Dialog open={refundModalOpen} onOpenChange={setRefundModalOpen}>
+        <DialogContent className="z-[1000] !w-auto !max-w-[650px] !min-w-[550px]">
+          <DialogHeader>
+            <DialogTitle>Issue Refund</DialogTitle>
+            <DialogDescription>
+              Refundable remaining:{" "}
+              {formatCurrency(
+                (payment.amountCents || 0) - (payment.refundedAmountCents || 0),
+                payment.currency
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <Label htmlFor="partial-refund">Partial refund</Label>
+              <Switch
+                id="partial-refund"
+                checked={isPartialRefund}
+                onCheckedChange={(v) => {
+                  setIsPartialRefund(!!v);
+                  if (!v) setRefundAmountInput("");
+                }}
+              />
+            </div>
+            {isPartialRefund && (
+              <div>
+                <Label htmlFor="refund-amount" className="mb-1 block">
+                  Refund amount
+                </Label>
+                <Input
+                  id="refund-amount"
+                  type="text"
+                  inputMode="decimal"
+                  pattern="\d*\.?\d{0,2}"
+                  placeholder="0.00"
+                  value={refundAmountInput}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    if (value === "" || /^\d*\.?\d{0,2}$/.test(value)) {
+                      setRefundAmountInput(value);
+                    }
+                  }}
+                />
+                {refundAmountInput !== "" &&
+                  parseStringToCents(refundAmountInput) >
+                    payment.amountCents -
+                      (payment.refundedAmountCents || 0) && (
+                    <div className="text-xs text-red-600 mt-1">
+                      Amount cannot exceed refundable remaining
+                    </div>
+                  )}
+              </div>
+            )}
+          </div>
+          <DialogFooter className="mt-2 flex flex-col sm:flex-row sm:justify-end gap-2">
+            <Button
+              className="w-full sm:w-auto"
+              variant="outline"
+              onClick={() => setRefundModalOpen(false)}
+            >
+              Cancel
+            </Button>
+            {linkedSubscription?.status === "active" ? (
+              <>
+                <Button
+                  className="w-full sm:w-auto"
+                  onClick={() => {
+                    const payloadAmount = isPartialRefund
+                      ? refundAmountInput === ""
+                        ? undefined
+                        : parseStringToCents(refundAmountInput)
+                      : undefined;
+                    if (
+                      isPartialRefund &&
+                      (refundAmountInput === "" ||
+                        parseStringToCents(refundAmountInput) <= 0 ||
+                        parseStringToCents(refundAmountInput) >
+                          payment.amountCents -
+                            (payment.refundedAmountCents || 0))
+                    ) {
+                      toast.error(
+                        "Enter a valid refund amount less than total"
+                      );
+                      return;
+                    }
+                    refundPaymentMutation.mutate({
+                      amountCents: payloadAmount,
+                      terminate: false,
+                    });
+                  }}
+                  disabled={refundPaymentMutation.isPending}
+                >
+                  {refundPaymentMutation.isPending ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : null}
+                  Refund & keep subscription active
+                </Button>
+                <Button
+                  className="w-full sm:w-auto"
+                  variant="destructive"
+                  onClick={() => {
+                    const payloadAmount = isPartialRefund
+                      ? refundAmountInput === ""
+                        ? undefined
+                        : parseStringToCents(refundAmountInput)
+                      : undefined;
+                    if (
+                      isPartialRefund &&
+                      (refundAmountInput === "" ||
+                        parseStringToCents(refundAmountInput) <= 0 ||
+                        parseStringToCents(refundAmountInput) >
+                          payment.amountCents -
+                            (payment.refundedAmountCents || 0))
+                    ) {
+                      toast.error(
+                        "Enter a valid refund amount less than total"
+                      );
+                      return;
+                    }
+                    refundPaymentMutation.mutate({
+                      amountCents: payloadAmount,
+                      terminate: true,
+                    });
+                  }}
+                  disabled={refundPaymentMutation.isPending}
+                >
+                  {refundPaymentMutation.isPending ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : null}
+                  Refund & terminate subscription
+                </Button>
+              </>
+            ) : (
+              <Button
+                className="w-full sm:w-auto"
+                onClick={() => {
+                  const payloadAmount = isPartialRefund
+                    ? refundAmountInput === ""
+                      ? undefined
+                      : parseStringToCents(refundAmountInput)
+                    : undefined;
+                  if (
+                    isPartialRefund &&
+                    (refundAmountInput === "" ||
+                      parseStringToCents(refundAmountInput) <= 0 ||
+                      parseStringToCents(refundAmountInput) >
+                        payment.amountCents -
+                          (payment.refundedAmountCents || 0))
+                  ) {
+                    toast.error("Enter a valid refund amount less than total");
+                    return;
+                  }
+                  refundPaymentMutation.mutate({ amountCents: payloadAmount });
+                }}
+                disabled={refundPaymentMutation.isPending}
+              >
+                {refundPaymentMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                ) : null}
+                Refund
+              </Button>
+            )}
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

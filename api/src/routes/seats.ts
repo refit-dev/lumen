@@ -11,13 +11,22 @@ import {
   prices,
   invoiceLineItems,
   invoices,
+  customerOrganizations,
+  creditDefinitions,
+  creditGrants,
+  subscriptionFeatures,
 } from "@lumen/common/schema";
-import { eq, and, isNull, desc, gte, lte } from "drizzle-orm";
+import { eq, and, isNull, desc, gte, lte, or, asc } from "drizzle-orm";
 import { logger } from "../helpers/logging";
 import { eventProcessingService } from "./events";
 import questDbService from "../db/questDbService";
 import { nanoid } from "nanoid";
-import { calculateUsageForComponent } from "../helpers/billing";
+import {
+  calculateUsageForComponent,
+  associateFeaturesWithSubscription,
+} from "../helpers/billing";
+import { getPlanFeatures } from "../helpers/index";
+import { createCreditGrant, createCreditTransaction } from "../helpers/credits";
 import {
   PriceComponentSchemaType,
   PerUnitPriceComponentSchemaType,
@@ -74,37 +83,112 @@ async function verifyUserExistsInSeats(
 }
 
 // Validation schemas for seat management
-const addSeatSchema = z.object({
-  user_id: z.string().min(1, "External user ID is required"), // External user ID of the main org
-  created_user_id: z
-    .string()
-    .min(1, "External user ID of the new seat being added is required"), // External user ID which is being added to the seat
-  metadata: z.record(z.any()).optional(),
-  idempotency_key: z.string().optional(),
-  timestamp: z
-    .string()
-    .datetime({ offset: true })
-    .refine((val) => val.endsWith("Z"), {
-      message: "Timestamp must be in UTC format and end with 'Z'",
-    })
-    .optional(),
-});
+const addSeatSchema = z
+  .object({
+    user_id: z.string().min(1, "External user ID is required").optional(), // External user ID of the main org (fallback)
+    organization_id: z.string().optional(), // Preferred organization identifier
+    created_user_id: z
+      .string()
+      .min(1, "External user ID of the new seat being added is required"), // External user ID which is being added to the seat
+    created_user_info: z
+      .object({
+        name: z.string().optional(),
+        email: z.string().email().optional(),
+      })
+      .optional(), // Optional info about the user being added
+    metadata: z.record(z.any()).optional(),
+    idempotency_key: z.string().optional(),
+    timestamp: z
+      .string()
+      .datetime({ offset: true })
+      .refine((val) => val.endsWith("Z"), {
+        message: "Timestamp must be in UTC format and end with 'Z'",
+      })
+      .optional(),
+  })
+  .refine((data) => data.organization_id || data.user_id, {
+    message: "Either organization_id or user_id must be provided",
+  });
 
-const removeSeatSchema = z.object({
-  user_id: z.string().min(1, "External user ID is required"), // External user ID
-  removed_user_id: z
-    .string()
-    .min(1, "External user ID of the seat being removed is required"), // External user ID being removed from the seat
-  metadata: z.record(z.any()).optional(),
-  idempotency_key: z.string().optional(),
-  timestamp: z
-    .string()
-    .datetime({ offset: true })
-    .refine((val) => val.endsWith("Z"), {
-      message: "Timestamp must be in UTC format and end with 'Z'",
-    })
-    .optional(),
-});
+const removeSeatSchema = z
+  .object({
+    user_id: z.string().min(1, "External user ID is required").optional(), // External user ID (fallback)
+    organization_id: z.string().optional(), // Preferred organization identifier
+    removed_user_id: z
+      .string()
+      .min(1, "External user ID of the seat being removed is required"), // External user ID being removed from the seat
+    metadata: z.record(z.any()).optional(),
+    idempotency_key: z.string().optional(),
+    timestamp: z
+      .string()
+      .datetime({ offset: true })
+      .refine((val) => val.endsWith("Z"), {
+        message: "Timestamp must be in UTC format and end with 'Z'",
+      })
+      .optional(),
+  })
+  .refine((data) => data.organization_id || data.user_id, {
+    message: "Either organization_id or user_id must be provided",
+  });
+
+// Helper function to resolve billing customer from organization_id or user_id
+async function resolveBillingCustomer(
+  merchantId: string,
+  organizationId?: string,
+  userId?: string
+): Promise<{ externalCustomerId: string; customerId: string } | null> {
+  if (organizationId) {
+    // Look up organization by external ID and get its billing customer
+    const organization = await db.query.customerOrganizations.findFirst({
+      where: and(
+        eq(customerOrganizations.externalOrgId, organizationId),
+        eq(customerOrganizations.merchantId, merchantId),
+        isNull(customerOrganizations.deletedAt)
+      ),
+    });
+
+    if (!organization || !organization.billingCustomerId) {
+      return null;
+    }
+
+    const billingCustomer = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.id, organization.billingCustomerId),
+        eq(customers.merchantId, merchantId),
+        isNull(customers.deletedAt)
+      ),
+    });
+
+    if (!billingCustomer || !billingCustomer.externalCustomerId) {
+      return null;
+    }
+
+    return {
+      externalCustomerId: billingCustomer.externalCustomerId,
+      customerId: billingCustomer.id,
+    };
+  } else if (userId) {
+    // Fallback to user_id lookup
+    const customer = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.externalCustomerId, userId),
+        eq(customers.merchantId, merchantId),
+        isNull(customers.deletedAt)
+      ),
+    });
+
+    if (!customer || !customer.externalCustomerId) {
+      return null;
+    }
+
+    return {
+      externalCustomerId: customer.externalCustomerId,
+      customerId: customer.id,
+    };
+  }
+
+  return null;
+}
 
 export const seatsRoute = new Hono()
   // Add a seat for a customer/subscription
@@ -113,7 +197,31 @@ export const seatsRoute = new Hono()
     const merchantId = c.get("merchant")!.id;
     const seatData = c.req.valid("json");
     console.debug("[POST /seats/add] seatData:", seatData);
-    const { user_id, created_user_id, metadata, timestamp } = seatData;
+    const {
+      user_id,
+      organization_id,
+      created_user_id,
+      created_user_info,
+      metadata,
+      timestamp,
+    } = seatData;
+
+    // Resolve billing customer from organization_id (preferred) or user_id (fallback)
+    const billingCustomer = await resolveBillingCustomer(
+      merchantId,
+      organization_id,
+      user_id
+    );
+    if (!billingCustomer) {
+      return c.json(
+        {
+          error: organization_id
+            ? `Organization not found: ${organization_id}`
+            : `Customer not found: ${user_id}`,
+        },
+        404
+      );
+    }
 
     const subsResult = await db
       .select({
@@ -124,7 +232,7 @@ export const seatsRoute = new Hono()
       .innerJoin(customers, eq(subscriptions.customerId, customers.id))
       .where(
         and(
-          eq(customers.externalCustomerId, user_id),
+          eq(customers.externalCustomerId, billingCustomer.externalCustomerId),
           eq(subscriptions.merchantId, merchantId),
           isNull(subscriptions.deletedAt),
           isNull(subscriptions.endTimestamp),
@@ -140,6 +248,8 @@ export const seatsRoute = new Hono()
         "[POST /seats/add] Subscription not found or access denied",
         {
           user_id,
+          organization_id,
+          billingCustomerExtId: billingCustomer.externalCustomerId,
           merchantId,
         }
       );
@@ -158,7 +268,7 @@ export const seatsRoute = new Hono()
       const eventData = {
         eventName: "seat_added",
         customerId: customerId,
-        externalCustomerId: user_id,
+        extCustomerId: billingCustomer.externalCustomerId,
         eventString: created_user_id, // The external user ID being added
         properties: {
           subscription_id: subscriptionId,
@@ -183,6 +293,156 @@ export const seatsRoute = new Hono()
         console.info(
           `Seat addition accepted and processed: merchant=${merchantId}, subscription=${subscriptionId}, user=${created_user_id}`
         );
+
+        // ---------------- Create/ensure seat customer + entitlements + seat credits ----------------
+        try {
+          // Load subscription with plan/price/customer context
+          const subscriptionFull = await db.query.subscriptions.findFirst({
+            where: eq(subscriptions.id, subscriptionId),
+            with: { plan: true, price: true, customer: true },
+          });
+
+          if (
+            subscriptionFull?.customer &&
+            subscriptionFull.plan &&
+            subscriptionFull.price
+          ) {
+            const primary = subscriptionFull.customer;
+
+            // Ensure org exists for primary customer
+            let orgId = primary.customerOrganizationId || null;
+            if (!orgId) {
+              const [createdOrg] = await db
+                .insert(customerOrganizations)
+                .values({
+                  merchantId,
+                  billingCustomerId: primary.id, // Set the primary customer as the billing customer
+                })
+                .returning();
+              orgId = createdOrg.id;
+              await db
+                .update(customers)
+                .set({ customerOrganizationId: orgId, orgRole: "primary" })
+                .where(eq(customers.id, primary.id));
+            }
+
+            // Upsert seat customer by externalCustomerId
+            let seatCustomer = await db.query.customers.findFirst({
+              where: and(
+                eq(customers.merchantId, merchantId),
+                eq(customers.externalCustomerId, created_user_id),
+                isNull(customers.deletedAt)
+              ),
+            });
+
+            if (!seatCustomer) {
+              const [createdSeat] = await db
+                .insert(customers)
+                .values({
+                  merchantId,
+                  externalCustomerId: created_user_id,
+                  name: created_user_info?.name || null,
+                  email: created_user_info?.email || null,
+                  customerOrganizationId: orgId!,
+                  orgRole: "member",
+                  timezone: primary.timezone || "UTC",
+                  preferredLanguage: primary.preferredLanguage || "en",
+                  preferredCurrency:
+                    primary.preferredCurrency ||
+                    subscriptionFull.price.currency,
+                })
+                .returning();
+              seatCustomer = createdSeat;
+            } else if (!seatCustomer.customerOrganizationId) {
+              // Update existing customer with org info and optionally update name/email if provided
+              const updateData: any = {
+                customerOrganizationId: orgId!,
+                orgRole: "member",
+              };
+              if (created_user_info?.name)
+                updateData.name = created_user_info.name;
+              if (created_user_info?.email)
+                updateData.email = created_user_info.email;
+
+              await db
+                .update(customers)
+                .set(updateData)
+                .where(eq(customers.id, seatCustomer.id));
+            }
+
+            // Copy plan features to seat customer entitlements (pointing to primary subscription)
+            const planFeaturesList = await getPlanFeatures(
+              subscriptionFull.plan.id,
+              db
+            );
+            if (planFeaturesList.length > 0) {
+              const featuresToAssociate = planFeaturesList.map((pf) => ({
+                id: pf.id,
+                slug: pf.slug,
+                featureValue: pf.featureValue as any,
+                source: "plan" as const,
+              }));
+              await associateFeaturesWithSubscription(
+                subscriptionId,
+                seatCustomer.id,
+                merchantId,
+                featuresToAssociate
+              );
+            }
+
+            // Create seat credit grants from plan-scoped definitions (like initial subscription grants)
+            const price = subscriptionFull.price;
+            const allComponents = price.pricingData?.components || [];
+            const componentIdSet = new Set(
+              allComponents.map((c: any) => c.component_id)
+            );
+
+            const definitions = await db.query.creditDefinitions.findMany({
+              where: and(
+                eq(creditDefinitions.merchantId, merchantId),
+                eq(creditDefinitions.scope, "plan"),
+                eq(creditDefinitions.planId, subscriptionFull.plan.id),
+                eq(creditDefinitions.isActive, true),
+                isNull(creditDefinitions.deletedAt),
+                or(
+                  isNull(creditDefinitions.priceId),
+                  eq(creditDefinitions.priceId, price.id)
+                )
+              ),
+              orderBy: [
+                asc(creditDefinitions.priority),
+                asc(creditDefinitions.createdAt),
+              ],
+            });
+
+            for (const def of definitions) {
+              // If definition targets a specific component, ensure it exists in current price
+              if (
+                def.priceComponentId &&
+                !componentIdSet.has(def.priceComponentId)
+              ) {
+                continue;
+              }
+
+              try {
+                await createCreditGrant({
+                  merchantId,
+                  customerId: seatCustomer.id,
+                  creditDefinitionId: def.id,
+                  source: "subscription",
+                  notes: `Seat grant for ${created_user_id} under subscription ${subscriptionId}`,
+                });
+              } catch (e) {
+                console.error("Failed creating seat credit grant", e);
+              }
+            }
+          }
+        } catch (seatSetupErr) {
+          console.error(
+            "Seat setup (customer/entitlements/credits) failed",
+            seatSetupErr
+          );
+        }
 
         // ---------------- Overage billing for pre-pay seat plans ----------------
         try {
@@ -327,7 +587,10 @@ export const seatsRoute = new Hono()
                   const billImmediately =
                     seatComponent.bill_immediately !== false;
                   const invoiceStatus = billImmediately ? "issued" : "draft"; // when "issued", new invoice is created and charged
-                  const description = `Seat overage charge for ${created_user_id}`;
+                  // Use email if available, otherwise use external customer ID
+                  const userIdentifier =
+                    created_user_info?.email || created_user_id;
+                  const description = `Seat overage charge for ${userIdentifier}`;
 
                   console.info(
                     `[POST /seats/add] Creating ${invoiceStatus} invoice for overage: remainingQty=${remainingQty}, billImmediately=${billImmediately}`
@@ -400,6 +663,7 @@ export const seatsRoute = new Hono()
           {
             message: "Seat added successfully",
             user_id,
+            organization_id,
             created_user_id,
             subscription_id: subscriptionId,
             idempotency_key: idempotencyKey,
@@ -422,7 +686,24 @@ export const seatsRoute = new Hono()
     const merchantId = c.get("merchant")!.id;
     const seatData = c.req.valid("json");
     console.debug("[POST /seats/remove] seatData:", seatData);
-    const { user_id, removed_user_id, metadata } = seatData;
+    const { user_id, organization_id, removed_user_id, metadata } = seatData;
+
+    // Resolve billing customer from organization_id (preferred) or user_id (fallback)
+    const billingCustomer = await resolveBillingCustomer(
+      merchantId,
+      organization_id,
+      user_id
+    );
+    if (!billingCustomer) {
+      return c.json(
+        {
+          error: organization_id
+            ? `Organization not found: ${organization_id}`
+            : `Customer not found: ${user_id}`,
+        },
+        404
+      );
+    }
 
     const subsResult = await db
       .select({
@@ -433,7 +714,7 @@ export const seatsRoute = new Hono()
       .innerJoin(customers, eq(subscriptions.customerId, customers.id))
       .where(
         and(
-          eq(customers.externalCustomerId, user_id),
+          eq(customers.externalCustomerId, billingCustomer.externalCustomerId),
           eq(subscriptions.merchantId, merchantId),
           isNull(subscriptions.deletedAt),
           isNull(subscriptions.endTimestamp),
@@ -447,7 +728,12 @@ export const seatsRoute = new Hono()
     if (subsResult.length === 0) {
       console.warn(
         "[POST /seats/remove] Subscription not found or access denied",
-        { user_id, merchantId }
+        {
+          user_id,
+          organization_id,
+          billingCustomerExtId: billingCustomer.externalCustomerId,
+          merchantId,
+        }
       );
       return c.json({ error: "Subscription not found or access denied" }, 404);
     }
@@ -478,6 +764,88 @@ export const seatsRoute = new Hono()
         );
       }
 
+      // Find the seat customer by external id
+      const seatCustomer = await db.query.customers.findFirst({
+        where: and(
+          eq(customers.merchantId, merchantId),
+          eq(customers.externalCustomerId, removed_user_id),
+          isNull(customers.deletedAt)
+        ),
+      });
+
+      if (seatCustomer) {
+        // Load subscription context
+        const subscription = await db.query.subscriptions.findFirst({
+          where: eq(subscriptions.id, subscriptionId),
+          with: { price: true },
+        });
+
+        // Immediately revoke ACTIVE grants for this seat customer for this plan
+        const activeSeatGrants = await db.query.creditGrants.findMany({
+          where: and(
+            eq(creditGrants.merchantId, merchantId),
+            eq(creditGrants.customerId, seatCustomer.id),
+            eq(creditGrants.status, "ACTIVE"),
+            isNull(creditGrants.deletedAt),
+            // if subscription known, scope grants to its plan to avoid cross-plan revokes
+            subscription?.planId
+              ? eq(creditGrants.planId, subscription.planId)
+              : eq(creditGrants.planId, creditGrants.planId)
+          ),
+        });
+
+        for (const grant of activeSeatGrants) {
+          if (grant.remainingAmount > 0) {
+            await createCreditTransaction(
+              {
+                merchantId,
+                customerId: seatCustomer.id,
+                creditGrantId: grant.id,
+                amount: grant.remainingAmount,
+                applicationType: grant.applicationType,
+                eventName: "revoked",
+                eventTimestamp: new Date(),
+                featureId: grant.featureId || undefined,
+                featureSlug: grant.featureSlug || undefined,
+                priceId: grant.priceId || undefined,
+                priceComponentId: grant.priceComponentId || undefined,
+                currency: grant.currency || undefined,
+                notes: "Seat removed - immediate revocation",
+              },
+              undefined
+            );
+          }
+
+          await db
+            .update(creditGrants)
+            .set({
+              status: "REVOKED",
+              remainingAmount: 0,
+              updatedAt: new Date(),
+            })
+            .where(eq(creditGrants.id, grant.id));
+        }
+
+        const now = new Date();
+        // Soft-delete entitlements for this seat customer mapped to this subscription
+        await db
+          .update(subscriptionFeatures)
+          .set({ deletedAt: now })
+          .where(
+            and(
+              eq(subscriptionFeatures.subscriptionId, subscriptionId),
+              eq(subscriptionFeatures.customerId, seatCustomer.id),
+              isNull(subscriptionFeatures.deletedAt)
+            )
+          );
+
+        // Soft-delete the seat customer
+        await db
+          .update(customers)
+          .set({ deletedAt: now })
+          .where(eq(customers.id, seatCustomer.id));
+      }
+
       // Generate idempotency key if not provided
       const idempotencyKey =
         seatData.idempotency_key ||
@@ -486,7 +854,7 @@ export const seatsRoute = new Hono()
       // Use the new event processing service
       const eventData = {
         eventName: "seat_removed",
-        externalCustomerId: user_id,
+        extCustomerId: billingCustomer.externalCustomerId,
         customerId: customerId,
         eventString: removed_user_id, // The external user ID being removed
         properties: {
@@ -520,6 +888,7 @@ export const seatsRoute = new Hono()
           {
             message: "Seat removed successfully",
             user_id,
+            organization_id,
             removed_user_id,
             subscription_id: subscriptionId,
             idempotency_key: idempotencyKey,

@@ -12,6 +12,11 @@ export const lumenNextHandler = async ({
   const SUPPORTED_PATHS = [
     "customers/subscription-status",
     "entitlements/{customerId}",
+    "customers/portal/overview",
+    "customers/portal/create-setup-intent",
+    "customers/portal/set-subscription-payment-method",
+    "customers/portal/payment-methods/{id}",
+    "invoices/{id}/pdf",
   ];
   const API_KEY = apiKey || process.env.LUMEN_API_KEY;
   if (!API_KEY) {
@@ -29,7 +34,16 @@ export const lumenNextHandler = async ({
     pathname.split("/").slice(3).join("/")
   );
 
-  if (!SUPPORTED_PATHS.includes(lumenBackendPath)) {
+  const pathToRegex = (pattern: string): RegExp => {
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = "^" + escaped.replace(/\\\{[^/}]+\\\}/g, "[^/]+") + "$";
+    return new RegExp(re);
+  };
+
+  const isAllowed = SUPPORTED_PATHS.some((p) =>
+    pathToRegex(p).test(lumenBackendPath)
+  );
+  if (!isAllowed) {
     return { error: "Unsupported path" };
   }
 
@@ -54,14 +68,37 @@ export const lumenNextHandler = async ({
     path = path + "?" + queryString;
   }
 
+  let body: string | undefined = undefined;
+  const method = (request.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    try {
+      const json = await request.json();
+      // Security: if externalCustomerId is present in body, ensure it matches userId
+      if (
+        json &&
+        typeof json.externalCustomerId === "string" &&
+        json.externalCustomerId !== userId
+      ) {
+        return { error: "Forbidden" };
+      }
+      body = JSON.stringify({ ...json });
+    } catch {
+      body = undefined;
+    }
+  }
+
   const response = await fetch(path, {
     headers: {
       Authorization: `Bearer ${API_KEY}`,
       "Content-Type": "application/json",
     },
-    method: request.method,
-    body: request.body ? JSON.stringify({ ...request.body }) : undefined,
+    method,
+    body,
   });
+
+  if (!response.ok) {
+    console.error("lumenNextHandler: Failed to fetch Lumen API", response);
+  }
 
   return await response.json();
 };

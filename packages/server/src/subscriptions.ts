@@ -92,3 +92,6 @@ export const createFreeSubscriptionIfNoneExists = async (params: {
     throw error;
   }
 };
+
+// Backwards-friendly alias used in docs/examples
+export const createFreeSubscription = createFreeSubscriptionIfNoneExists;

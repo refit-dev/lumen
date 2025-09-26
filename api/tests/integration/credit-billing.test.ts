@@ -61,13 +61,10 @@ import { processBillingCycle } from "../../trigger/helpers/billing";
 import { collectPaymentJob } from "../../trigger/jobs/collectPayment";
 import { collectPaymentPayloadSchema } from "../../trigger/helpers/collectPayment";
 import { env } from "../../src/env";
-import { testEnv } from "../test-env";
-import { setTimeout as sleep } from "timers/promises";
-import { spawn, ChildProcess } from "child_process";
+import { sleep } from "../test-helpers/sleep";
+import { ChildProcess } from "child_process";
 import { promises as fs } from "fs";
-import path from "path";
 import { z } from "zod";
-import { encryptField } from "../../src/helpers/encryption";
 
 const customerAddressObj = {
   customerAddress: "123 Main St",

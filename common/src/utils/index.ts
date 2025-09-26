@@ -4,6 +4,9 @@ import Dinero, { Currency } from "dinero.js";
 
 export * from "./countries";
 
+export const YC_ENROLLMENT_PLACEHOLDER_DOMAIN = "yc-companies-placeholder.com";
+export const YC_ENROLLMENT_FEATURE_SLUG = "yc-company";
+
 export function formatCurrency(amount: number, currency: string): string {
   // Ensure the amount is an integer as required by Dinero.js. If a float or
   // NaN sneaks in (e.g. from averaging), default to a rounded integer or 0.

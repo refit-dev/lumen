@@ -7,8 +7,12 @@ import {
   invoiceLineItems,
   invoiceInsertSchemaReq,
   invoiceUpdateSchemaReq,
+  paymentRetries,
+  payments,
+  paymentMethods,
+  subscriptionDetails,
 } from "@lumen/common/schema";
-import { and, eq, desc, count, inArray } from "drizzle-orm";
+import { and, eq, desc, count, inArray, isNull } from "drizzle-orm";
 import {
   generatePresignedUrl,
   extractBucketAndKeyFromUrl,
@@ -18,6 +22,7 @@ import {
   formatCustomerInvoiceNumber,
   triggerInvoicePdfGeneration,
 } from "../helpers/billing";
+import { retryInvoicePayment } from "../helpers/paymentprovider";
 
 const listInvoicesSchema = z
   .object({
@@ -118,6 +123,7 @@ export const invoicesRouter = new Hono()
           },
           lineItems: true,
           payment: true,
+          originalInvoice: true,
         },
         limit,
         offset,
@@ -182,6 +188,7 @@ export const invoicesRouter = new Hono()
           },
           lineItems: true,
           payment: true,
+          originalInvoice: true,
         },
       });
 
@@ -190,7 +197,7 @@ export const invoicesRouter = new Hono()
       }
 
       // Don't expose the actual PDF URL, just indicate if a PDF is available
-      const invoiceWithPdfStatus = {
+      const invoiceWithPdfStatus: any = {
         ...invoice,
         hasPdf: Boolean(invoice.pdfUrl),
         pdfUrl: undefined, // Remove the actual URL
@@ -198,8 +205,32 @@ export const invoicesRouter = new Hono()
           invoice.lineItems || []
         ),
       };
+      // Find adjustment invoices that reference this invoice
+      const adjustments = await db.query.invoices.findMany({
+        where: and(
+          eq(invoices.merchantId, merchantId),
+          eq(invoices.originalInvoiceId, invoiceId)
+        ),
+        with: {
+          customer: true,
+        },
+        orderBy: [desc(invoices.createdAt)],
+      });
 
-      return c.json({ invoice: invoiceWithPdfStatus });
+      return c.json({
+        invoice: {
+          ...invoiceWithPdfStatus,
+          adjustmentInvoices: adjustments.map((inv) => ({
+            id: inv.id,
+            customerInvoiceNumber: inv.customerInvoiceNumber,
+            documentType: (inv as any).documentType,
+            totalAmountCents: inv.totalAmountCents,
+            currency: inv.currency,
+            issueDate: inv.issueDate,
+            hasPdf: Boolean(inv.pdfUrl),
+          })),
+        },
+      });
     } catch (error) {
       console.error("Error fetching invoice:", error);
       return c.json(
@@ -227,6 +258,7 @@ export const invoicesRouter = new Hono()
         with: {
           lineItems: true,
           payment: true,
+          originalInvoice: true,
         },
         orderBy: [desc(invoices.createdAt)],
       });
@@ -308,6 +340,128 @@ export const invoicesRouter = new Hono()
             error instanceof Error
               ? error.message
               : "Failed to generate PDF access URL",
+        },
+        500
+      );
+    }
+  })
+  // Manual retry endpoint for unpaid invoices
+  .post("/:id/retry-payment", async (c) => {
+    try {
+      const invoiceId = c.req.param("id");
+      const merchantId = c.get("merchant")!.id;
+
+      // Ensure the invoice belongs to this merchant and is not paid
+      const invoice = await db.query.invoices.findFirst({
+        where: and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.merchantId, merchantId)
+        ),
+        with: { customer: true },
+      });
+
+      if (!invoice) {
+        return c.json({ error: "Invoice not found" }, 404);
+      }
+
+      if (invoice.status === "paid") {
+        return c.json({ success: true, message: "Invoice already paid" }, 200);
+      }
+
+      // Compute next attempt number for this invoice
+      const lastRetry = await db.query.paymentRetries.findFirst({
+        where: eq(paymentRetries.invoiceId, invoiceId),
+        orderBy: (paymentRetries, { desc }) => [
+          desc(paymentRetries.attemptNumber),
+        ],
+      });
+      const attemptNumber = (lastRetry?.attemptNumber || 0) + 1;
+
+      // Find or create a payment record for this invoice
+      let existingPayment = await db.query.payments.findFirst({
+        where: eq(payments.invoiceId, invoiceId),
+        orderBy: (payments, { desc }) => [desc(payments.createdAt)],
+      });
+
+      if (!existingPayment) {
+        // Get customer's latest payment method if available
+        // Prefer subscription's configured payment method, fallback to most recently used
+        let pm: typeof paymentMethods.$inferSelect | null = null;
+        if (invoice.subscriptionId) {
+          const sd = await db.query.subscriptionDetails.findFirst({
+            where: and(
+              eq(subscriptionDetails.subscriptionId, invoice.subscriptionId),
+              isNull(subscriptionDetails.deletedAt)
+            ),
+          });
+          if (sd?.paymentMethodId) {
+            const found = await db.query.paymentMethods.findFirst({
+              where: and(
+                eq(paymentMethods.id, sd.paymentMethodId),
+                isNull(paymentMethods.deletedAt)
+              ),
+            });
+            pm = found ?? null;
+          }
+        }
+        if (!pm) {
+          const found = await db.query.paymentMethods.findFirst({
+            where: and(
+              eq(paymentMethods.customerId, invoice.customerId),
+              isNull(paymentMethods.deletedAt)
+            ),
+            orderBy: (paymentMethods, { desc }) => [
+              desc(paymentMethods.lastUsedAt),
+            ],
+          });
+          pm = found ?? null;
+        }
+        const [created] = await db
+          .insert(payments)
+          .values({
+            merchantId: merchantId,
+            invoiceId: invoiceId,
+            paymentMethodId: pm ? pm.id : null,
+            amountCents: invoice.totalAmountCents || 0,
+            currency: invoice.currency,
+            status: "pending",
+          })
+          .returning();
+        existingPayment = created;
+      }
+
+      // Create retry record as pending so webhook can update it
+      const [retryRecord] = await db
+        .insert(paymentRetries)
+        .values({
+          paymentId: existingPayment.id,
+          invoiceId,
+          attemptNumber,
+          status: "pending",
+        })
+        .returning();
+
+      // Delegate to existing retry helper which triggers PSP attempt
+      const result = await retryInvoicePayment({
+        invoiceId,
+        paymentRetryId: retryRecord.id,
+        attemptNumber,
+      });
+
+      return c.json({
+        success: result.queued,
+        message:
+          result.message ||
+          (result.queued ? "Retry queued" : "Failed to queue retry"),
+        attemptNumber,
+        paymentId: result.paymentId,
+      });
+    } catch (error) {
+      console.error("Error retrying invoice payment:", error);
+      return c.json(
+        {
+          error:
+            error instanceof Error ? error.message : "Failed to retry payment",
         },
         500
       );
@@ -420,7 +574,7 @@ export const invoicesRouter = new Hono()
                     ? "manual_entry"
                     : "default",
                 ...(data.taxCalculationMethod === "exempt" && {
-                  exemptionReason: "customer_exempt",
+                  exemptionReason: "other",
                 }),
                 ...(data.taxCalculationMethod === "manual" &&
                   data.manualTaxDescription && {

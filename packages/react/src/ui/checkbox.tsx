@@ -3,11 +3,8 @@ import styled from "styled-components";
 
 interface CheckboxProps
   extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "type"> {
-  // For onCheckedChange, shadcn/Radix typically provides (checked: boolean | 'indeterminate')
-  // For a native input, onChange will give React.ChangeEvent<HTMLInputElement>
-  // We'll stick to standard HTML input props here for simplicity.
-  // If onCheckedChange behavior is crucial, it needs more complex handling.
   "aria-invalid"?: boolean;
+  onCheckedChange?: (checked: boolean) => void;
 }
 
 const StyledCheckboxInput = styled.input.attrs({
@@ -66,8 +63,23 @@ const StyledCheckboxInput = styled.input.attrs({
 `;
 
 const Checkbox = React.forwardRef<HTMLInputElement, CheckboxProps>(
-  ({ className, ...props }, ref) => {
-    return <StyledCheckboxInput ref={ref} className={className} {...props} />;
+  ({ className, onCheckedChange, onChange, ...props }, ref) => {
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (typeof onChange === "function") {
+        onChange(e);
+      }
+      if (typeof onCheckedChange === "function") {
+        onCheckedChange(e.target.checked);
+      }
+    };
+    return (
+      <StyledCheckboxInput
+        ref={ref}
+        className={className}
+        onChange={handleChange}
+        {...props}
+      />
+    );
   }
 );
 

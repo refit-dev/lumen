@@ -14,7 +14,7 @@ import { db } from "../../src/db/client";
 import Stripe from "stripe";
 import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
-import { setTimeout as sleep } from "timers/promises";
+import { sleep } from "../test-helpers/sleep";
 import path from "path";
 import {
   invoices,
@@ -52,14 +52,13 @@ import {
   createTestPrice,
   createTestCustomer,
   createTestApiClient,
-  createTestStripe,
   createTestApiKeys,
   clearEventData,
   cleanupDataFull,
 } from "../test-helpers";
 import { FeatureValue } from "../test-helpers/data/feature";
 import dotenv from "dotenv";
-import { calculateNextBillingDate } from "../../src/helpers/billing";
+import { calculateNextBillingDate } from "../../src/helpers/billing-dates";
 import { Price } from "../../src/helpers";
 
 import { collectPaymentJob } from "../../trigger/jobs/collectPayment"; // Added for new job
@@ -68,43 +67,13 @@ import { createOrMergeIntoInvoice } from "../../src/helpers/billing";
 import { z } from "zod";
 import { env } from "../../src/env";
 import { testEnv } from "../test-env";
+import {
+  createPaymentProvider,
+  PaymentProviderAdapter,
+} from "../test-helpers/paymentProvider";
 
 // Define the type for batch items based on the job payload schema
 type BatchItem = { payload: z.infer<typeof collectPaymentPayloadSchema> };
-
-async function findStripeCLI(): Promise<string | null> {
-  // Try to find it on PATH
-  try {
-    const proc = await Bun.spawn(["which", "stripe"], {
-      stdout: "pipe",
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const result = stdout.trim();
-    if (result) {
-      return result;
-    }
-  } catch (e) {
-    console.error("Failed to find Stripe CLI:", e);
-  }
-
-  // Common places to look for stripe CLI
-  const possiblePaths = [
-    "/usr/local/bin/stripe",
-    "/opt/homebrew/bin/stripe",
-    path.join(process.env.HOME || "", ".local/bin/stripe"),
-  ];
-
-  for (const p of possiblePaths) {
-    try {
-      await fs.access(p, fs.constants.X_OK);
-      return p;
-    } catch (e) {
-      console.error("Failed to find Stripe CLI:", e);
-    }
-  }
-
-  return null;
-}
 
 // Define the type for the mock run result
 type MockRunResult = {
@@ -192,24 +161,8 @@ describe("Billing Integration Tests", () => {
   let tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
   let tempMerchantIdFile = "/tmp/test_merchant_id.txt";
   let publishableApiKey: string;
-  let customerEmail: string;
+  let paymentProvider: PaymentProviderAdapter;
 
-  // Clean up function for the webhook process
-  const cleanupWebhook = async () => {
-    if (webhookProcess && !webhookProcess.killed) {
-      console.log("Cleaning up webhook process...");
-      webhookProcess.kill();
-      webhookProcess = null;
-
-      // Clean up temp files
-      try {
-        await fs.unlink(tempWebhookSecretFile);
-        await fs.unlink(tempMerchantIdFile);
-      } catch (err) {
-        // Ignore errors if files don't exist
-      }
-    }
-  };
 
   beforeAll(async () => {
     // Get Stripe test keys
@@ -225,14 +178,14 @@ describe("Billing Integration Tests", () => {
 
   afterAll(async () => {
     // Final cleanup of the webhook process if needed
-    await cleanupWebhook();
-
+    await paymentProvider?.cleanup();
     // Clean up database records
     await cleanupDataFull();
   });
 
   beforeEach(async () => {
     // Clean up test data from previous tests
+    await clearEventData();
     await cleanupTestData();
 
     testStartTime = new Date();
@@ -251,6 +204,8 @@ describe("Billing Integration Tests", () => {
       );
     }
 
+    paymentProvider = await createPaymentProvider();
+
     // 1. Set up a test environment
     const { user, merchant } = await createFullTestEnvironment();
     merchantId = merchant.id;
@@ -259,12 +214,7 @@ describe("Billing Integration Tests", () => {
     await fs.writeFile(tempMerchantIdFile, merchantId);
 
     // Create Stripe integration for the merchant
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // Generate publishable API key for payment-init flow
     const apiKeys = await createTestApiKeys({
@@ -382,71 +332,7 @@ describe("Billing Integration Tests", () => {
     subscriptionDetailsId = details.id;
 
     // Start webhook listener in a separate process
-    try {
-      console.log(`Starting webhook listener for merchant ${merchantId}...`);
-
-      // Get the stripe CLI path
-      const stripeCLIPath = await findStripeCLI();
-      console.log(`Found Stripe CLI at: ${stripeCLIPath}`);
-
-      // Start the webhook listener only if we found the Stripe CLI
-      if (stripeCLIPath) {
-        // First, get the webhook secret
-        const secretProcess = spawn(stripeCLIPath, [
-          "listen",
-          "--forward-to",
-          `localhost:8000/v1/public/webhook/${merchantId}`,
-          "--print-secret",
-          "--api-key",
-          testEnv.TEST_STRIPE_SECRET_KEY,
-        ]);
-
-        // Collect the secret from stdout
-        let secret = "";
-        secretProcess.stdout.on("data", (data) => {
-          secret += data.toString();
-        });
-
-        await new Promise<void>((resolve) => {
-          secretProcess.on("close", async () => {
-            // Clean up and save the secret
-            secret = secret.trim();
-            await fs.writeFile(tempWebhookSecretFile, secret);
-            console.log(`Saved webhook secret to ${tempWebhookSecretFile}`);
-            resolve();
-          });
-        });
-
-        // Now start the actual webhook listener
-        webhookProcess = spawn(
-          stripeCLIPath,
-          [
-            "listen",
-            "--forward-to",
-            `localhost:8000/v1/public/webhook/${merchantId}`,
-            "--api-key",
-            testEnv.TEST_STRIPE_SECRET_KEY,
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-          }
-        );
-
-        // Give some time for the webhook process to start
-        await sleep(1000);
-        console.log(`Webhook listener started with PID ${webhookProcess.pid}`);
-      } else {
-        console.log(
-          "Stripe CLI not found, webhook listener will not be started"
-        );
-        console.log(
-          "This test will still run but may not properly test the webhook handling"
-        );
-      }
-    } catch (error) {
-      console.error("Failed to start webhook listener:", error);
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
 
     // --- Mock Setup ---
     batchTriggerSpy = spyOn(collectPaymentJob, "batchTrigger");
@@ -542,12 +428,14 @@ describe("Billing Integration Tests", () => {
     }
 
     // Clean up the webhook process
-    await cleanupWebhook();
+    await paymentProvider?.cleanup();
   });
 
   afterAll(async () => {
     // Final cleanup of the webhook process if needed
-    await cleanupWebhook();
+    await paymentProvider?.cleanup();
+    // Clean up database records
+    await cleanupDataFull();
   });
 
   it("should process a due subscription, generate an invoice via mock, and update billing dates", async () => {
@@ -695,6 +583,185 @@ describe("Billing Integration Tests", () => {
     expect(details.nextBillingDate.toISOString().slice(0, 16)).toBe(
       expectedNextBillingDate.toISOString().slice(0, 16)
     );
+  }, 30000);
+
+  it("should prefer subscription_details payment method over most-recent when charging", async () => {
+    // Create a Stripe customer for PSP integration
+    const stripeCustomer = await stripeClient.customers.create({
+      email: `prefer-subdetail-${customerId}@example.com`,
+      name: "Prefer SubDetail PM Customer",
+      metadata: { lumenCustomerId: customerId },
+    });
+
+    // Update our customer record with the pspCustomerId
+    await db
+      .update(customers)
+      .set({ pspCustomerId: stripeCustomer.id })
+      .where(eq(customers.id, customerId));
+
+    // Attach two Stripe payment methods
+    const stripePmA = await stripeClient.paymentMethods.attach("pm_card_visa", {
+      customer: stripeCustomer.id,
+    });
+    const stripePmB = await stripeClient.paymentMethods.attach("pm_card_visa", {
+      customer: stripeCustomer.id,
+    });
+
+    // Insert both payment methods into our DB
+    const [dbPmA] = await db
+      .insert(paymentMethods)
+      .values({
+        merchantId,
+        customerId: customerId,
+        provider: "stripe",
+        paymentType: "card",
+        status: "active",
+        externalPspPaymentMethodId: stripePmA.id,
+        externalPspCustomerId: stripeCustomer.id,
+        cardLastFour: stripePmA.card?.last4,
+        cardBrand: stripePmA.card?.brand,
+        lastUsedAt: new Date(Date.now() - 60_000),
+      })
+      .returning();
+
+    const [dbPmB] = await db
+      .insert(paymentMethods)
+      .values({
+        merchantId,
+        customerId: customerId,
+        provider: "stripe",
+        paymentType: "card",
+        status: "active",
+        externalPspPaymentMethodId: stripePmB.id,
+        externalPspCustomerId: stripeCustomer.id,
+        cardLastFour: stripePmB.card?.last4,
+        cardBrand: stripePmB.card?.brand,
+        lastUsedAt: new Date(), // more recent
+      })
+      .returning();
+
+    // Link preferred PM (A) to subscription details, even though B is more recent
+    await db
+      .update(subscriptionDetails)
+      .set({
+        paymentMethodId: dbPmA.id,
+        nextBillingDate: new Date(Date.now() - 60_000),
+      })
+      .where(eq(subscriptionDetails.id, subscriptionDetailsId));
+
+    // Run billing
+    const result = await processBillingCycle(apiUrl, triggerApiAccessKey);
+    expect(result.subscriptionsProcessed).toBe(1);
+
+    // Wait for webhook to settle
+    await sleep(2500);
+
+    // Fetch the latest invoice for this subscription
+    const invs = await db
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.merchantId, merchantId),
+          eq(invoices.customerId, customerId),
+          eq(invoices.subscriptionId, subscriptionId),
+          ne(invoices.status, "deleted")
+        )
+      );
+    expect(invs.length).toBeGreaterThan(0);
+    const latest = invs.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0];
+
+    // Verify the payment used the subscription_details PM (A)
+    const pmts = await db
+      .select()
+      .from(payments)
+      .where(eq(payments.invoiceId, latest.id));
+    expect(pmts.length).toBe(1);
+    expect(pmts[0].paymentMethodId).toBe(dbPmA.id);
+  }, 30000);
+
+  it("should stamp attempted_payment_method_ids on payment metadata", async () => {
+    // Create a Stripe customer for PSP integration
+    const stripeCustomer = await stripeClient.customers.create({
+      email: `attempted-meta-${customerId}@example.com`,
+      name: "Attempted Meta Customer",
+      metadata: { lumenCustomerId: customerId },
+    });
+
+    // Update our customer record with the pspCustomerId
+    await db
+      .update(customers)
+      .set({ pspCustomerId: stripeCustomer.id })
+      .where(eq(customers.id, customerId));
+
+    // Attach a Stripe payment method and save in DB
+    const stripePm = await stripeClient.paymentMethods.attach("pm_card_visa", {
+      customer: stripeCustomer.id,
+    });
+
+    const [dbPm] = await db
+      .insert(paymentMethods)
+      .values({
+        merchantId,
+        customerId: customerId,
+        provider: "stripe",
+        paymentType: "card",
+        status: "active",
+        externalPspPaymentMethodId: stripePm.id,
+        externalPspCustomerId: stripeCustomer.id,
+        cardLastFour: stripePm.card?.last4,
+        cardBrand: stripePm.card?.brand,
+      })
+      .returning();
+
+    // Link PM to subscription details and make due now
+    await db
+      .update(subscriptionDetails)
+      .set({
+        paymentMethodId: dbPm.id,
+        nextBillingDate: new Date(Date.now() - 60_000),
+      })
+      .where(eq(subscriptionDetails.id, subscriptionDetailsId));
+
+    // Run billing
+    const result = await processBillingCycle(apiUrl, triggerApiAccessKey);
+    expect(result.subscriptionsProcessed).toBe(1);
+
+    // Wait for webhook
+    await sleep(2500);
+
+    // Fetch latest invoice and payment
+    const invs = await db
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.merchantId, merchantId),
+          eq(invoices.customerId, customerId),
+          eq(invoices.subscriptionId, subscriptionId),
+          ne(invoices.status, "deleted")
+        )
+      );
+    expect(invs.length).toBeGreaterThan(0);
+    const latest = invs.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0];
+
+    const pmts = await db
+      .select()
+      .from(payments)
+      .where(eq(payments.invoiceId, latest.id));
+    expect(pmts.length).toBe(1);
+
+    const meta = (pmts[0].metadata || {}) as any;
+    // We expect attempted list to exist and include the chosen PM id
+    const attempted = (meta.attempted_payment_method_ids || []) as string[];
+    expect(Array.isArray(attempted)).toBe(true);
+    expect(attempted).toContain(dbPm.id);
   }, 30000);
 
   it("should not process a subscription that is not due yet", async () => {
@@ -1186,27 +1253,14 @@ describe("Multiple Price Components Billing", () => {
   let tempMerchantIdFile = "/tmp/test_merchant_id.txt";
   let tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
   let webhookProcess: ChildProcess | null = null;
-
-  // Clean up function for the webhook process
-  const cleanupWebhook = async () => {
-    if (webhookProcess && !webhookProcess.killed) {
-      console.log("Cleaning up multi-component webhook process...");
-      webhookProcess.kill();
-      webhookProcess = null;
-
-      // Clean up temp files
-      try {
-        await fs.unlink(tempWebhookSecretFile);
-        await fs.unlink(tempMerchantIdFile);
-      } catch (err) {
-        // Ignore errors if files don't exist
-      }
-    }
-  };
+  let paymentProvider: PaymentProviderAdapter;
 
   beforeEach(async () => {
     // Clean up test data from previous tests
+    await clearEventData();
     await cleanupTestData();
+
+    paymentProvider = await createPaymentProvider();
 
     testStartTime = new Date();
 
@@ -1235,80 +1289,10 @@ describe("Multiple Price Components Billing", () => {
     await fs.writeFile(tempMerchantIdFile, merchantId);
 
     // Create Stripe integration for the merchant
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // Start webhook listener in a separate process
-    try {
-      console.log(
-        `Starting webhook listener for multi-component tests, merchant ${merchantId}...`
-      );
-
-      // Get the stripe CLI path
-      const stripeCLIPath = await findStripeCLI();
-      console.log(`Found Stripe CLI at: ${stripeCLIPath}`);
-
-      // Start the webhook listener only if we found the Stripe CLI
-      if (stripeCLIPath) {
-        // First, get the webhook secret
-        const secretProcess = spawn(stripeCLIPath, [
-          "listen",
-          "--forward-to",
-          `${apiUrl}/public/webhook/${merchantId}`,
-          "--print-secret",
-          "--api-key",
-          stripeSecretKey,
-        ]);
-
-        // Collect the secret from stdout
-        let secret = "";
-        secretProcess.stdout.on("data", (data) => {
-          secret += data.toString();
-        });
-
-        await new Promise<void>((resolve) => {
-          secretProcess.on("close", async () => {
-            // Clean up and save the secret
-            secret = secret.trim();
-            await fs.writeFile(tempWebhookSecretFile, secret);
-            console.log(
-              `Saved webhook secret to ${tempWebhookSecretFile} for multi-component tests`
-            );
-            resolve();
-          });
-        });
-        const listenUrl = `${apiUrl}/public/webhook/${merchantId}`;
-        // Now start the actual webhook listener
-        webhookProcess = spawn(
-          stripeCLIPath,
-          ["listen", "--forward-to", listenUrl, "--api-key", stripeSecretKey],
-          {
-            detached: true,
-            stdio: "ignore",
-          }
-        );
-        console.log("Stripe Webhook listening at", listenUrl);
-
-        // Give some time for the webhook process to start
-        await sleep(1000);
-        console.log(
-          `Multi-component webhook listener started with PID ${webhookProcess.pid}`
-        );
-      } else {
-        console.log(
-          "Stripe CLI not found, webhook listener will not be started for multi-component tests"
-        );
-      }
-    } catch (error) {
-      console.error(
-        "Failed to start webhook listener for multi-component tests:",
-        error
-      );
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
 
     // 3. Authenticate
     const authResponse = await authenticateTestUser(user.email, user.password);
@@ -1539,14 +1523,16 @@ describe("Multiple Price Components Billing", () => {
     }
 
     // Clean up the webhook process
-    await cleanupWebhook();
+    await paymentProvider?.cleanup();
 
     await clearEventData();
   });
 
   afterAll(async () => {
     // Final cleanup of the webhook process if needed
-    await cleanupWebhook();
+    await paymentProvider?.cleanup();
+    // Clean up database records
+    await cleanupDataFull();
   });
 
   it("should process multiple price components with different billing cycles and generate invoices", async () => {
@@ -1657,7 +1643,7 @@ describe("Multiple Price Components Billing", () => {
 
     // Wait for webhook to process the payment
     console.log("Waiting for webhook to process multi-component payment...");
-    await sleep(3000);
+    await sleep(3000, { alsoSleepInStripeMock: true });
     // Now we should be processing our components as a consolidated batch
     expect(result.subscriptionsProcessed).toBe(3); // Three components processed
     expect(result.batchRuns).toBe(1); // Processed as one batch for the customer
@@ -2059,7 +2045,7 @@ describe("Multiple Price Components Billing", () => {
     }
 
     // Wait for event processing to complete
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500, { alsoSleepInStripeMock: true });
 
     // Execute the billing cycle
     const result = await processBillingCycle(apiUrl, triggerApiAccessKey);
@@ -2458,28 +2444,14 @@ describe("Plan Migration with Billing Integration", () => {
   let customerEmail: string;
   let tempMerchantIdFile = "/tmp/test_merchant_id.txt";
   let tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
-  let webhookProcess: ChildProcess | null = null;
-
-  // Clean up function for the webhook process
-  const cleanupWebhook = async () => {
-    if (webhookProcess && !webhookProcess.killed) {
-      console.log("Cleaning up migration webhook process...");
-      webhookProcess.kill();
-      webhookProcess = null;
-
-      // Clean up temp files
-      try {
-        await fs.unlink(tempWebhookSecretFile);
-        await fs.unlink(tempMerchantIdFile);
-      } catch (err) {
-        // Ignore errors if files don't exist
-      }
-    }
-  };
+  let paymentProvider: PaymentProviderAdapter;
 
   beforeEach(async () => {
     // Clean up test data from previous tests
+    await clearEventData();
     await cleanupTestData();
+
+    paymentProvider = await createPaymentProvider();
 
     testStartTime = new Date();
 
@@ -2508,12 +2480,7 @@ describe("Plan Migration with Billing Integration", () => {
     await fs.writeFile(tempMerchantIdFile, merchantId);
 
     // Create Stripe integration for the merchant
-    await createTestStripe({
-      merchantId,
-      secretKey: stripeSecretKey,
-      publicKey: stripePublicKey,
-      webhookSecret: stripeWebhookSecret,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // Generate publishable API key for payment-init flow
     const apiKeys = await createTestApiKeys({
@@ -2523,62 +2490,7 @@ describe("Plan Migration with Billing Integration", () => {
     publishableApiKey = apiKeys.publishableKey.keyValue;
 
     // Start webhook listener
-    try {
-      console.log(
-        `Starting webhook listener for migration tests, merchant ${merchantId}...`
-      );
-
-      const stripeCLIPath = await findStripeCLI();
-      console.log(`Found Stripe CLI at: ${stripeCLIPath}`);
-
-      if (stripeCLIPath) {
-        // Get webhook secret
-        const secretProcess = spawn(stripeCLIPath, [
-          "listen",
-          "--forward-to",
-          `${apiUrl}/public/webhook/${merchantId}`,
-          "--print-secret",
-          "--api-key",
-          stripeSecretKey,
-        ]);
-
-        let secret = "";
-        secretProcess.stdout.on("data", (data) => {
-          secret += data.toString();
-        });
-
-        await new Promise<void>((resolve) => {
-          secretProcess.on("close", async () => {
-            secret = secret.trim();
-            await fs.writeFile(tempWebhookSecretFile, secret);
-            console.log(
-              `Saved webhook secret to ${tempWebhookSecretFile} for migration tests`
-            );
-            resolve();
-          });
-        });
-
-        const listenUrl = `${apiUrl}/public/webhook/${merchantId}`;
-        webhookProcess = spawn(
-          stripeCLIPath,
-          ["listen", "--forward-to", listenUrl, "--api-key", stripeSecretKey],
-          {
-            detached: true,
-            stdio: "ignore",
-          }
-        );
-
-        await sleep(1000);
-        console.log(
-          `Migration webhook listener started with PID ${webhookProcess.pid}`
-        );
-      }
-    } catch (error) {
-      console.error(
-        "Failed to start webhook listener for migration tests:",
-        error
-      );
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
 
     // Authenticate
     const authResponse = await authenticateTestUser(user.email, user.password);
@@ -2688,13 +2600,16 @@ describe("Plan Migration with Billing Integration", () => {
     }
 
     // Clean up the webhook process
-    await cleanupWebhook();
+    await paymentProvider?.cleanup();
 
     await clearEventData();
   });
 
   afterAll(async () => {
-    await cleanupWebhook();
+    // Final cleanup of the webhook process if needed
+    await paymentProvider?.cleanup();
+    // Clean up database records
+    await cleanupDataFull();
   });
 
   it("should handle complete plan migration flow with billing cycle validation", async () => {
@@ -3337,6 +3252,7 @@ describe("Plan Deletion Prevention with Scheduled Migrations", () => {
 
   beforeEach(async () => {
     // Clean up test data from previous tests
+    await clearEventData();
     await cleanupTestData();
 
     // Set up test environment
@@ -3355,10 +3271,6 @@ describe("Plan Deletion Prevention with Scheduled Migrations", () => {
       timezone: "America/Los_Angeles",
     });
     customerId = customer.id;
-  });
-
-  afterEach(async () => {
-    // No cleanup needed here since we clean up in beforeEach
   });
 
   it("should cancel incoming migrations when plan version is deleted", async () => {

@@ -42,22 +42,23 @@ export const apiClient = {
   baseURL: API_URL,
 
   fetch: async (endpoint: string, options: RequestInit = {}) => {
-    const headers: Record<string, string> = {
-      ...(options.headers as Record<string, string>),
-      "Content-Type": "application/json",
-    };
+    const incomingHeaders = options.headers as HeadersInit | undefined;
+    const mergedHeaders = new Headers(incomingHeaders);
+    if (!mergedHeaders.has("Content-Type")) {
+      mergedHeaders.set("Content-Type", "application/json");
+    }
     const response = await fetchWithAuthInterceptor(
       `${apiClient.baseURL}${endpoint}`,
       {
         ...options,
-        headers,
+        headers: mergedHeaders,
       }
     );
     return response;
   },
 
-  get: async (endpoint: string) => {
-    return apiClient.fetch(endpoint, { method: "GET" });
+  get: async (endpoint: string, options: RequestInit = {}) => {
+    return apiClient.fetch(endpoint, { ...options, method: "GET" });
   },
 
   post: async <T>(endpoint: string, data: T) => {

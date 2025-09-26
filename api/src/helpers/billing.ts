@@ -9,8 +9,10 @@ import {
   events,
   metrics,
   creditGrants,
-  creditDefinitions,
-  paymentMethods,
+  dunningConfigs,
+  subscriptionChanges,
+  pricingTables,
+  pricingTablePlans,
 } from "@lumen/common/schema";
 import {
   eq,
@@ -25,6 +27,7 @@ import {
   inArray,
   desc,
   like,
+  sql,
 } from "drizzle-orm";
 import { customers } from "@lumen/common/schema";
 import { subscriptions } from "@lumen/common/schema";
@@ -45,6 +48,7 @@ import {
   subscriptionFeatures,
   subscriptionDetails,
   customerInvoiceCounters,
+  customerOrganizations,
 } from "@lumen/common/schema";
 import {} from "@lumen/common/schema";
 import {
@@ -66,6 +70,7 @@ import { configure } from "@trigger.dev/sdk/v3";
 import {
   applyUsageCreditsForBilling,
   processInitialCreditsForSubscription,
+  createCreditTransaction,
 } from "./credits";
 import Dinero, { Currency } from "dinero.js";
 import { uploadFile, getObjectStorageUrl } from "./s3";
@@ -76,6 +81,8 @@ import {
   chargeCustomerWithAmount,
   getPaymentProvider,
 } from "./paymentprovider";
+import { calculateNextBillingDate } from "./billing-dates";
+import { eventProcessingService } from "../routes/events";
 
 configure({
   secretKey: (await getSecretOrEnvVar({
@@ -104,6 +111,7 @@ export async function createSubscriptionCore({
   isRenewal,
   isImmediatePayment,
   dangerouslyAllowMultipleSubscriptions,
+  primarySeatEventTimestamp,
   tx,
 }: {
   merchantId: string;
@@ -117,6 +125,7 @@ export async function createSubscriptionCore({
   isRenewal?: boolean;
   isImmediatePayment?: boolean;
   dangerouslyAllowMultipleSubscriptions?: boolean;
+  primarySeatEventTimestamp?: Date;
   tx?: TransactionType;
 }): Promise<{
   subscription: typeof subscriptions.$inferSelect;
@@ -125,12 +134,27 @@ export async function createSubscriptionCore({
   price: typeof prices.$inferSelect;
   wasExistingSubscription: boolean;
 }> {
+  console.info("createSubscriptionCore: Starting subscription creation", {
+    merchantId,
+    customerId,
+    planId,
+    effectivePriceId,
+    startTimestamp,
+    stableSubscriptionId,
+    isRenewal,
+    isImmediatePayment,
+    dangerouslyAllowMultipleSubscriptions,
+  });
+
   // --- Validation ---
   // Use transaction for validation if provided, otherwise use db
-  console.log("startTimestamp", startTimestamp);
   const dbInstance = tx || db;
 
   // 1. Check Customer
+  console.info("createSubscriptionCore: Validating customer", {
+    customerId,
+    merchantId,
+  });
   const customer = await dbInstance.query.customers.findFirst({
     where: and(
       eq(customers.id, customerId),
@@ -139,10 +163,23 @@ export async function createSubscriptionCore({
     ),
   });
   if (!customer) {
+    console.error("createSubscriptionCore: Customer validation failed", {
+      customerId,
+      merchantId,
+    });
     throw new Error("Customer not found or does not belong to this merchant.");
   }
+  console.info("createSubscriptionCore: Customer validated successfully", {
+    customerId,
+    customerOrganizationId: customer.customerOrganizationId,
+    orgRole: customer.orgRole,
+  });
 
   // 2. Check Plan
+  console.info("createSubscriptionCore: Validating plan", {
+    planId,
+    merchantId,
+  });
   const plan = await dbInstance.query.plans.findFirst({
     where: and(
       eq(plans.id, planId),
@@ -151,10 +188,23 @@ export async function createSubscriptionCore({
     ),
   });
   if (!plan) {
+    console.error("createSubscriptionCore: Plan validation failed", {
+      planId,
+      merchantId,
+    });
     throw new Error("Plan not found or does not belong to this merchant.");
   }
+  console.info("createSubscriptionCore: Plan validated successfully", {
+    planId,
+    planName: plan.planName,
+  });
 
   // 3. Check Price
+  console.info("createSubscriptionCore: Validating price", {
+    effectivePriceId,
+    planId,
+    merchantId,
+  });
   const price = await dbInstance.query.prices.findFirst({
     where: and(
       eq(prices.id, effectivePriceId),
@@ -164,13 +214,104 @@ export async function createSubscriptionCore({
     ),
   });
   if (!price) {
+    console.error("createSubscriptionCore: Price validation failed", {
+      effectivePriceId,
+      planId,
+      merchantId,
+    });
     throw new Error(
       "Price not found, does not belong to this plan, or does not belong to this merchant."
     );
   }
+  console.info("createSubscriptionCore: Price validated successfully", {
+    effectivePriceId,
+    currency: price.currency,
+    componentsCount: price.pricingData?.components?.length || 0,
+  });
+
+  // 3a. Seats-as-customers: ensure organization exists and customer linked as primary when seat plan detected
+  const hasSeatPerUnit = Array.isArray(price.pricingData?.components)
+    ? price.pricingData.components.some((c: any) => c.type === "per_unit")
+    : false;
+
+  if (hasSeatPerUnit) {
+    console.info(
+      "createSubscriptionCore: Detected seat-based plan, setting up organization",
+      {
+        customerId,
+        hasSeatPerUnit,
+        existingOrgId: customer.customerOrganizationId,
+        existingOrgRole: customer.orgRole,
+      }
+    );
+
+    // If customer is not part of any organization, create one and mark as primary
+    if (!customer.customerOrganizationId) {
+      console.info(
+        "createSubscriptionCore: Creating new organization for customer",
+        { customerId }
+      );
+      const [org] = await dbInstance
+        .insert(customerOrganizations)
+        .values({
+          merchantId,
+          billingCustomerId: customerId, // Set the primary customer as the billing customer
+        })
+        .returning();
+
+      await dbInstance
+        .update(customers)
+        .set({ customerOrganizationId: org.id, orgRole: "primary" })
+        .where(
+          and(
+            eq(customers.id, customerId),
+            eq(customers.merchantId, merchantId)
+          )
+        );
+
+      console.info(
+        "createSubscriptionCore: Organization created and customer set as primary",
+        {
+          customerId,
+          organizationId: org.id,
+        }
+      );
+    } else if (!customer.orgRole) {
+      console.info(
+        "createSubscriptionCore: Setting customer as primary in existing organization",
+        {
+          customerId,
+          organizationId: customer.customerOrganizationId,
+        }
+      );
+      // If linked but role is null, set primary by default for the billing customer
+      await dbInstance
+        .update(customers)
+        .set({ orgRole: "primary" })
+        .where(
+          and(
+            eq(customers.id, customerId),
+            eq(customers.merchantId, merchantId)
+          )
+        );
+    }
+
+    // No primary usage credit grants here. Initial plan/price grants are handled
+    // by processInitialCreditsForSubscription during invoice/subscription flows.
+  }
 
   // 4. Check for existing active subscription
   // Skip this check if we're renewing or this is explicitly an upgrade/migration
+  console.info("createSubscriptionCore: Checking for existing subscriptions", {
+    isRenewal,
+    stableSubscriptionId,
+    dangerouslyAllowMultipleSubscriptions,
+    willCheckExisting:
+      !isRenewal &&
+      !stableSubscriptionId &&
+      !dangerouslyAllowMultipleSubscriptions,
+  });
+
   if (
     !isRenewal &&
     !stableSubscriptionId &&
@@ -191,8 +332,13 @@ export async function createSubscriptionCore({
 
     if (existingActiveSubscription) {
       // Return existing subscription info instead of creating a new one
-      console.log(
-        `Found existing active subscription for customer ${customerId}: ${existingActiveSubscription.stableSubscriptionId || existingActiveSubscription.id}`
+      console.info(
+        "createSubscriptionCore: Found existing active subscription, returning existing",
+        {
+          customerId,
+          existingSubscriptionId: existingActiveSubscription.id,
+          stableSubscriptionId: existingActiveSubscription.stableSubscriptionId,
+        }
       );
 
       return {
@@ -204,9 +350,16 @@ export async function createSubscriptionCore({
         wasExistingSubscription: true,
       };
     }
+    console.info(
+      "createSubscriptionCore: No existing active subscription found, proceeding with creation"
+    );
   }
 
   // --- Creation ---
+  console.info(
+    "createSubscriptionCore: Starting subscription creation transaction"
+  );
+
   const transaction = async (tx: TransactionType) => {
     const actualStartTimestamp = startTimestamp;
 
@@ -221,16 +374,41 @@ export async function createSubscriptionCore({
       stableSubscriptionId: stableSubscriptionId || undefined,
     };
 
+    console.info("createSubscriptionCore: Creating subscription record", {
+      subscriptionValues: {
+        ...subscriptionValues,
+        startTimestamp: actualStartTimestamp.toISOString(),
+      },
+    });
+
     const [subscription] = await tx
       .insert(subscriptions)
       .values(subscriptionValues)
       .returning();
 
+    console.info("createSubscriptionCore: Subscription record created", {
+      subscriptionId: subscription.id,
+      stableSubscriptionId: subscription.stableSubscriptionId,
+    });
+
     // Get the features associated with the plan
+    console.info("createSubscriptionCore: Fetching plan features", { planId });
     const planFeaturesList = await getPlanFeatures(planId, tx);
 
     // Associate the plan features with the subscription
     if (planFeaturesList.length > 0) {
+      console.info(
+        "createSubscriptionCore: Associating plan features with subscription",
+        {
+          subscriptionId: subscription.id,
+          featuresCount: planFeaturesList.length,
+          features: planFeaturesList.map((pf) => ({
+            id: pf.id,
+            slug: pf.slug,
+          })),
+        }
+      );
+
       await associateFeaturesWithSubscription(
         subscription.id,
         customerId,
@@ -243,12 +421,23 @@ export async function createSubscriptionCore({
         })),
         tx
       );
+      console.info(
+        "createSubscriptionCore: Plan features associated successfully"
+      );
+    } else {
+      console.info("createSubscriptionCore: No plan features to associate");
     }
 
     const effectiveTimezone = await getEffectiveTimezone(
       customerId,
       merchantId
     );
+
+    console.info("createSubscriptionCore: Creating subscription details", {
+      subscriptionId: subscription.id,
+      effectiveTimezone,
+      componentsCount: price.pricingData.components.length,
+    });
 
     const components = price.pricingData.components;
     const subscriptionDetailsRecords: SubscriptionDetails[] = [];
@@ -260,15 +449,6 @@ export async function createSubscriptionCore({
         actualStartTimestamp,
         effectiveTimezone
       );
-      console.log(
-        "component",
-        component,
-        "nextBillingDate",
-        nextBillingDate,
-        "actualStartTimestamp",
-        actualStartTimestamp
-      );
-
       const billImmediately = component.bill_immediately;
 
       // Set cyclesBilled to 1 if this is an immediate payment for a component that bills immediately
@@ -277,7 +457,17 @@ export async function createSubscriptionCore({
         isImmediatePayment && billImmediately !== false ? 1 : 0;
 
       console.info(
-        `Setting cyclesBilled to ${initialCyclesBilled} for subscription ${subscription.id} component ${component.component_id}`
+        "createSubscriptionCore: Processing subscription component",
+        {
+          subscriptionId: subscription.id,
+          componentId: component.component_id,
+          componentType: component.type,
+          nextBillingDate: nextBillingDate.toISOString(),
+          actualStartTimestamp: actualStartTimestamp.toISOString(),
+          billImmediately,
+          initialCyclesBilled,
+          isImmediatePayment,
+        }
       );
 
       const [detailsRecord] = await tx
@@ -296,6 +486,14 @@ export async function createSubscriptionCore({
 
       subscriptionDetailsRecords.push(detailsRecord);
     }
+
+    console.info(
+      "createSubscriptionCore: All subscription detail records created",
+      {
+        subscriptionId: subscription.id,
+        detailsRecordCount: subscriptionDetailsRecords.length,
+      }
+    );
 
     // Process initial credit grants for the new subscription
     let creditGrants: { grantCount: number; errors: string[] } = {
@@ -328,6 +526,44 @@ export async function createSubscriptionCore({
       };
     }
 
+    // Add seat_added event for the primary customer when subscribing to a seat-based plan
+    // This ensures the primary customer counts as the first seat in the metrics/events system
+    if (hasSeatPerUnit && customer.externalCustomerId) {
+      try {
+        await eventProcessingService.processEvent(
+          {
+            eventName: "seat_added",
+            customerId: customerId,
+            extCustomerId: customer.externalCustomerId,
+            eventString: customer.externalCustomerId,
+            properties: {
+              subscription_id: subscription.id,
+              source: "subscription_creation",
+            },
+            idempotencyKey: `seat_add_primary_${customerId}_${subscription.id}_${Date.now()}`,
+            eventTimestamp: primarySeatEventTimestamp || startTimestamp,
+          },
+          merchantId
+        );
+        console.info(
+          `Added seat_added event for primary customer ${customer.externalCustomerId} on seat-based subscription ${subscription.id}`
+        );
+      } catch (eventError) {
+        console.error(
+          "Failed to add seat_added event for primary customer:",
+          eventError
+        );
+      }
+    }
+
+    console.info("createSubscriptionCore: Transaction completed successfully", {
+      subscriptionId: subscription.id,
+      subscriptionDetailsCount: subscriptionDetailsRecords.length,
+      creditGrantsCount: creditGrants.grantCount,
+      creditGrantsErrors: creditGrants.errors.length,
+      wasExistingSubscription: false,
+    });
+
     return {
       subscription,
       subscriptionDetailsRecords: subscriptionDetailsRecords,
@@ -338,6 +574,14 @@ export async function createSubscriptionCore({
   };
 
   const result = tx ? await transaction(tx) : await db.transaction(transaction);
+
+  console.info("createSubscriptionCore: Subscription creation completed", {
+    subscriptionId: result.subscription.id,
+    stableSubscriptionId: result.subscription.stableSubscriptionId,
+    customerId: result.subscription.customerId,
+    planId: result.subscription.planId,
+    wasExistingSubscription: result.wasExistingSubscription,
+  });
 
   return result;
 }
@@ -569,7 +813,6 @@ export async function generateImmediateInvoice({
 
     if (invoiceWithDetails) {
       await triggerInvoicePdfGeneration(invoiceWithDetails, tx);
-      console.log(`Triggered PDF generation for invoice ${newInvoice.id}`);
     }
   } catch (pdfError) {
     console.error(
@@ -665,7 +908,9 @@ export async function getActiveSubscriptionForCustomer(
       eq(subscriptions.merchantId, merchantId),
       eq(subscriptions.customerId, customerId),
       isNull(subscriptions.deletedAt),
-      isNull(subscriptions.endTimestamp)
+      isNull(subscriptions.endTimestamp),
+      // Consider subscription active if status is active, trialing, or past_due (grace period)
+      inArray(subscriptions.status, ["active", "trialing", "past_due"])
     ),
   });
 
@@ -737,6 +982,7 @@ export async function upgradeSubscriptionAndInvoice({
     .set({
       deletedAt: currentTimestamp,
       endTimestamp: currentTimestamp,
+      status: "canceled", // Set proper dunning status when upgrading
     })
     .where(eq(subscriptions.id, existingSubscription.id));
 
@@ -882,6 +1128,242 @@ export async function upgradeSubscriptionAndInvoice({
 }
 
 /**
+ * Downgrade an existing subscription version to the merchant's latest free plan (if available).
+ * Creates a new subscription version on the free plan, preserving stableSubscriptionId and versioning.
+ * Falls back to throwing if no free price is available (caller should decide fallback behavior).
+ */
+export async function downgradeSubscriptionToFreeAndInvoice({
+  merchantId,
+  customerId,
+  existingSubscription,
+  tx,
+}: {
+  merchantId: string;
+  customerId: string;
+  existingSubscription: typeof subscriptions.$inferSelect;
+  tx: TransactionType;
+}): Promise<{
+  subscription: typeof subscriptions.$inferSelect;
+  invoice: typeof invoices.$inferSelect | null;
+  creditGrants: { grantCount: number; errors: string[] };
+}> {
+  console.log("Starting downgradeSubscriptionToFreeAndInvoice", {
+    merchantId,
+    customerId,
+    existingSubscriptionId: existingSubscription.id,
+  });
+
+  // 1. Locate latest free price from active pricing tables
+  const activePricingTables = await tx.query.pricingTables.findMany({
+    where: and(
+      eq(pricingTables.merchantId, merchantId),
+      eq(pricingTables.isActive, true),
+      isNull(pricingTables.deletedAt)
+    ),
+  });
+
+  if (activePricingTables.length === 0) {
+    throw new Error("No active pricing tables found for this merchant");
+  }
+
+  const pricingTableIds = activePricingTables.map((pt) => pt.id);
+
+  const pricingTablePlanEntries = await tx.query.pricingTablePlans.findMany({
+    where: and(
+      eq(pricingTablePlans.merchantId, merchantId),
+      inArray(pricingTablePlans.pricingTableId, pricingTableIds),
+      isNull(pricingTablePlans.deletedAt)
+    ),
+  });
+
+  if (pricingTablePlanEntries.length === 0) {
+    throw new Error("No plans found in active pricing tables");
+  }
+
+  const planIdsInPricingTables = pricingTablePlanEntries.map(
+    (ptp) => ptp.planId
+  );
+
+  const pricesForPricingTablePlans = await tx.query.prices.findMany({
+    where: and(
+      eq(prices.merchantId, merchantId),
+      inArray(prices.planId, planIdsInPricingTables),
+      isNull(prices.deletedAt)
+    ),
+    with: { plan: true },
+    orderBy: desc(prices.createdAt),
+  });
+
+  const freePrices = pricesForPricingTablePlans.filter((price) => {
+    if (!price.pricingData || !price.pricingData.components) {
+      return false;
+    }
+
+    let immediateAmountToBill = 0;
+    let totalPlanValueExcludingUsage = 0;
+    let hasUsageComponentWithNonZeroPrice = false;
+
+    for (const component of price.pricingData.components) {
+      if (component.type !== "usage") {
+        totalPlanValueExcludingUsage += component.amount_cents || 0;
+        if (component.bill_immediately) {
+          immediateAmountToBill += component.amount_cents || 0;
+        }
+      } else {
+        if (component.unit_cost_cents > 0) {
+          hasUsageComponentWithNonZeroPrice = true;
+        }
+      }
+    }
+
+    return (
+      immediateAmountToBill === 0 &&
+      totalPlanValueExcludingUsage === 0 &&
+      !hasUsageComponentWithNonZeroPrice
+    );
+  });
+
+  if (freePrices.length === 0) {
+    throw new Error("No free plans available for this merchant");
+  }
+
+  const latestFreePlanPrice = freePrices[0];
+  if (!latestFreePlanPrice.plan) {
+    throw new Error("Plan not found for the selected free price");
+  }
+
+  const newPlanId = latestFreePlanPrice.plan.id;
+  const newPriceId = latestFreePlanPrice.id;
+
+  // 2. Prepare new plan features for override migration
+  const newPlanFeatures = await getPlanFeatures(newPlanId, tx);
+  const newPlanFeatureSlugs = new Set(newPlanFeatures.map((f) => f.slug));
+
+  // 3. Soft-delete existing subscription and related entities
+  const currentTimestamp = new Date();
+
+  await tx
+    .update(subscriptions)
+    .set({
+      deletedAt: currentTimestamp,
+      endTimestamp: currentTimestamp,
+      status: "canceled",
+      gracePeriodEndsAt: null,
+    })
+    .where(eq(subscriptions.id, existingSubscription.id));
+
+  await tx
+    .update(subscriptionFeatures)
+    .set({ deletedAt: currentTimestamp })
+    .where(
+      and(
+        eq(subscriptionFeatures.subscriptionId, existingSubscription.id),
+        isNull(subscriptionFeatures.deletedAt)
+      )
+    );
+
+  await tx
+    .update(subscriptionDetails)
+    .set({ deletedAt: currentTimestamp })
+    .where(
+      and(
+        eq(subscriptionDetails.subscriptionId, existingSubscription.id),
+        isNull(subscriptionDetails.deletedAt)
+      )
+    );
+
+  // 4. Expire plan-scoped credit grants for the old plan
+  const oldPlanGrants = await tx.query.creditGrants.findMany({
+    where: and(
+      eq(creditGrants.customerId, customerId),
+      eq(creditGrants.planId, existingSubscription.planId),
+      eq(creditGrants.scope, "plan"),
+      eq(creditGrants.status, "ACTIVE"),
+      isNull(creditGrants.deletedAt)
+    ),
+    with: { creditDefinition: true },
+  });
+
+  if (oldPlanGrants.length > 0) {
+    const allGrantIds = oldPlanGrants.map((g) => g.id);
+
+    await tx
+      .update(creditGrants)
+      .set({ nextRenewalDate: null, updatedAt: new Date() })
+      .where(inArray(creditGrants.id, allGrantIds));
+
+    const expireGrantIds = oldPlanGrants
+      .filter(
+        (g) =>
+          g.creditDefinition?.expiryDays === -1 || g.source === "subscription"
+      )
+      .map((g) => g.id);
+
+    if (expireGrantIds.length > 0) {
+      await tx
+        .update(creditGrants)
+        .set({
+          expiryDate: currentTimestamp,
+          status: "EXPIRED" as const,
+          updatedAt: new Date(),
+        })
+        .where(inArray(creditGrants.id, expireGrantIds));
+    }
+  }
+
+  // 5. Create the new free version of the subscription
+  const startTimestamp = currentTimestamp;
+  const {
+    subscription,
+    subscriptionDetailsRecords,
+    creditGrants: initialCreditGrants,
+    price,
+  } = await createSubscriptionCore({
+    merchantId,
+    customerId,
+    planId: newPlanId,
+    effectivePriceId: newPriceId,
+    startTimestamp,
+    paymentMethodId: undefined,
+    stableSubscriptionId: existingSubscription.stableSubscriptionId,
+    versionNumberOverride: existingSubscription.versionNumber + 1,
+    isImmediatePayment: false,
+    dangerouslyAllowMultipleSubscriptions: false,
+    tx,
+  });
+
+  // 6. Migrate feature overrides, excluding features provided by the free plan
+  await migrateFeatureOverrides({
+    previousSubscriptionId: existingSubscription.id,
+    newSubscriptionId: subscription.id,
+    newPlanFeatureSlugs,
+    customerId,
+    merchantId,
+    tx,
+  });
+
+  // 7. Generate a $0 invoice for bookkeeping
+  const invoice = await generateImmediateInvoice({
+    merchantId,
+    customerId,
+    subscription,
+    price,
+    subscriptionDetailsRecords,
+    firstBillingPeriodStart: startTimestamp,
+    tx,
+    taxInfo: undefined,
+  });
+
+  console.log("Downgrade to free complete", {
+    newSubscriptionId: subscription.id,
+    invoiceId: invoice ? invoice.id : null,
+    creditGrantCount: initialCreditGrants.grantCount,
+  });
+
+  return { subscription, invoice, creditGrants: initialCreditGrants };
+}
+
+/**
  * @deprecated Use createSubscriptionCore instead. This function is kept for backward compatibility.
  * Core subscription creation logic that handles both new subscriptions and subscription upgrades
  */
@@ -934,74 +1416,6 @@ export async function createSubscription({
  * @param timezone The timezone to use for calculation
  * @returns The next billing date as a UTC Date
  */
-export function calculateNextBillingDate(
-  component: PriceComponentSchemaType,
-  currentTimestamp: Date,
-  subscriptionStartTimestamp: Date,
-  timezone: string = "UTC"
-): Date {
-  const rruleStr = component.recurrence_rule;
-
-  const currentTimestampInTzStripped = convertToTimezoneStrippedFromUTC(
-    currentTimestamp,
-    timezone
-  );
-  const subscriptionStartTimestampInTzStripped =
-    convertToTimezoneStrippedFromUTC(subscriptionStartTimestamp, timezone);
-
-  // Parse the RRULE string into options
-  const options: Partial<RRuleOptions> = RRule.parseString(rruleStr);
-
-  // Check if BYMONTHDAY is explicitly set and handle edge cases
-  if (
-    options.bymonthday &&
-    Array.isArray(options.bymonthday) &&
-    options.bymonthday.length === 1
-  ) {
-    const day = options.bymonthday[0];
-    if ([29, 30, 31].includes(day)) {
-      options.bymonthday = [day, -1];
-      options.bysetpos = 1;
-    }
-  } else if (options.bymonthday && typeof options.bymonthday === "number") {
-    // Handle the case where bymonthday is a single number
-    const day = options.bymonthday;
-    if ([29, 30, 31].includes(day)) {
-      options.bymonthday = [day, -1];
-      options.bysetpos = 1;
-    }
-  } else if (!options.bymonthday && options.freq === RRule.MONTHLY) {
-    // Anniversary billing for MONTHLY frequency: derive the day from the original start timestamp
-    const anniversaryDay = subscriptionStartTimestampInTzStripped.getDate();
-
-    // Apply edge-case handling for anniversary days 29, 30, 31
-    if ([29, 30, 31].includes(anniversaryDay)) {
-      options.bymonthday = [anniversaryDay, -1];
-      options.bysetpos = 1;
-    } else {
-      options.bymonthday = anniversaryDay;
-    }
-  }
-  // NOTE: For YEARLY anniversary billing (or other frequencies without BYMONTHDAY),
-  // we intentionally DO NOT set bymonthday. RRule handles this correctly based on dtstart and freq.
-
-  // Finalize options for RRule constructor
-  const finalOptions: RRuleOptions = {
-    ...options,
-    dtstart: currentTimestampInTzStripped,
-    tzid: timezone,
-    count: options.count || 2,
-  } as RRuleOptions;
-
-  const rule = new RRule(finalOptions);
-  const dates = rule.all().map((date) => convertToUTCFromServerTz(date));
-
-  const nextDateUTC = isSameDay(dates[0], currentTimestamp, timezone)
-    ? dates[1]
-    : dates[0];
-
-  return nextDateUTC;
-}
 
 /**
  * Updates the subscription details record for a specific component after a billing cycle completes.
@@ -1103,6 +1517,201 @@ export function generateComponentId(
 
   // Generate the unique ID using the standard createPrefixedId function
   return createPrefixedId(prefix);
+}
+
+/**
+ * Resume a paused/past_due subscription by resetting its billing cycle to start at `resumedAt`
+ * and regenerating initial credits for the plan. This keeps the same subscription object
+ * but logically starts a fresh cycle.
+ */
+export async function resumeSubscriptionAndResetCycle({
+  subscriptionId,
+  resumedAt = new Date(),
+  tx,
+}: {
+  subscriptionId: string;
+  resumedAt?: Date;
+  tx?: TransactionType;
+}): Promise<{
+  updatedSubscriptionId: string;
+  updatedDetailsCount: number;
+  credits: { revokedCount: number; expiredCount: number; newGrants: number };
+}> {
+  const dbx = tx || db;
+
+  const subscription = await dbx.query.subscriptions.findFirst({
+    where: eq(subscriptions.id, subscriptionId),
+    with: {
+      price: true,
+      customer: true,
+      subscriptionDetails: {
+        where: isNull(subscriptionDetails.deletedAt),
+      },
+    },
+  });
+
+  if (!subscription) {
+    throw new Error(`Subscription not found: ${subscriptionId}`);
+  }
+
+  if (
+    subscription.status !== "paused" &&
+    subscription.status !== "past_due" &&
+    subscription.status !== "unpaid"
+  ) {
+    // Allow resume semantics for paused/past_due; reactivate can optionally use this for unpaid
+    // Skip if already active/canceled etc.
+    return {
+      updatedSubscriptionId: subscription.id,
+      updatedDetailsCount: 0,
+      credits: { revokedCount: 0, expiredCount: 0, newGrants: 0 },
+    };
+  }
+
+  const effectiveTimezone = await getEffectiveTimezone(
+    subscription.customerId,
+    subscription.merchantId
+  );
+
+  // Update subscription core fields: set as active, clear grace, reset start timestamp
+  await dbx
+    .update(subscriptions)
+    .set({
+      status: "active",
+      gracePeriodEndsAt: null,
+      endTimestamp: null,
+      startTimestamp: resumedAt,
+    })
+    .where(eq(subscriptions.id, subscription.id));
+
+  // Recompute next billing dates for all active subscription details aligning to the new start
+  const priceComponents: PriceComponentSchemaType[] =
+    (subscription.price?.pricingData
+      ?.components as PriceComponentSchemaType[]) || [];
+
+  let updatedDetailsCount = 0;
+  for (const detail of subscription.subscriptionDetails) {
+    // Find matching component by ID; fallback to using stored recurrence rule if component not found
+    const component =
+      priceComponents.find((c) => c.component_id === detail.componentId) ||
+      ({
+        recurrence_rule: detail.recurrenceRule,
+      } as unknown as PriceComponentSchemaType);
+
+    const nextDate = calculateNextBillingDate(
+      component,
+      resumedAt,
+      resumedAt,
+      effectiveTimezone
+    );
+
+    await dbx
+      .update(subscriptionDetails)
+      .set({
+        nextBillingDate: nextDate,
+        subscriptionStartDate: resumedAt,
+        previousBillingDate: null,
+        cyclesBilled: 0,
+      })
+      .where(eq(subscriptionDetails.id, detail.id));
+    updatedDetailsCount++;
+  }
+
+  // Revoke/expire existing active plan-scoped credit grants for this plan/customer
+  const activeGrants = await dbx.query.creditGrants.findMany({
+    where: and(
+      eq(creditGrants.merchantId, subscription.merchantId),
+      eq(creditGrants.customerId, subscription.customerId),
+      eq(creditGrants.planId, subscription.planId),
+      eq(creditGrants.status, "ACTIVE"),
+      isNull(creditGrants.deletedAt)
+    ),
+  });
+
+  let revokedCount = 0;
+  let expiredCount = 0;
+  for (const grant of activeGrants) {
+    if (grant.expiryDate) {
+      // Mark as expired and record transaction
+      await dbx
+        .update(creditGrants)
+        .set({ status: "EXPIRED", updatedAt: new Date() })
+        .where(eq(creditGrants.id, grant.id));
+
+      if (grant.remainingAmount > 0) {
+        await createCreditTransaction({
+          merchantId: grant.merchantId,
+          customerId: grant.customerId,
+          creditGrantId: grant.id,
+          amount: grant.remainingAmount,
+          applicationType: grant.applicationType,
+          eventName: "expired",
+          eventTimestamp: resumedAt,
+          featureId: grant.featureId || undefined,
+          featureSlug: grant.featureSlug || undefined,
+          priceId: grant.priceId || undefined,
+          priceComponentId: grant.priceComponentId || undefined,
+          currency: grant.currency || undefined,
+        });
+      }
+      expiredCount++;
+    } else {
+      // No fixed expiry: revoke remaining balance and record transaction
+      await dbx
+        .update(creditGrants)
+        .set({ status: "REVOKED", remainingAmount: 0, updatedAt: new Date() })
+        .where(eq(creditGrants.id, grant.id));
+
+      if (grant.remainingAmount > 0) {
+        await createCreditTransaction({
+          merchantId: grant.merchantId,
+          customerId: grant.customerId,
+          creditGrantId: grant.id,
+          amount: grant.remainingAmount,
+          applicationType: grant.applicationType,
+          eventName: "revoked",
+          eventTimestamp: resumedAt,
+          featureId: grant.featureId || undefined,
+          featureSlug: grant.featureSlug || undefined,
+          priceId: grant.priceId || undefined,
+          priceComponentId: grant.priceComponentId || undefined,
+          currency: grant.currency || undefined,
+        });
+      }
+      revokedCount++;
+    }
+  }
+
+  // Grant fresh credits for the plan as if this were a renewal
+  const { grantCount } = await processInitialCreditsForSubscription(
+    subscription.merchantId,
+    subscription.customerId,
+    subscription.planId,
+    subscription.id,
+    tx,
+    true
+  );
+
+  // Log subscription change for auditability
+  await dbx.insert(subscriptionChanges).values({
+    subscriptionId: subscription.id,
+    type: "resume",
+    previousState: {
+      status: subscription.status,
+    },
+    newState: {
+      status: "active",
+      resumedAt: resumedAt.toISOString(),
+    },
+    effectiveDate: resumedAt,
+    createdBy: "system",
+  });
+
+  return {
+    updatedSubscriptionId: subscription.id,
+    updatedDetailsCount,
+    credits: { revokedCount, expiredCount, newGrants: grantCount },
+  };
 }
 
 /**
@@ -1243,91 +1852,32 @@ export async function getAndIncrementInvoiceCounter(
     throw new Error("Merchant ID and Customer ID are required");
   }
 
-  // Try to get existing counter with FOR UPDATE locking
-  // This ensures that no other transaction can modify this row until our transaction completes
-  const counters = await tx
-    .select()
-    .from(customerInvoiceCounters)
-    .where(
-      and(
-        eq(customerInvoiceCounters.merchantId, merchantId),
-        eq(customerInvoiceCounters.customerId, customerId)
-      )
-    )
-    .for("update"); // Add FOR UPDATE lock to prevent race conditions
+  // Atomic upsert to avoid race conditions and duplicate key errors under concurrency
+  const [row] = await tx
+    .insert(customerInvoiceCounters)
+    .values({
+      merchantId,
+      customerId,
+      lastInvoiceNumber: 1,
+    })
+    .onConflictDoUpdate({
+      target: [
+        customerInvoiceCounters.merchantId,
+        customerInvoiceCounters.customerId,
+      ],
+      set: {
+        lastInvoiceNumber: sql`${customerInvoiceCounters.lastInvoiceNumber} + 1`,
+        updatedAt: sql`now()`,
+      },
+    })
+    .returning({
+      lastInvoiceNumber: customerInvoiceCounters.lastInvoiceNumber,
+    });
 
-  // Check if we found an existing counter
-  if (counters.length > 0) {
-    // Increment the existing counter
-    const nextNumber = counters[0].lastInvoiceNumber + 1; // will only return 1 row bec of primary key
-
-    // Update the counter in the database
-    await tx
-      .update(customerInvoiceCounters)
-      .set({
-        lastInvoiceNumber: nextNumber,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(customerInvoiceCounters.merchantId, merchantId),
-          eq(customerInvoiceCounters.customerId, customerId)
-        )
-      );
-
-    return nextNumber;
-  } else {
-    try {
-      // Create a new counter starting at 1
-      await tx.insert(customerInvoiceCounters).values({
-        merchantId,
-        customerId,
-        lastInvoiceNumber: 1,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-
-      return 1; // First invoice for this customer
-    } catch (error) {
-      // If there was a race condition and another transaction created the counter
-      // between our initial check and insertion attempt, retry the whole operation
-      if (error instanceof Error && error.message.includes("duplicate key")) {
-        // Another transaction created the counter, so let's query it again with locking
-        const retryCounters = await tx
-          .select()
-          .from(customerInvoiceCounters)
-          .where(
-            and(
-              eq(customerInvoiceCounters.merchantId, merchantId),
-              eq(customerInvoiceCounters.customerId, customerId)
-            )
-          )
-          .for("update");
-
-        if (retryCounters.length > 0) {
-          const nextNumber = retryCounters[0].lastInvoiceNumber + 1;
-
-          await tx
-            .update(customerInvoiceCounters)
-            .set({
-              lastInvoiceNumber: nextNumber,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(customerInvoiceCounters.merchantId, merchantId),
-                eq(customerInvoiceCounters.customerId, customerId)
-              )
-            );
-
-          return nextNumber;
-        }
-      }
-
-      // Rethrow any other errors
-      throw error;
-    }
+  if (!row) {
+    throw new Error("Failed to reserve next invoice number");
   }
+  return row.lastInvoiceNumber;
 }
 
 /**
@@ -1413,7 +1963,18 @@ export async function calculateUsageForComponent(
   endDate: Date,
   subscriptionId?: string
 ): Promise<number> {
+  let externalCustomerId: string | undefined;
   try {
+    // Resolve external customer id to ensure we match events recorded with either internal or external id
+    const customerRecord = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.id, customerId),
+        eq(customers.merchantId, merchantId),
+        isNull(customers.deletedAt)
+      ),
+    });
+    externalCustomerId = customerRecord?.externalCustomerId || undefined;
+
     // Try QuestDB first
     // Import DB client and events schema - needed for both paths
 
@@ -1435,6 +1996,7 @@ export async function calculateUsageForComponent(
           const simpleResult = await questDbService.queryMetrics({
             merchantId,
             customerId,
+            externalCustomerId,
             metricType: "simple",
             eventName: metric.eventName,
             aggregation: metric.aggregationType,
@@ -1515,6 +2077,7 @@ export async function calculateUsageForComponent(
             const complexResult = await questDbService.queryMetrics({
               merchantId,
               customerId,
+              externalCustomerId,
               metricType: metric.queryType,
               sqlQuery: metric.sqlDefinition,
               timeframe: {
@@ -1574,6 +2137,13 @@ export async function calculateUsageForComponent(
           `Using PostgreSQL fallback for seat-based metric ${metric.id}`
         );
 
+        const customerMatch = externalCustomerId
+          ? or(
+              eq(events.customerId, customerId),
+              eq(events.extCustomerId, externalCustomerId)
+            )
+          : eq(events.customerId, customerId);
+
         // PostgreSQL equivalent of the seat-based query
         // Step 1: Get users active at billing period start
         const usersBeforePeriod = await db
@@ -1586,7 +2156,7 @@ export async function calculateUsageForComponent(
           .where(
             and(
               eq(events.merchantId, merchantId),
-              eq(events.customerId, customerId),
+              customerMatch,
               inArray(events.eventName, ["seat_added", "seat_removed"]),
               lte(events.eventTimestamp, startDate),
               isNull(events.deletedAt)
@@ -1629,7 +2199,7 @@ export async function calculateUsageForComponent(
           .where(
             and(
               eq(events.merchantId, merchantId),
-              eq(events.customerId, customerId),
+              customerMatch,
               eq(events.eventName, "seat_added"),
               gte(events.eventTimestamp, startDate),
               lte(events.eventTimestamp, endDate),
@@ -1678,7 +2248,12 @@ export async function calculateUsageForComponent(
         .where(
           and(
             eq(events.merchantId, merchantId),
-            customerId ? eq(events.customerId, customerId) : undefined,
+            externalCustomerId
+              ? or(
+                  eq(events.customerId, customerId),
+                  eq(events.extCustomerId, externalCustomerId)
+                )
+              : eq(events.customerId, customerId),
             eq(events.eventName, eventName),
             gte(events.eventTimestamp, startDate),
             lte(events.eventTimestamp, endDate),
@@ -1894,6 +2469,7 @@ export async function generateUsageCreditLineItems(
   context: {
     merchantId: string;
     customerId: string;
+    customersToBill?: (typeof customers.$inferSelect)[]; // All customers to check for credits
     processedDetails: ProcessedSubscriptionDetail[];
     billingSessionId?: string;
   },
@@ -1915,11 +2491,17 @@ export async function generateUsageCreditLineItems(
   console.log("Starting generateUsageCreditLineItems", {
     merchantId: context.merchantId,
     customerId: context.customerId,
+    customersToBill: context.customersToBill?.length || 1,
     processedDetailsCount: context.processedDetails.length,
     billingSessionId: context.billingSessionId,
   });
 
   const usageCreditLineItems = [];
+
+  // Determine which customers to check for credits
+  const customersToCheck = context.customersToBill || [
+    { id: context.customerId } as typeof customers.$inferSelect,
+  ];
 
   for (const data of context.processedDetails) {
     const { component, billingPeriodStart, billingPeriodEnd } = data;
@@ -1941,41 +2523,7 @@ export async function generateUsageCreditLineItems(
       continue;
     }
 
-    // Check for billing-visible usage credits linked to this specific price and component
-    const billingVisibleCredits = await tx.query.creditGrants.findMany({
-      where: and(
-        eq(creditGrants.merchantId, context.merchantId),
-        eq(creditGrants.customerId, context.customerId),
-        eq(creditGrants.priceId, priceId),
-        eq(creditGrants.priceComponentId, component.component_id),
-        eq(creditGrants.applicationType, "usage"),
-        or(
-          gte(creditGrants.expiryDate, new Date()),
-          isNull(creditGrants.expiryDate)
-        ),
-        lte(creditGrants.startDate, new Date()),
-        eq(creditGrants.billingVisible, true),
-        isNull(creditGrants.deletedAt)
-      ),
-      with: {
-        creditDefinition: true,
-      },
-    });
-
-    console.log("Found billing visible credits", {
-      componentId: component.component_id,
-      creditCount: billingVisibleCredits.length,
-    });
-
-    if (billingVisibleCredits.length === 0) {
-      console.log("No billing visible credits found, skipping", {
-        componentId: component.component_id,
-      });
-      continue;
-    }
-
-    // Calculate actual usage to determine how many credits to apply
-    // Fetch metric information
+    // Fetch metric information once for this component
     const creditMetric = await tx.query.metrics.findFirst({
       where: and(
         eq(metrics.id, component.metric_id),
@@ -1992,96 +2540,153 @@ export async function generateUsageCreditLineItems(
       continue;
     }
 
-    const rawUsage = await calculateUsageForComponent(
-      context.merchantId,
-      context.customerId,
-      creditMetric,
-      component.type as "per_unit" | "usage" | "fixed",
-      billingPeriodStart,
-      billingPeriodEnd,
-      data.subDetail.subscription.id
-    );
+    // Process credits for each customer
+    for (const customerToCheck of customersToCheck) {
+      const customerIdToCheck = customerToCheck.id;
 
-    console.log("Calculated raw usage", {
-      componentId: component.component_id,
-      rawUsage,
-      metricId: component.metric_id,
-    });
+      // Check for billing-visible usage credits for this customer
+      const billingVisibleCredits = await tx.query.creditGrants.findMany({
+        where: and(
+          eq(creditGrants.merchantId, context.merchantId),
+          eq(creditGrants.customerId, customerIdToCheck),
+          eq(creditGrants.priceId, priceId),
+          eq(creditGrants.priceComponentId, component.component_id),
+          eq(creditGrants.applicationType, "usage"),
+          or(
+            gte(creditGrants.expiryDate, new Date()),
+            isNull(creditGrants.expiryDate)
+          ),
+          lte(creditGrants.startDate, new Date()),
+          eq(creditGrants.billingVisible, true),
+          isNull(creditGrants.deletedAt)
+        ),
+        with: {
+          creditDefinition: true,
+        },
+      });
 
-    // Apply usage credits and record transactions
-    const creditsApplied = await applyUsageCreditsForBilling(
-      {
-        merchantId: context.merchantId,
-        customerId: context.customerId,
-        priceId: priceId,
+      console.log("Found billing visible credits", {
         componentId: component.component_id,
-        amount: rawUsage,
-        invoiceId: null, // Will be updated later
-        billingSessionId: context.billingSessionId,
-        billingPeriodStart,
-        billingPeriodEnd,
-      },
-      tx
-    );
+        customerId: customerIdToCheck,
+        creditCount: billingVisibleCredits.length,
+      });
 
-    console.log("Applied usage credits", {
-      componentId: component.component_id,
-      creditsApplied,
-    });
-
-    if (creditsApplied > 0) {
-      // Convert usage credits to monetary value using the component's unit price
-      const creditValueCents = creditsApplied * component.unit_cost_cents;
-
-      // Get currency from the subscription price
-      const currency = data.subDetail.subscription.price.currency;
-
-      // Format the unit cost properly using Dinero.js
-      const unitCostFormatted = Dinero({
-        amount: component.unit_cost_cents,
-        currency: currency as Currency,
-      }).toFormat();
-
-      // Generate description that respects the credit definition's billingDescription
-      let description: string;
-      if (
-        billingVisibleCredits.length === 1 &&
-        billingVisibleCredits[0].creditDefinition
-      ) {
-        // Single credit - use its billing description with usage details
-        const creditDef = billingVisibleCredits[0].creditDefinition;
-        const creditName = creditDef.billingDescription || creditDef.name;
-        description = `${creditName} (${creditsApplied} units × ${unitCostFormatted})`;
-      } else {
-        // Multiple credits or fallback - use generic description
-        description = `Usage credits applied (${creditsApplied} units × ${unitCostFormatted})`;
+      if (billingVisibleCredits.length === 0) {
+        console.log("No billing visible credits found for customer", {
+          componentId: component.component_id,
+          customerId: customerIdToCheck,
+        });
+        continue;
       }
 
-      usageCreditLineItems.push({
-        type: "credit",
-        description,
-        subtotalCents: -creditValueCents, // Negative because it's a credit
-        componentId: component.component_id,
-        priceId,
-        quantity: creditsApplied,
-        unitAmountCents: -component.unit_cost_cents, // Negative unit amount for credits
+      // Calculate actual usage for this customer
+      const rawUsage = await calculateUsageForComponent(
+        context.merchantId,
+        customerIdToCheck,
+        creditMetric,
+        component.type as "per_unit" | "usage" | "fixed",
         billingPeriodStart,
         billingPeriodEnd,
+        data.subDetail.subscription.id
+      );
+
+      console.log("Calculated raw usage", {
+        componentId: component.component_id,
+        customerId: customerIdToCheck,
+        rawUsage,
         metricId: component.metric_id,
       });
 
-      console.log(
-        `Generated usage credit line item for component ${component.component_id}`,
+      if (rawUsage === 0) {
+        continue; // No usage for this customer
+      }
+
+      // Apply usage credits and record transactions
+      const creditsApplied = await applyUsageCreditsForBilling(
         {
-          creditsApplied,
-          creditValueCents,
           merchantId: context.merchantId,
-          customerId: context.customerId,
-          priceId,
+          customerId: customerIdToCheck,
+          priceId: priceId,
           componentId: component.component_id,
-          unitCostFormatted,
-        }
+          amount: rawUsage,
+          invoiceId: null, // Will be updated later
+          billingSessionId: context.billingSessionId,
+          billingPeriodStart,
+          billingPeriodEnd,
+        },
+        tx
       );
+
+      console.log("Applied usage credits", {
+        componentId: component.component_id,
+        customerId: customerIdToCheck,
+        creditsApplied,
+      });
+
+      if (creditsApplied > 0) {
+        // Convert usage credits to monetary value using the component's unit price
+        const creditValueCents = creditsApplied * component.unit_cost_cents;
+
+        // Get currency from the subscription price
+        const currency = data.subDetail.subscription.price.currency;
+
+        // Format the unit cost properly using Dinero.js
+        const unitCostFormatted = Dinero({
+          amount: component.unit_cost_cents,
+          currency: currency as Currency,
+        }).toFormat();
+
+        // Generate description that respects the credit definition's billingDescription
+        let description: string;
+        if (
+          billingVisibleCredits.length === 1 &&
+          billingVisibleCredits[0].creditDefinition
+        ) {
+          // Single credit - use its billing description with usage details
+          const creditDef = billingVisibleCredits[0].creditDefinition;
+          const creditName = creditDef.billingDescription || creditDef.name;
+          description = `${creditName} (${creditsApplied} units × ${unitCostFormatted})`;
+        } else {
+          // Multiple credits or fallback - use generic description
+          description = `Usage credits applied (${creditsApplied} units × ${unitCostFormatted})`;
+        }
+
+        // Add customer identifier for seat-based plans
+        if (customersToCheck.length > 1) {
+          // Use email if available, otherwise use external customer ID
+          const customerIdentifier =
+            (customerToCheck as any).email ||
+            (customerToCheck as any).externalCustomerId ||
+            customerToCheck.id;
+          description = `${description} (${customerIdentifier})`;
+        }
+
+        usageCreditLineItems.push({
+          type: "credit",
+          description,
+          subtotalCents: -creditValueCents, // Negative because it's a credit
+          componentId: component.component_id,
+          priceId,
+          quantity: creditsApplied,
+          unitAmountCents: -component.unit_cost_cents, // Negative unit amount for credits
+          billingPeriodStart,
+          billingPeriodEnd,
+          metricId: component.metric_id,
+        });
+
+        console.log(
+          `Generated usage credit line item for component ${component.component_id}`,
+          {
+            creditsApplied,
+            creditValueCents,
+            merchantId: context.merchantId,
+            customerId: customerIdToCheck,
+            priceId,
+            componentId: component.component_id,
+            unitCostFormatted,
+          }
+        );
+      }
     }
   }
 
@@ -2420,6 +3025,18 @@ export async function triggerInvoicePdfGeneration(
       taxJurisdiction: invoiceWithDetails.taxJurisdiction,
       taxCalculationMethod: invoiceWithDetails.taxCalculationMethod,
       notes: invoiceWithDetails.notes, // Add notes field for payment links
+      documentType: invoiceWithDetails.documentType,
+      originalInvoiceId: invoiceWithDetails.originalInvoiceId,
+      cancellationOrCreditReason: invoiceWithDetails.cancellationOrCreditReason,
+      originalInvoiceNumber:
+        (invoiceWithDetails.originalInvoice &&
+          (invoiceWithDetails.originalInvoice.customerInvoiceNumber ||
+            invoiceWithDetails.originalInvoice.id)) ||
+        undefined,
+      originalIssueDate:
+        (invoiceWithDetails.originalInvoice &&
+          (invoiceWithDetails.originalInvoice.issueDate || undefined)) ||
+        undefined,
       lineItems: (invoiceWithDetails.lineItems || []).map((item: any) => ({
         id: item.id,
         description: item.description,
@@ -3366,4 +3983,55 @@ export async function triggerImmediateBillingIfNeeded({
     );
     // Don't throw - immediate billing failure shouldn't block subscription creation
   }
+}
+
+// Helper function to get dunning config with hierarchical fallback (plan-specific -> merchant default)
+export async function getOrCreateDunningConfig(
+  merchantId: string,
+  planId: string
+): Promise<typeof dunningConfigs.$inferSelect> {
+  // 1. First try to find plan-specific config
+  let config = await db.query.dunningConfigs.findFirst({
+    where: and(
+      eq(dunningConfigs.planId, planId),
+      eq(dunningConfigs.merchantId, merchantId),
+      isNull(dunningConfigs.deletedAt)
+    ),
+  });
+
+  if (config) {
+    console.log(`Using plan-specific dunning config for plan ${planId}`);
+    return config;
+  }
+
+  // 2. Fall back to merchant-level default config
+  config = await db.query.dunningConfigs.findFirst({
+    where: and(
+      eq(dunningConfigs.merchantId, merchantId),
+      isNull(dunningConfigs.planId), // Merchant-level default has null planId
+      isNull(dunningConfigs.deletedAt)
+    ),
+  });
+
+  if (config) {
+    console.log(`Using merchant-level dunning config for plan ${planId}`);
+    return config;
+  }
+
+  // 3. Create merchant-level default if none exists
+  console.log(
+    `Creating default merchant-level dunning config for merchant ${merchantId}`
+  );
+  const [newConfig] = await db
+    .insert(dunningConfigs)
+    .values({
+      merchantId,
+      planId: null, // Merchant-level default
+      gracePeriodDays: 7,
+      retrySchedule: [1, 3, 7],
+      endOfDunningAction: "pause_subscription",
+    })
+    .returning();
+
+  return newConfig;
 }

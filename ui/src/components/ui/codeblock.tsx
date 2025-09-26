@@ -31,6 +31,8 @@ export const CodeBlock = ({
                 this.addClassToHast(node, "overflow-x-auto");
                 this.addClassToHast(node, "text-sm");
                 this.addClassToHast(node, "leading-relaxed");
+                this.addClassToHast(node, "w-full");
+                this.addClassToHast(node, "max-w-full");
               },
             },
           ],
@@ -43,7 +45,7 @@ export const CodeBlock = ({
           error
         );
         setHtml(
-          `<pre class="overflow-x-auto text-sm leading-relaxed"><code>${code}</code></pre>`
+          `<pre class="overflow-x-auto w-full max-w-full text-sm leading-relaxed"><code>${code}</code></pre>`
         );
       }
     };
@@ -61,7 +63,7 @@ export const CodeBlock = ({
   return (
     <div
       className={cn(
-        "relative rounded-2xl bg-gray-50/30 border border-gray-200/50 shadow-lg hover:shadow-xl transition-all duration-300 overflow-hidden",
+        "relative w-full max-w-full min-w-0 rounded-2xl bg-gray-50/30 border border-gray-200/50 shadow-lg hover:shadow-xl transition-all duration-300 overflow-hidden",
         className
       )}
     >
@@ -102,16 +104,21 @@ export const CodeBlock = ({
 
       {/* Code content */}
       <div className="p-6">
-        {html ? (
-          <div
-            dangerouslySetInnerHTML={{ __html: html }}
-            className="[&>pre]:!bg-transparent [&>pre]:!m-0 [&>pre]:!p-0 [&>pre]:!border-0 [&>pre]:!rounded-0"
-          />
-        ) : (
-          <pre className="overflow-x-auto text-sm leading-relaxed text-gray-800">
-            <code>{code}</code>
-          </pre>
-        )}
+        <div
+          className="w-full max-w-full overflow-x-auto"
+          style={{ WebkitOverflowScrolling: "touch" }}
+        >
+          {html ? (
+            <div
+              dangerouslySetInnerHTML={{ __html: html }}
+              className="[&>pre]:!bg-transparent [&>pre]:!m-0 [&>pre]:!p-0 [&>pre]:!border-0 [&>pre]:!rounded-0 [&>pre]:!w-full [&>pre]:!max-w-full [&>pre]:!overflow-x-auto"
+            />
+          ) : (
+            <pre className="overflow-x-auto w-full max-w-full text-sm leading-relaxed text-gray-800">
+              <code>{code}</code>
+            </pre>
+          )}
+        </div>
       </div>
     </div>
   );

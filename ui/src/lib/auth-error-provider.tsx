@@ -31,6 +31,8 @@ const PUBLIC_ROUTES = new Set([
   "/terms",
   "/impressum",
   "/login",
+  "/demo",
+  // /blog routes handled later in code with startsWith
 ]);
 
 export function AuthErrorProvider({ children }: AuthErrorProviderProps) {
@@ -56,7 +58,8 @@ export function AuthErrorProvider({ children }: AuthErrorProviderProps) {
     if (!isPending) {
       if (!session?.user && typeof window !== "undefined") {
         const { pathname } = window.location;
-        const isPublic = PUBLIC_ROUTES.has(pathname);
+        const isPublic =
+          PUBLIC_ROUTES.has(pathname) || pathname.startsWith("/blog");
 
         if (!isPublic) {
           console.warn("No active session detected - redirecting to login");

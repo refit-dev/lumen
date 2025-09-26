@@ -61,6 +61,11 @@ export interface InvoiceData {
   // Reverse charge fields
   isReverseCharge?: boolean;
   reverseChargeMessage?: string;
+  // Refund/correction document support
+  documentType?: "standard" | "cancellation" | "credit_note";
+  originalInvoiceNumber?: string;
+  originalIssueDate?: string;
+  adjustmentReason?: string;
 }
 
 // Define styles for the PDF document
@@ -408,6 +413,14 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
     return <Text>No customer selected</Text>;
   }
 
+  const isCancellation = data.documentType === "cancellation";
+  const isCreditNote = data.documentType === "credit_note";
+  const headingText = isCancellation
+    ? "Invoice Cancellation"
+    : isCreditNote
+      ? "Credit Note"
+      : "Invoice";
+
   return (
     <Document>
       <Page size="A4" style={styles.page}>
@@ -421,7 +434,7 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
           }}
         >
           <Text style={{ fontSize: 24, fontWeight: "bold", color: "#000" }}>
-            Invoice
+            {headingText}
           </Text>
           <Text style={{ fontSize: 22, fontWeight: "bold", color: "#999" }}>
             {data.merchant.displayName || data.merchant.legalName}
@@ -439,12 +452,30 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
               Date of issue{" "}
               <Text style={{ fontWeight: "normal" }}>{data.issueDate}</Text>
             </Text>
-            <Text style={{ fontSize: 10 }}>
-              Date due{" "}
-              <Text style={{ fontWeight: "normal" }}>{data.dueDate}</Text>
-            </Text>
+            {!isCancellation && !isCreditNote && (
+              <Text style={{ fontSize: 10 }}>
+                Date due{" "}
+                <Text style={{ fontWeight: "normal" }}>{data.dueDate}</Text>
+              </Text>
+            )}
           </View>
         </View>
+
+        {(isCancellation || isCreditNote) && data.originalInvoiceNumber && (
+          <View style={{ marginBottom: 8 }}>
+            <Text style={{ fontSize: 10 }}>
+              References invoice {data.originalInvoiceNumber}
+              {data.originalIssueDate
+                ? `, issued ${data.originalIssueDate}`
+                : ""}
+            </Text>
+            {data.adjustmentReason && (
+              <Text style={{ fontSize: 9, color: "#666" }}>
+                Reason: {data.adjustmentReason}
+              </Text>
+            )}
+          </View>
+        )}
 
         {/* Reverse Charge Notice - Small note */}
         {/* Note: This is now handled by standardized tax descriptions like "0.00%: Reverse Charge [1]" */}
@@ -508,10 +539,17 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
           </View>
         </View>
 
-        {/* Amount due and due date */}
-        <Text style={{ fontSize: 18, fontWeight: "bold", marginBottom: 2 }}>
-          {formatAmount(total)} due {data.dueDate}
-        </Text>
+        {/* Amount summary */}
+        {isCancellation || isCreditNote ? (
+          <Text style={{ fontSize: 18, fontWeight: "bold", marginBottom: 2 }}>
+            {headingText === "Credit Note" ? "Total credit" : "Total refund"}:{" "}
+            {formatAmount(total)}
+          </Text>
+        ) : (
+          <Text style={{ fontSize: 18, fontWeight: "bold", marginBottom: 2 }}>
+            {formatAmount(total)} due {data.dueDate}
+          </Text>
+        )}
 
         {/* Pay online link */}
         {/* <Text
@@ -580,7 +618,7 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
           ))}
         </View>
 
-        {/* Subtotal, Tax, Total, Amount due summary */}
+        {/* Subtotal, Tax, Total, Amount summary */}
         <View
           style={{
             flexDirection: "column",
@@ -713,18 +751,22 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
             <Text style={{ fontSize: 10 }}>Total</Text>
             <Text style={{ fontSize: 10 }}>{formatAmount(total)}</Text>
           </View>
-          <View
-            style={{
-              flexDirection: "row",
-              width: "60%",
-              justifyContent: "space-between",
-            }}
-          >
-            <Text style={{ fontWeight: "bold", fontSize: 11 }}>Amount due</Text>
-            <Text style={{ fontWeight: "bold", fontSize: 11 }}>
-              {formatAmount(total)}
-            </Text>
-          </View>
+          {!isCancellation && !isCreditNote && (
+            <View
+              style={{
+                flexDirection: "row",
+                width: "60%",
+                justifyContent: "space-between",
+              }}
+            >
+              <Text style={{ fontWeight: "bold", fontSize: 11 }}>
+                Amount due
+              </Text>
+              <Text style={{ fontWeight: "bold", fontSize: 11 }}>
+                {formatAmount(total)}
+              </Text>
+            </View>
+          )}
         </View>
 
         {/* Notes section, if present */}
@@ -756,7 +798,13 @@ export const InvoiceDocument: React.FC<{ data: InvoiceData }> = ({ data }) => {
           }}
         >
           <Text>
-            {data.invoiceNumber} · {formatAmount(total)} due {data.dueDate}
+            {data.invoiceNumber} ·{" "}
+            {isCancellation || isCreditNote
+              ? headingText === "Credit Note"
+                ? "credit"
+                : "refund"
+              : "due"}{" "}
+            {formatAmount(total)}
           </Text>
           <Text>Page 1 of 1</Text>
         </View>

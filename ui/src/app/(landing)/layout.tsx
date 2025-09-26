@@ -11,6 +11,7 @@ import { toast } from "sonner";
 import { useState, useEffect } from "react";
 import { useCookieConsent } from "@/lib/cookie-consent-context";
 import localFont from "next/font/local";
+import { Menu, X } from "lucide-react";
 
 const calSans = localFont({
   src: "../../../public/CalSans-Regular.ttf",
@@ -27,6 +28,7 @@ export default function LandingLayout({
   const { autoConsentOnLogin } = useCookieConsent();
   const [newsletterEmail, setNewsletterEmail] = useState("");
   const [isSubmittingNewsletter, setIsSubmittingNewsletter] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   // Auto-consent when user is logged in but still on landing pages
   useEffect(() => {
@@ -58,7 +60,7 @@ export default function LandingLayout({
   };
 
   return (
-    <div className="min-h-screen bg-white">
+    <div className="min-h-screen bg-white overflow-x-hidden">
       {/* Header */}
       <header className="relative border-b border-gray-100/50 backdrop-blur-sm bg-white/80 top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 lg:px-8">
@@ -72,7 +74,7 @@ export default function LandingLayout({
                   height={39}
                   className="rounded-[0.75rem]"
                 />
-                <div className="flex flex-col">
+                <div className="hidden md:flex flex-col">
                   <span
                     className={`text-2xl font-semibold text-gray-900 tracking-wider ${calSans.className} mb-[-2px]`}
                   >
@@ -86,6 +88,12 @@ export default function LandingLayout({
             </div>
 
             <nav className="hidden md:flex items-center space-x-10 absolute left-1/2 transform -translate-x-1/2">
+              <Link
+                href="/blog"
+                className="text-gray-600 hover:text-gray-900 transition-all duration-200 font-medium text-sm tracking-wide"
+              >
+                Blog
+              </Link>
               <Link
                 href="/pricing"
                 className="text-gray-600 hover:text-gray-900 transition-all duration-200 font-medium text-sm tracking-wide"
@@ -106,6 +114,34 @@ export default function LandingLayout({
             </nav>
 
             <div className="flex items-center space-x-4">
+              <button
+                type="button"
+                aria-label="Toggle menu"
+                onClick={() => setIsMobileMenuOpen((prev) => !prev)}
+                className="md:hidden p-2 text-gray-600 hover:text-gray-900 hover:bg-gray-50 rounded-lg transition-colors"
+              >
+                {isMobileMenuOpen ? (
+                  <X className="w-6 h-6" />
+                ) : (
+                  <Menu className="w-6 h-6" />
+                )}
+              </button>
+              <Link
+                href="https://github.com/pretzelai/lumen"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center space-x-2 p-2 text-gray-600 hover:text-gray-900 hover:bg-gray-50 rounded-lg transition-all duration-200"
+                title="View on GitHub"
+              >
+                <Image
+                  src="/github.svg"
+                  alt="GitHub"
+                  width={20}
+                  height={20}
+                  className="w-5 h-5"
+                />
+                <span className="text-sm font-medium">Github</span>
+              </Link>
               <Link
                 href="https://cal.com/ramongarate/quick-chat"
                 target="_blank"
@@ -133,6 +169,43 @@ export default function LandingLayout({
               )}
             </div>
           </div>
+          {isMobileMenuOpen && (
+            <div className="md:hidden w-full border-t border-gray-100 pt-4 pb-6">
+              <div className="flex flex-col space-y-3">
+                <Link
+                  href="/blog"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="text-gray-700 hover:text-gray-900 transition-colors font-medium"
+                >
+                  Blog
+                </Link>
+                <Link
+                  href="/pricing"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="text-gray-700 hover:text-gray-900 transition-colors font-medium"
+                >
+                  Pricing
+                </Link>
+                <Link
+                  href="https://docs.getlumen.dev"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="text-gray-700 hover:text-gray-900 transition-colors font-medium"
+                >
+                  Documentation
+                </Link>
+                <ContactUsModal>
+                  <button
+                    onClick={() => setIsMobileMenuOpen(false)}
+                    className="text-left text-gray-700 hover:text-gray-900 transition-colors font-medium"
+                  >
+                    Contact Us
+                  </button>
+                </ContactUsModal>
+              </div>
+            </div>
+          )}
         </div>
       </header>
 
@@ -265,13 +338,13 @@ export default function LandingLayout({
                   Get updates on new features and billing best practices.
                   Important updates only. Unsubscribe anytime.
                 </p>
-                <form onSubmit={handleNewsletterSubmit} className="flex">
+                <form onSubmit={handleNewsletterSubmit} className="flex w-full">
                   <input
                     type="email"
                     placeholder="Enter your email"
                     value={newsletterEmail}
                     onChange={(e) => setNewsletterEmail(e.target.value)}
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-l-md text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 focus:border-transparent"
+                    className="flex-1 min-w-0 px-3 py-2 border border-gray-300 rounded-l-md text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 focus:border-transparent"
                     required
                   />
                   <button
@@ -295,7 +368,7 @@ export default function LandingLayout({
                   height={28}
                   className="h-7 w-7 rounded-lg"
                 />
-                <div className="flex flex-col">
+                <div className="hidden md:flex flex-col">
                   <span
                     className={`text-base font-bold text-gray-900 ${calSans.className}`}
                   >

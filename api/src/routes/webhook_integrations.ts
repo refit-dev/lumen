@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { createFreeSubscriptionForUser } from "../helpers/create-free-subscription";
+import { createEnrollmentSubscriptionForUser } from "../helpers/create-enrollment-subscription";
 
 // Supabase webhook payload schema
 const supabaseWebhookSchema = z.object({
@@ -104,8 +104,8 @@ export const integrationWebhooksRouter = new Hono()
 
       console.log(`Processing Supabase user creation for ${record.email}`);
 
-      // Create free subscription
-      const [result, statusCode] = await createFreeSubscriptionForUser({
+      // Create enrollment subscription (falls back to free if no rule matches)
+      const [result, statusCode] = await createEnrollmentSubscriptionForUser({
         merchantId,
         customerEmail: record.email,
         customerName: userName,
@@ -149,8 +149,8 @@ export const integrationWebhooksRouter = new Hono()
         `Processing Clerk user creation for ${primaryEmail.email_address}`
       );
 
-      // Create free subscription
-      const [result, statusCode] = await createFreeSubscriptionForUser({
+      // Create enrollment subscription (falls back to free if no rule matches)
+      const [result, statusCode] = await createEnrollmentSubscriptionForUser({
         merchantId,
         customerEmail: primaryEmail.email_address,
         customerName: userName,

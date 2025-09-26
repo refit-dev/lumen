@@ -14,6 +14,7 @@ import { useStore } from "@tanstack/react-form";
 // import { Label } from "@/components/ui/label"; // End date feature
 import React from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { toast } from "sonner";
 
 // Interface for price components
 interface PriceComponent {
@@ -280,17 +281,29 @@ export default function CreateSubscriptionPage() {
         });
         const data = await response.json();
         if ("error" in data) {
+          // Display error message to the user
+          toast.error(data.error);
           throw new Error(data.error);
         }
         // Redirect to the newly created subscription details page
         if (!data.subscription?.stableSubscriptionId) {
-          throw new Error(
-            "Subscription creation failed: No stable subscription ID returned"
-          );
+          const errorMessage =
+            "Subscription creation failed: No stable subscription ID returned";
+          toast.error(errorMessage);
+          throw new Error(errorMessage);
         }
+
+        toast.success("Subscription created successfully");
         router.push(`/subscriptions/${data.subscription.stableSubscriptionId}`);
       } catch (error) {
         console.error("Error creating subscription:", error);
+        // Don't show toast if we already showed one above
+        if (
+          error instanceof Error &&
+          !error.message.includes("already has an active subscription")
+        ) {
+          toast.error(error.message || "Failed to create subscription");
+        }
         throw error;
       }
     },
@@ -445,15 +458,11 @@ export default function CreateSubscriptionPage() {
             <div className="flex items-start gap-2">
               <Mail className="h-4 w-4 mt-0.5 text-blue-600" />
               <p className="text-sm">
-                The customer will receive an email with their invoice and a
-                &ldquo;Pay Online&rdquo; button that takes them to a secure
-                Stripe checkout page.
+                The customer will receive an email with this link. They can
+                click it to pay online. We will store the payment method on file
+                for future invoices.
               </p>
             </div>
-            <p className="text-sm text-blue-700">
-              Once they pay, the invoice will be automatically marked as paid
-              and their subscription will continue normally.
-            </p>
           </div>
         </AlertDescription>
       </Alert>

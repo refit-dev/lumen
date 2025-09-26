@@ -534,7 +534,7 @@ describe("Integration Webhooks", () => {
   });
 
   describe("Error Handling", () => {
-    it("should handle missing Stripe configuration", async () => {
+    it("Should work with free plan and no stripe configuration", async () => {
       // Create a new merchant without Stripe configuration
       const { merchant: merchantWithoutStripe } =
         await createFullTestEnvironment();
@@ -608,14 +608,7 @@ describe("Integration Webhooks", () => {
         json: supabasePayload,
       });
 
-      expect(response.status).toBe(400);
-      const body = (await response.json()) as any;
-
-      if (!("error" in body)) {
-        throw new Error("Expected error response");
-      }
-
-      expect(body.error).toContain("No payment provider configured");
+      expect(response.status).toBe(200);
     });
 
     it("should handle missing free plans", async () => {

@@ -26,8 +26,9 @@ import {
   creditApplicationTypes,
   creditScopes,
   creditGrantStatuses,
+  customers,
 } from "@lumen/common/schema";
-import { eq, and, isNull, desc, sql } from "drizzle-orm";
+import { eq, and, isNull, desc, sql, inArray } from "drizzle-orm";
 
 // Enhanced Zod schemas for validation using imported type definitions
 
@@ -469,6 +470,109 @@ export const creditsRouter = new Hono()
       } catch (error) {
         console.error("Error fetching customer credit grants:", error);
         return c.json({ error: "Failed to fetch customer credit grants" }, 500);
+      }
+    }
+  )
+
+  // Get credit grants for all customers in an organization (seat-aware)
+  .get(
+    "/customers/:customerId/grants/seat-aware",
+    zValidator("param", customerIdParamSchema),
+    zValidator(
+      "query",
+      z.object({
+        status: creditGrantStatusSchema.optional(),
+        applicationType: creditApplicationTypeSchema.optional(),
+      })
+    ),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const { customerId } = c.req.valid("param");
+      const { status, applicationType } = c.req.valid("query");
+
+      try {
+        // Get the customer's organization
+        const customer = await db.query.customers.findFirst({
+          where: and(
+            eq(customers.id, customerId),
+            eq(customers.merchantId, merchantId),
+            isNull(customers.deletedAt)
+          ),
+        });
+
+        if (!customer?.customerOrganizationId) {
+          // No organization, fall back to regular grants for this customer only
+          const conditions = [
+            eq(creditGrants.merchantId, merchantId),
+            eq(creditGrants.customerId, customerId),
+            isNull(creditGrants.deletedAt),
+          ];
+
+          if (status) {
+            conditions.push(eq(creditGrants.status, status));
+          }
+
+          if (applicationType) {
+            conditions.push(eq(creditGrants.applicationType, applicationType));
+          }
+
+          const grants = await db.query.creditGrants.findMany({
+            where: and(...conditions),
+            orderBy: [desc(creditGrants.createdAt)],
+            with: {
+              creditDefinition: true,
+              customer: true,
+            },
+          });
+
+          return c.json({ grants });
+        }
+
+        // Get ALL customers in the organization
+        const orgCustomers = await db.query.customers.findMany({
+          where: and(
+            eq(
+              customers.customerOrganizationId,
+              customer.customerOrganizationId
+            ),
+            eq(customers.merchantId, merchantId),
+            isNull(customers.deletedAt)
+          ),
+        });
+
+        const orgCustomerIds = orgCustomers.map((c) => c.id);
+
+        // Get grants for all customers in the organization
+        const conditions = [
+          eq(creditGrants.merchantId, merchantId),
+          inArray(creditGrants.customerId, orgCustomerIds),
+          isNull(creditGrants.deletedAt),
+        ];
+
+        if (status) {
+          conditions.push(eq(creditGrants.status, status));
+        }
+
+        if (applicationType) {
+          conditions.push(eq(creditGrants.applicationType, applicationType));
+        }
+
+        const grants = await db.query.creditGrants.findMany({
+          where: and(...conditions),
+          orderBy: [desc(creditGrants.createdAt)],
+          with: {
+            creditDefinition: true,
+            customer: true,
+          },
+        });
+
+        return c.json({ grants });
+      } catch (error) {
+        console.error("Error fetching seat-aware credit grants:", error);
+        return c.json(
+          { error: "Failed to fetch seat-aware credit grants" },
+          500
+        );
       }
     }
   )

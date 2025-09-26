@@ -23,6 +23,10 @@ import { TaxRateDefinitionsManager } from "@/components/dashboard/TaxRateDefinit
 import { AuthenticatedContactModal } from "@/components/ContactUsModal";
 import { usStates } from "@lumen/common/utils";
 import { usePageTitle } from "@/components/dashboard/page-title-context";
+import {
+  TaxSetupWizard,
+  TaxWizardSubmission,
+} from "@/components/dashboard/TaxSetupWizard";
 
 type NexusConfig = {
   id: string;
@@ -56,6 +60,20 @@ export default function TaxSettingsPage() {
   const [showNexusWizard, setShowNexusWizard] = useState(false);
 
   const merchantId = session?.merchant?.id;
+
+  // Onboarding status for conditional wizard
+  const { data: onboardingStatus, isLoading: isLoadingOnboarding } = useQuery({
+    queryKey: ["onboarding-status"],
+    queryFn: async () => {
+      const response = await apiClient.merchants.checkonboarding.$get();
+      const data = await response.json();
+      return data as {
+        hasPlans?: boolean;
+        hasPaymentProvider?: boolean;
+        hasTax?: boolean;
+      };
+    },
+  });
 
   // Validate tax rate input
   const validateTaxRate = (value: string) => {
@@ -397,6 +415,32 @@ export default function TaxSettingsPage() {
 
   return (
     <div className="max-w-4xl w-full mx-auto p-6 space-y-8">
+      {/* Onboarding Wizard - force until configured */}
+      {!dodoConfig &&
+        !isLoadingOnboarding &&
+        onboardingStatus &&
+        onboardingStatus.hasTax === false && (
+          <TaxSetupWizard
+            open={true}
+            merchantCountry={merchant?.country}
+            isSaving={updateTaxConfigMutation.isPending}
+            onSubmit={async (payload: TaxWizardSubmission) => {
+              await updateTaxConfigMutation.mutateAsync(payload);
+              await Promise.all([
+                queryClient.invalidateQueries({
+                  queryKey: ["tax-config", merchantId],
+                }),
+                queryClient.invalidateQueries({
+                  queryKey: ["onboarding-status"],
+                }),
+              ]);
+            }}
+            onFinished={() => {
+              // no-op; dialog will close automatically when hasTax becomes true on next render
+            }}
+          />
+        )}
+
       <div>
         <h1 className="text-3xl font-bold">Tax Settings</h1>
         <p className="text-muted-foreground mt-2">

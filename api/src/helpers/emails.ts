@@ -13,7 +13,7 @@ interface SendEmailParams {
   resendApiKey?: string;
 }
 
-export async function sendEmail({
+export async function sendEmailWithResend({
   to,
   subject,
   body,
@@ -26,6 +26,7 @@ export async function sendEmail({
     to.includes(domain)
   );
   if (skipSendingEmail) {
+    console.log(`Skipping sending email to ${to}`);
     return { success: true, message: `Skipping sending email to ${to}` };
   }
   // Implementation with Resend. You can modify this function to use any other provider

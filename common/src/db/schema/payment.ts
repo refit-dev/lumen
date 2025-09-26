@@ -5,12 +5,14 @@ import {
   jsonb,
   integer,
   boolean,
+  index,
 } from "drizzle-orm/pg-core";
 import { createPrefixedId, ID_PREFIXES } from "../utils";
 import { customers } from "./customer";
 import { invoices } from "./invoice";
 import { merchants } from "./merchants";
-import { createInsertSchema } from "drizzle-zod";
+import { createInsertSchema, createSelectSchema } from "drizzle-zod";
+import { relations } from "drizzle-orm";
 
 export const paymentMethods = pgTable("payment_methods", {
   id: text("id")
@@ -104,6 +106,9 @@ export const refunds = pgTable("refunds", {
   currency: text("currency").notNull(),
   status: text("status").notNull(),
   reason: text("reason"),
+  adjustmentInvoiceId: text("adjustment_invoice_id").references(
+    () => invoices.id
+  ),
   errorMessage: text("error_message"),
   metadata:
     jsonb("metadata").$type<Record<string, string | number | boolean>>(),
@@ -111,11 +116,52 @@ export const refunds = pgTable("refunds", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+// Payment retry tracking table - logs each dunning attempt
+export const paymentRetries = pgTable(
+  "payment_retries",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createPrefixedId(ID_PREFIXES.paymentRetry)),
+    paymentId: text("payment_id")
+      .notNull()
+      .references(() => payments.id),
+    invoiceId: text("invoice_id")
+      .notNull()
+      .references(() => invoices.id),
+    attemptNumber: integer("attempt_number").notNull(),
+    status: text("status").notNull(), // 'succeeded' or 'failed'
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    deletedAt: timestamp("deleted_at"),
+  },
+  (table) => [
+    // Index for finding retries by payment/invoice
+    index("idx_payment_retries_payment").on(table.paymentId),
+    index("idx_payment_retries_invoice").on(table.invoiceId),
+  ]
+);
+
+// Payment retries relations
+export const paymentRetriesRelations = relations(paymentRetries, ({ one }) => ({
+  payment: one(payments, {
+    fields: [paymentRetries.paymentId],
+    references: [payments.id],
+  }),
+  invoice: one(invoices, {
+    fields: [paymentRetries.invoiceId],
+    references: [invoices.id],
+  }),
+}));
+
 export const paymentMethodInsertSchema = createInsertSchema(paymentMethods);
 
 export const paymentMethodInsertSchemaReq = paymentMethodInsertSchema.omit({
   merchantId: true,
 });
+
+export const paymentRetriesSelectSchema = createSelectSchema(paymentRetries);
+export const paymentRetriesInsertSchema = createInsertSchema(paymentRetries);
 
 // export const paymentServiceProviders = pgTable("payment_service_providers", {
 //   id: text("id")

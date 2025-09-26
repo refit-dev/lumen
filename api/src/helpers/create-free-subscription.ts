@@ -43,13 +43,6 @@ export const createFreeSubscriptionForUser = async (
   const dbInstance = tx || db;
 
   try {
-    // Early check: ensure payment provider is configured
-    const { isPaymentProviderReady, statusMessage } =
-      await getPaymentProvider(merchantId);
-    if (!isPaymentProviderReady) {
-      return [{ error: statusMessage }, 400 as ContentfulStatusCode] as const;
-    }
-
     // Early check: does an active subscription already exist for this external customer ID?
     const existingCustomer = await dbInstance.query.customers.findFirst({
       where: and(
@@ -69,7 +62,8 @@ export const createFreeSubscriptionForUser = async (
             eq(subscriptions.customerId, existingCustomer.id),
             eq(subscriptions.merchantId, merchantId),
             isNull(subscriptions.deletedAt),
-            isNull(subscriptions.endTimestamp)
+            isNull(subscriptions.endTimestamp),
+            inArray(subscriptions.status, ["active", "trialing", "past_due"])
           ),
         });
 

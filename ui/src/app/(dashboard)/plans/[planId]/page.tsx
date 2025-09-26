@@ -54,6 +54,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/ui/checkbox";
+import { PlanEnrollmentRules } from "@/components/dashboard/PlanEnrollmentRules";
 import {
   ColumnDef,
   ColumnFiltersState,
@@ -67,7 +68,8 @@ import {
   useReactTable,
   PaginationState,
 } from "@tanstack/react-table";
-import { CustomerFromApi } from "@lumen/common/schema";
+import { CustomerFromApi, Plan } from "@lumen/common/schema";
+import { PriceDSLSchemaType } from "@lumen/common";
 import { IdBadge } from "@/components/ui/id-badge";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -129,7 +131,20 @@ const isAPIPlanWithFeatures = (plan: unknown): plan is APIPlanWithFeatures => {
   );
 };
 
-// Subscription type with customer relation
+// Price type from API response
+interface PriceFromApi {
+  id: string;
+  planId: string;
+  merchantId: string;
+  currency: string;
+  pricingData: PriceDSLSchemaType;
+  isOverridePrice: boolean;
+  clonedFromPriceId: string | null;
+  createdAt: string;
+  deletedAt: string | null;
+}
+
+// Subscription type with customer, plan, and price relations (matches API response)
 interface SubscriptionWithCustomer {
   id: string;
   createdAt: string;
@@ -143,7 +158,11 @@ interface SubscriptionWithCustomer {
   featureOverrideId: string | null;
   startTimestamp: string;
   endTimestamp: string | null;
+  status: "canceled" | "active" | "trialing" | "past_due" | "paused" | "unpaid";
+  gracePeriodEndsAt: string | null;
   customer: CustomerFromApi;
+  plan: Plan;
+  price: PriceFromApi;
 }
 
 // Types for pricing components - flexible to handle actual API data
@@ -632,11 +651,14 @@ export default function PlanDetailsPage() {
         const response = await apiClient.subscriptions.$get({
           query: { includeFeatures: "false" },
         });
-        const data = await response.json();
+        const data = (await response.json()) as {
+          subscriptions?: SubscriptionWithCustomer[];
+          error?: string;
+        };
         if ("error" in data) {
           throw new Error(String(data.error));
         }
-        return data.subscriptions || [];
+        return (data.subscriptions || []) as SubscriptionWithCustomer[];
       },
       staleTime: 2 * 60 * 1000, // 2 minutes (subscriptions change more frequently)
       refetchOnWindowFocus: false,
@@ -1099,7 +1121,7 @@ export default function PlanDetailsPage() {
   return (
     <div className="container mx-auto py-10">
       <div className="flex justify-between items-center mb-10">
-        <Button variant="outline" onClick={() => router.back()}>
+        <Button variant="outline" onClick={() => router.push("/plans")}>
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back
           <kbd className="ml-2 inline-flex h-5 items-center rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
@@ -1411,6 +1433,11 @@ export default function PlanDetailsPage() {
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
         {/* Left Column - Plan Details */}
         <div className="xl:col-span-2 space-y-8">
+          {/* Enrollment Rules */}
+          {selectedVersionId ? (
+            <PlanEnrollmentRules planId={selectedVersionId} />
+          ) : null}
+
           {/* Pricing & Features */}
           <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
             <div className="p-6 border-b border-slate-200 bg-slate-50/50">

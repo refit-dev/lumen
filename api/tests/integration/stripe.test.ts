@@ -12,7 +12,6 @@ import { testEnv } from "../test-env";
 import { Stripe } from "stripe";
 import { createTestStripe } from "../test-helpers/data/stripe";
 
-// Helper function to clean up webhooks after each test
 async function cleanupWebhooks() {
   const secretKey = testEnv.TEST_STRIPE_SECRET_KEY;
 

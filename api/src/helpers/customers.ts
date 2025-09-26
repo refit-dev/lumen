@@ -111,34 +111,103 @@ export async function upsertCustomer(options: UpsertCustomerOptions) {
       });
 
       if (existingCustomerByEmail) {
-        throw new Error(
-          "A customer with this email already exists. Use dangerouslyAllowSameEmailForDifferentCustomers to allow multiple customers with the same email."
-        );
+        // If an existing customer is found for this email, merge instead of creating a new one.
+        // Attach externalCustomerId if not already set; if set to a different value, throw.
+        if (
+          options.externalCustomerId &&
+          existingCustomerByEmail.externalCustomerId &&
+          existingCustomerByEmail.externalCustomerId !==
+            options.externalCustomerId
+        ) {
+          throw new Error(
+            "This email is already linked to a different external customer ID."
+          );
+        }
+
+        const mergedMetadata = {
+          ...(existingCustomerByEmail.metadata || {}),
+          ...(options.metadata || {}),
+        } as Record<string, unknown> | undefined;
+
+        const [mergedCustomer] = await tx
+          .update(customers)
+          .set({
+            // Prefer preserving existing non-null fields; only update when a new value is provided
+            name: options.name ?? existingCustomerByEmail.name ?? null,
+            businessName:
+              options.businessName ??
+              existingCustomerByEmail.businessName ??
+              null,
+            email: existingCustomerByEmail.email, // keep canonical email
+            externalCustomerId:
+              options.externalCustomerId ||
+              existingCustomerByEmail.externalCustomerId ||
+              null,
+            billingAddressLine1:
+              options.billingAddressLine1 ??
+              existingCustomerByEmail.billingAddressLine1 ??
+              null,
+            billingAddressLine2:
+              options.billingAddressLine2 ??
+              existingCustomerByEmail.billingAddressLine2 ??
+              null,
+            billingCity:
+              options.billingCity ??
+              existingCustomerByEmail.billingCity ??
+              null,
+            billingPostalCode:
+              options.billingPostalCode ??
+              existingCustomerByEmail.billingPostalCode ??
+              null,
+            billingCountry:
+              options.billingCountry ??
+              existingCustomerByEmail.billingCountry ??
+              null,
+            billingStateProvince:
+              options.billingStateProvince ??
+              existingCustomerByEmail.billingStateProvince ??
+              null,
+            taxId: options.taxId ?? existingCustomerByEmail.taxId ?? null,
+            metadata: mergedMetadata,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(customers.id, existingCustomerByEmail.id),
+              eq(customers.merchantId, merchantId)
+            )
+          )
+          .returning();
+
+        customer = mergedCustomer;
+        console.log(`Merged with existing customer by email: ${customer.id}`);
       }
     }
 
-    // Create new customer
-    const [newCustomer] = await tx
-      .insert(customers)
-      .values({
-        merchantId: options.merchantId,
-        name: options.name,
-        businessName: options.businessName,
-        email: options.email,
-        externalCustomerId: options.externalCustomerId, // Will be string or undefined (if looked up by customerId and not provided)
-        billingAddressLine1: options.billingAddressLine1,
-        billingAddressLine2: options.billingAddressLine2,
-        billingCity: options.billingCity,
-        billingPostalCode: options.billingPostalCode,
-        billingCountry: options.billingCountry,
-        billingStateProvince: options.billingStateProvince,
-        taxId: options.taxId,
-        metadata: options.metadata,
-      })
-      .returning();
+    // Create new customer (only if we didn't merge by email above)
+    if (!customer) {
+      const [newCustomer] = await tx
+        .insert(customers)
+        .values({
+          merchantId: options.merchantId,
+          name: options.name,
+          businessName: options.businessName,
+          email: options.email,
+          externalCustomerId: options.externalCustomerId, // Will be string or undefined (if looked up by customerId and not provided)
+          billingAddressLine1: options.billingAddressLine1,
+          billingAddressLine2: options.billingAddressLine2,
+          billingCity: options.billingCity,
+          billingPostalCode: options.billingPostalCode,
+          billingCountry: options.billingCountry,
+          billingStateProvince: options.billingStateProvince,
+          taxId: options.taxId,
+          metadata: options.metadata,
+        })
+        .returning();
 
-    customer = newCustomer;
-    console.log(`Customer created: ${customer.id}`);
+      customer = newCustomer;
+      console.log(`Customer created: ${customer.id}`);
+    }
   }
 
   return customer;

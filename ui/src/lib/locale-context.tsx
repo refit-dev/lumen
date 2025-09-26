@@ -65,24 +65,35 @@ export function useDateFormatter() {
       const dateObj = typeof date === "string" ? new Date(date) : date;
       const localeContext = detectUserLocale(merchantCountry, customerCountry);
 
-      const formatOptions: Intl.DateTimeFormatOptions = {};
+      // Build month name in English explicitly
+      const monthName = new Intl.DateTimeFormat("en-US", {
+        month: "short",
+      }).format(dateObj);
+      const day = dateObj.getDate();
+      const year = dateObj.getFullYear();
+      const isSameYear = year === new Date().getFullYear();
 
-      // Set date style - always use individual properties to force English month names
-      // Note: We avoid dateStyle to ensure month names are always in English
-      formatOptions.year = "numeric";
-      formatOptions.month = "short";
-      formatOptions.day = "numeric";
+      const datePart = isSameYear
+        ? `${day} ${monthName}`
+        : `${day} ${monthName} ${year}`;
 
-      // Add time if requested
       if (options.includeTime) {
-        formatOptions.hour = "numeric";
-        formatOptions.minute = "2-digit";
-        formatOptions.hour12 = localeContext.timeFormat === "12";
+        const timeOptions: Intl.DateTimeFormatOptions = {
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: localeContext.timeFormat === "12",
+        };
+        const timePart = new Intl.DateTimeFormat(
+          localeContext.locale,
+          timeOptions
+        ).format(dateObj);
+
+        return isSameYear
+          ? `${datePart} ${timePart}`
+          : `${datePart}, ${timePart}`;
       }
 
-      // Always use en-US for formatting to ensure English month names
-      // but preserve the time format preference from the user's locale
-      return new Intl.DateTimeFormat("en-US", formatOptions).format(dateObj);
+      return datePart;
     },
 
     formatDateLegacy: (date: Date | string) => {

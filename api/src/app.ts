@@ -65,7 +65,9 @@ app.use(
   cors({
     origin: corsOriginList,
     credentials: true,
+    allowHeaders: ["Content-Type", "Authorization"],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    exposeHeaders: ["Content-Length"],
   })
 );
 console.log("[APP] General CORS middleware configured");

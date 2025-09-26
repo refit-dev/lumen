@@ -91,6 +91,7 @@ type PlanWithPrices = Plan & {
         type: string;
         amount_cents?: number;
         recurrence_rule?: string;
+        unit_label?: string;
       }>;
     };
   }>;
@@ -126,6 +127,9 @@ type PriceComponent = {
   amount_cents?: number;
   unit_cost_cents?: number;
   unit_label?: string;
+  recurrence_rule?: string;
+  label?: string;
+  component_name?: string;
 };
 
 // Helper to calculate MRR from price components
@@ -199,8 +203,8 @@ const extractPricingInfo = (plan: PlanWithPrices) => {
 
           if (component.type === "per_unit") {
             perUnit = true;
-            if ((component as { unit_label?: string }).unit_label) {
-              unitLabel = (component as { unit_label?: string }).unit_label!;
+            if (component.unit_label) {
+              unitLabel = component.unit_label;
             } else {
               unitLabel = "unit";
             }
@@ -558,6 +562,7 @@ export default function PlansPage() {
       // Pricing information
       {
         id: "pricing",
+        // Keep the original sorting accessor based on the first monthly fixed amount for now
         accessorFn: (row) => row.monthlyPrice,
         header: ({ column }) => (
           <div
@@ -570,70 +575,132 @@ export default function PlansPage() {
           </div>
         ),
         cell: ({ row }) => {
-          const { monthlyPrice, yearlyPrice, currency, perUnit, unitLabel } =
-            row.original;
+          const priceObjects = (row.original.prices || []) as Array<{
+            pricingData?: { components?: PriceComponent[] };
+          }>;
 
-          // NEW: gather usage-based pricing components (type === "usage")
-          const usageComponents = (
-            (row.original.prices?.[0]?.pricingData?.components ||
-              []) as PriceComponent[]
-          ).filter(
-            (c) =>
-              c.type === "usage" &&
-              (c.unit_cost_cents ?? c.amount_cents ?? 0) > 0
+          // Identify the monthly and yearly price objects separately (first match wins)
+          const monthlyPriceObj = priceObjects.find((p) =>
+            (p.pricingData?.components || []).some((c) =>
+              c.recurrence_rule?.includes("FREQ=MONTHLY")
+            )
+          );
+          const yearlyPriceObj = priceObjects.find((p) =>
+            (p.pricingData?.components || []).some((c) =>
+              c.recurrence_rule?.includes("FREQ=YEARLY")
+            )
           );
 
-          const renderUsage = (component: PriceComponent, idx: number) => {
-            const amount =
-              component.unit_cost_cents ?? component.amount_cents ?? 0;
-            const label = component.unit_label
-              ? ` per ${component.unit_label}`
-              : " per use";
+          const monthlyComponents =
+            monthlyPriceObj?.pricingData?.components ||
+            ([] as PriceComponent[]);
+          const yearlyComponents =
+            yearlyPriceObj?.pricingData?.components || ([] as PriceComponent[]);
 
-            // Careful currency fallback - use plan currency or summary currency or merchant currency
-            const displayCurrency =
-              currency ||
-              summaryStats.currency ||
-              session?.merchant?.defaultCurrency ||
-              "USD";
+          const fixedMonthlyComp = monthlyComponents.find(
+            (c) => c.type === "fixed" || c.type === "per_unit"
+          ) as
+            | (PriceComponent & {
+                amount_cents?: number;
+                unit_label?: string;
+              })
+            | null;
+          const fixedYearlyComp = yearlyComponents.find(
+            (c) => c.type === "fixed" || c.type === "per_unit"
+          ) as
+            | (PriceComponent & {
+                amount_cents?: number;
+                unit_label?: string;
+              })
+            | null;
 
-            return (
-              <div key={idx} className="text-xs text-muted-foreground">
-                {`${formatCurrency(amount, displayCurrency)}${label}`}
-              </div>
-            );
-          };
+          const usageComponents = monthlyComponents.filter(
+            (c) => c.type === "usage"
+          ) as Array<
+            PriceComponent & {
+              unit_cost_cents?: number;
+              unit_label?: string;
+              amount_cents?: number;
+            }
+          >;
 
-          const isFree =
-            monthlyPrice === 0 &&
-            yearlyPrice === 0 &&
-            usageComponents.length === 0;
-
-          // Careful currency fallback for pricing display
           const displayCurrency =
-            currency ||
+            row.original.currency ||
             summaryStats.currency ||
             session?.merchant?.defaultCurrency ||
             "USD";
 
+          const renderFixedLine = () => {
+            if (!fixedMonthlyComp && !fixedYearlyComp) return null;
+
+            const monthlyAmount = fixedMonthlyComp?.amount_cents ?? 0;
+            const yearlyAmount = fixedYearlyComp?.amount_cents ?? 0;
+            const perUnit = fixedMonthlyComp?.type === "per_unit";
+            const unitLabel = perUnit
+              ? fixedMonthlyComp?.unit_label || "unit"
+              : undefined;
+
+            return (
+              <div className="text-sm font-medium flex items-baseline gap-1 flex-wrap">
+                {fixedMonthlyComp && (
+                  <>
+                    {formatCurrency(monthlyAmount, displayCurrency)}/mo
+                    {perUnit && unitLabel ? ` per ${unitLabel}` : ""}
+                  </>
+                )}
+                {fixedYearlyComp && (
+                  <span className="text-xs text-muted-foreground ml-1 whitespace-nowrap">
+                    {formatCurrency(yearlyAmount, displayCurrency)}/yr
+                    {perUnit && unitLabel ? ` per ${unitLabel}` : ""}
+                  </span>
+                )}
+              </div>
+            );
+          };
+
+          const renderUsageSummary = () => {
+            if (usageComponents.length === 0) return null;
+            return (
+              <TooltipProvider delayDuration={0}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="text-xs text-muted-foreground underline cursor-help">
+                      + usage
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent align="start">
+                    <div className="space-y-1">
+                      {usageComponents.map((comp, idx) => {
+                        const amount =
+                          comp.unit_cost_cents ?? comp.amount_cents ?? 0;
+                        const labelText =
+                          comp.label ||
+                          comp.component_name ||
+                          `Usage ${idx + 1}`;
+                        const unitLbl = comp.unit_label || "unit";
+                        return (
+                          <div key={idx} className="text-xs">
+                            {labelText}:{" "}
+                            {formatCurrency(amount, displayCurrency)} per{" "}
+                            {unitLbl}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            );
+          };
+
+          const isFree =
+            !fixedMonthlyComp &&
+            !fixedYearlyComp &&
+            usageComponents.length === 0;
+
           return (
             <div className="space-y-1">
-              {monthlyPrice > 0 && (
-                <div className="text-sm font-medium">
-                  {formatCurrency(monthlyPrice, displayCurrency)}/mo
-                  {perUnit && unitLabel ? ` per ${unitLabel}` : ""}
-                </div>
-              )}
-              {yearlyPrice > 0 && (
-                <div className="text-xs text-muted-foreground">
-                  {formatCurrency(yearlyPrice, displayCurrency)}/yr
-                  {perUnit && unitLabel ? ` per ${unitLabel}` : ""}
-                </div>
-              )}
-
-              {/* NEW: render usage components */}
-              {usageComponents.map(renderUsage)}
-
+              {renderFixedLine()} {renderUsageSummary()}
               {isFree && (
                 <div className="text-sm text-muted-foreground">Free</div>
               )}

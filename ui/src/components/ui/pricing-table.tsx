@@ -3,7 +3,6 @@
 // Lumen Billing pricing table component. Learn more at https://docs.getlumen.dev
 import * as React from "react";
 import { useState, useEffect, useRef } from "react";
-import * as SwitchPrimitives from "@radix-ui/react-switch";
 import {
   Elements,
   PaymentElement,
@@ -18,6 +17,7 @@ import {
   X,
   ChevronDown,
   Search,
+  CreditCard,
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { DodoPayments } from "dodopayments-checkout";
@@ -36,6 +36,15 @@ import {
 import { Checkbox } from "./checkbox";
 import { Input } from "./input";
 import { Label } from "./label";
+import { Switch } from "./switch";
+import {
+  Table,
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from "./table";
 
 // ----------------------------------------------------------------------------
 // INLINE TYPES & SCHEMAS (self-contained)
@@ -91,6 +100,22 @@ export interface Plan {
   pspPlanId?: string;
 }
 
+// Optional customer information that can be provided upfront to prefill the
+// checkout/customer details form when the modal opens.
+export interface InitialCustomer {
+  email?: string;
+  name?: string;
+  businessName?: string;
+  address?: string;
+  addressLine2?: string;
+  zip?: string;
+  city?: string;
+  country?: string; // ISO 2 code (e.g., "US", "DE")
+  stateProvince?: string; // e.g., "CA" or state/province name
+  taxId?: string;
+  isBusiness?: boolean;
+}
+
 export interface PricingTableProps {
   heading?: string;
   description?: string;
@@ -114,6 +139,35 @@ const validatePricingTableData = (data: unknown): data is PricingTableProps => {
       typeof p.interval === "string"
     );
   });
+};
+
+// Sanitizes the initial customer data to prevent invalid data types from causing errors.
+const sanitizeInitialCustomer = (
+  customer: unknown
+): InitialCustomer | undefined => {
+  if (!customer || typeof customer !== "object") {
+    return undefined;
+  }
+
+  const c = customer as Record<string, unknown>;
+  const sanitized: InitialCustomer = {};
+
+  if (typeof c.email === "string") sanitized.email = c.email;
+  if (typeof c.name === "string") sanitized.name = c.name;
+  if (typeof c.businessName === "string")
+    sanitized.businessName = c.businessName;
+  if (typeof c.address === "string") sanitized.address = c.address;
+  if (typeof c.addressLine2 === "string")
+    sanitized.addressLine2 = c.addressLine2;
+  if (typeof c.zip === "string") sanitized.zip = c.zip;
+  if (typeof c.city === "string") sanitized.city = c.city;
+  if (typeof c.country === "string") sanitized.country = c.country;
+  if (typeof c.stateProvince === "string")
+    sanitized.stateProvince = c.stateProvince;
+  if (typeof c.taxId === "string") sanitized.taxId = c.taxId;
+  if (typeof c.isBusiness === "boolean") sanitized.isBusiness = c.isBusiness;
+
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined;
 };
 
 // ----------------------------------------------------------------------------
@@ -845,7 +899,8 @@ export const PricingTableCards = ({
   setSelectedPlan,
   subscriptionStatus,
 }: PricingTableCardsProps) => {
-  const [isYearly, setIsYearly] = useState(true);
+  const [isYearly, setIsYearly] = useState(false);
+  const initializedYearlyRef = useRef(false);
 
   const getGridColumnsClass = () => {
     const grid: Record<number, string> = {
@@ -857,12 +912,28 @@ export const PricingTableCards = ({
     return grid[plans.length] || "grid-cols-1 md:grid-cols-2 lg:grid-cols-3";
   };
 
-  const hasMultiplePricingOptions = plans.some(
-    (plan) =>
-      !plan.isEnterprisePlan &&
-      plan.priceMonthly !== undefined &&
-      plan.priceYearly !== undefined
-  );
+  const nonEnterprisePlans = plans.filter((plan) => !plan.isEnterprisePlan);
+  const usingPreviewData = !setSelectedPlan;
+  const shouldShowYearlyToggle =
+    nonEnterprisePlans.length > 0 &&
+    nonEnterprisePlans.every(
+      (plan) =>
+        plan.priceMonthly !== undefined &&
+        plan.priceYearly !== undefined &&
+        (usingPreviewData || !!plan.priceIdYearly)
+    );
+
+  useEffect(() => {
+    if (shouldShowYearlyToggle) {
+      if (!initializedYearlyRef.current) {
+        setIsYearly(true);
+        initializedYearlyRef.current = true;
+      }
+    } else {
+      setIsYearly(false);
+      initializedYearlyRef.current = false;
+    }
+  }, [shouldShowYearlyToggle]);
 
   const discountPercentage = (plan: Plan) => {
     if (plan.isEnterprisePlan || !isYearly) return null;
@@ -922,25 +993,24 @@ export const PricingTableCards = ({
         </div>
       )}
 
-      {hasMultiplePricingOptions && (
-        <div className="flex items-center justify-center space-x-3 mt-8 mb-8">
-          <SwitchPrimitives.Root
-            className="inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 data-[state=unchecked]:bg-gray-300 data-[state=checked]:bg-primary"
-            checked={isYearly}
-            onCheckedChange={setIsYearly}
-          >
-            <SwitchPrimitives.Thumb className="pointer-events-none block h-5 w-5 rounded-full bg-white shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-5 data-[state=unchecked]:translate-x-0" />
-          </SwitchPrimitives.Root>
-          <span
-            className={`text-sm ${isYearly ? "text-foreground" : "text-muted-foreground"}`}
-          >
-            Pay yearly
-          </span>
-          {maxDiscountPercentage > 0 && (
-            <Badge variant="secondary" className="ml-2">
-              Save {maxDiscountPercentage}%
-            </Badge>
-          )}
+      {shouldShowYearlyToggle && (
+        <div className="relative w-full flex items-center justify-center mt-8 mb-8">
+          <div className="relative inline-flex items-center space-x-3">
+            <Switch checked={isYearly} onCheckedChange={setIsYearly} />
+            <span
+              className={`text-sm ${isYearly ? "text-foreground" : "text-muted-foreground"}`}
+            >
+              Pay yearly
+            </span>
+            {maxDiscountPercentage > 0 && (
+              <Badge
+                variant="secondary"
+                className="absolute left-full ml-2 top-1/2 -translate-y-1/2"
+              >
+                Save {maxDiscountPercentage}%
+              </Badge>
+            )}
+          </div>
         </div>
       )}
 
@@ -1093,6 +1163,49 @@ export const PricingTableCards = ({
                         (comp) => {
                           if (comp.type !== "usage") return false;
 
+                          // Prefer slug-based matching to avoid prefix collisions
+                          const slugify = (s: string) =>
+                            s
+                              .toLowerCase()
+                              .trim()
+                              .replace(/\s+/g, "-")
+                              .replace(/[^a-z0-9-]/g, "-")
+                              .replace(/-+/g, "-")
+                              .replace(/^-|-$/g, "");
+
+                          // Match feature with usage component using slug derived from text
+                          const baseMainText = mainText
+                            .replace(/\s*\(.*?\)\s*$/, "")
+                            .trim();
+                          const mainTextSlug = slugify(baseMainText);
+
+                          let compSlug = "";
+                          if (
+                            typeof comp.component_name === "string" &&
+                            comp.component_name
+                          ) {
+                            const raw = comp.component_name
+                              .replace(/^usage[_-]?/i, "")
+                              .replace(/[_-]?usage$/i, "");
+                            compSlug = slugify(raw);
+                          } else if (
+                            typeof comp.unit_label === "string" &&
+                            comp.unit_label
+                          ) {
+                            compSlug = slugify(comp.unit_label);
+                          } else if (
+                            typeof comp.label === "string" &&
+                            comp.label
+                          ) {
+                            const raw = comp.label.replace(/\s+usage$/i, "");
+                            compSlug = slugify(raw);
+                          }
+
+                          if (compSlug && mainTextSlug) {
+                            return compSlug === mainTextSlug;
+                          }
+
+                          // Fallback to normalized name equality
                           let featureName = "";
                           if (comp.label) {
                             featureName = comp.label.replace(/\s+usage$/i, "");
@@ -1105,15 +1218,10 @@ export const PricingTableCards = ({
                               .replace(/-/g, " ")
                               .replace(/\b\w/g, (l: string) => l.toUpperCase());
                           }
-
-                          // Match feature name with usage component
+                          const normalize = (s: string) =>
+                            s.toLowerCase().replace(/\s+/g, " ").trim();
                           return (
-                            mainText
-                              .toLowerCase()
-                              .includes(featureName.toLowerCase()) ||
-                            featureName
-                              .toLowerCase()
-                              .includes(mainText.toLowerCase().split(" ")[0])
+                            normalize(baseMainText) === normalize(featureName)
                           );
                         }
                       );
@@ -1178,15 +1286,18 @@ export const PricingTableCards = ({
                     if (plan.isEnterprisePlan && plan.enterpriseRedirectUrl) {
                       window.open(plan.enterpriseRedirectUrl, "_blank");
                     } else {
+                      const allowYearly =
+                        isYearly &&
+                        plan.priceYearly !== undefined &&
+                        !!plan.priceIdYearly;
                       const selected: Plan = {
                         ...plan,
-                        selectedBillingInterval: isYearly
+                        selectedBillingInterval: allowYearly
                           ? "yearly"
                           : "monthly",
-                        selectedPrice:
-                          isYearly && plan.priceYearly
-                            ? plan.priceYearly
-                            : plan.priceMonthly || plan.price,
+                        selectedPrice: allowYearly
+                          ? plan.priceYearly!
+                          : plan.priceMonthly || plan.price,
                       };
                       setSelectedPlan?.(selected);
                     }
@@ -1213,11 +1324,13 @@ interface PaymentModalProps {
   plan: Plan | null;
   userEmail?: string;
   userId: string;
+  organizationId?: string;
   apiBaseUrl?: string;
   onClose?: () => void;
   onPaymentSuccess?: (paymentIntentId?: string) => void;
   onPaymentError?: (error?: string) => void;
   requireBillingDetails?: boolean;
+  initialCustomer?: InitialCustomer;
 }
 
 // Tax calculation result interface
@@ -1255,30 +1368,53 @@ export const PaymentModal = ({
   plan,
   userEmail,
   userId,
+  organizationId,
   onClose,
   onPaymentSuccess,
   onPaymentError,
   requireBillingDetails = false,
   apiBaseUrl = "https://api.getlumen.dev/v1",
+  initialCustomer,
 }: PaymentModalProps) => {
   const [stripePromise, setStripePromise] =
     useState<Promise<Stripe | null> | null>(null);
   const [clientSecret, setClientSecret] = useState<string | null>(null);
+
   const [intentId, setIntentId] = useState<string | null>(null);
   const [intentType, setIntentType] = useState<string | null>(null);
+
   const [integrationError, setIntegrationError] = useState<string | null>(null);
-  const [customerEmail, setCustomerEmail] = useState<string>(userEmail || "");
-  const [customerName, setCustomerName] = useState<string>("");
-  const [businessName, setBusinessName] = useState<string>("");
-  const [customerAddress, setCustomerAddress] = useState<string>("");
-  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>("");
-  const [customerZip, setCustomerZip] = useState<string>("");
-  const [customerCity, setCustomerCity] = useState<string>("");
-  const [customerCountry, setCustomerCountry] = useState<string>("");
-  const [customerStateProvince, setCustomerStateProvince] =
-    useState<string>("");
-  const [taxId, setTaxId] = useState<string>("");
-  const [isBusiness, setIsBusiness] = useState<boolean>(false);
+  const [customerEmail, setCustomerEmail] = useState<string>(
+    initialCustomer?.email || userEmail || ""
+  );
+  const [customerName, setCustomerName] = useState<string>(
+    initialCustomer?.name || ""
+  );
+  const [businessName, setBusinessName] = useState<string>(
+    initialCustomer?.businessName || ""
+  );
+  const [customerAddress, setCustomerAddress] = useState<string>(
+    initialCustomer?.address || ""
+  );
+  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>(
+    initialCustomer?.addressLine2 || ""
+  );
+  const [customerZip, setCustomerZip] = useState<string>(
+    initialCustomer?.zip || ""
+  );
+  const [customerCity, setCustomerCity] = useState<string>(
+    initialCustomer?.city || ""
+  );
+  const [customerCountry, setCustomerCountry] = useState<string>(
+    initialCustomer?.country || ""
+  );
+  const [customerStateProvince, setCustomerStateProvince] = useState<string>(
+    initialCustomer?.stateProvince || ""
+  );
+  const [taxId, setTaxId] = useState<string>(initialCustomer?.taxId || "");
+  const [isBusiness, setIsBusiness] = useState<boolean>(
+    initialCustomer?.isBusiness || false
+  );
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [emailSubmitting, setEmailSubmitting] = useState(false);
   const [checkoutFormErrorMessage, setCheckoutFormErrorMessage] = useState<
@@ -1463,6 +1599,7 @@ export const PaymentModal = ({
         customerEmail,
         customerName,
         userId,
+        ...(organizationId && { organizationId }),
         // Automatically start trial if available
         ...(plan.trial?.available && { startTrial: true }),
       };
@@ -2051,17 +2188,21 @@ export const PricingTable = ({
   lumenHandlerUrl,
   paymentProvider = "stripe",
   environment = "live",
+  initialCustomer,
+  organizationId,
 }: {
   pricingTableSlug?: string;
   lumenPublishableKey?: string;
   redirectUrl?: string;
   apiBaseUrl?: string;
   userId?: string;
+  organizationId?: string;
   loginRedirectUrl: string;
   pricingData?: Partial<PricingTableProps>;
   lumenHandlerUrl?: string;
   paymentProvider?: "stripe" | "dodo";
   environment?: "test" | "live";
+  initialCustomer?: InitialCustomer;
 }) => {
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [loading, setLoading] = useState(false);
@@ -2077,6 +2218,11 @@ export const PricingTable = ({
   } | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const autoDismissTimeoutRef = useRef<number | null>(null);
+
+  const sanitizedInitialCustomer = React.useMemo(
+    () => sanitizeInitialCustomer(initialCustomer),
+    [initialCustomer]
+  );
 
   useEffect(() => {
     return () => {
@@ -2319,21 +2465,25 @@ export const PricingTable = ({
           isOpen={!!selectedPlan}
           lumenPublishableKey={lumenPublishableKey}
           userId={userId || ""}
+          organizationId={organizationId}
           plan={selectedPlan}
           onClose={() => setSelectedPlan(null)}
           apiBaseUrl={apiBaseUrl}
           redirectUrl={redirectUrl}
+          initialCustomer={sanitizedInitialCustomer}
         />
       ) : (
         <PaymentModal
           isOpen={!!selectedPlan}
           lumenPublishableKey={lumenPublishableKey}
           userId={userId || ""}
+          organizationId={organizationId}
           plan={selectedPlan}
           onPaymentSuccess={handleStripePaymentSuccess}
           onPaymentError={handleStripePaymentError}
           onClose={() => setSelectedPlan(null)}
           apiBaseUrl={apiBaseUrl}
+          initialCustomer={sanitizedInitialCustomer}
         />
       )}
     </div>
@@ -2356,10 +2506,12 @@ interface PaymentModalDodoProps {
   plan: Plan | null;
   userEmail?: string;
   userId: string;
+  organizationId?: string;
   apiBaseUrl?: string;
   onClose?: () => void;
   redirectUrl?: string;
   onPaymentError?: (error?: string) => void;
+  initialCustomer?: InitialCustomer;
 }
 
 const PaymentModalDodo = ({
@@ -2368,25 +2520,46 @@ const PaymentModalDodo = ({
   plan,
   userEmail,
   userId,
+  organizationId,
   onClose,
   apiBaseUrl = "https://api.getlumen.dev/v1",
   redirectUrl,
   onPaymentError,
+  initialCustomer,
 }: PaymentModalDodoProps) => {
   const [loading, setLoading] = useState(false);
   const [integrationError, setIntegrationError] = useState<string | null>(null);
-  const [customerEmail, setCustomerEmail] = useState<string>(userEmail || "");
-  const [customerName, setCustomerName] = useState<string>("");
-  const [businessName, setBusinessName] = useState<string>("");
-  const [customerAddress, setCustomerAddress] = useState<string>("");
-  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>("");
-  const [customerZip, setCustomerZip] = useState<string>("");
-  const [customerCity, setCustomerCity] = useState<string>("");
-  const [customerCountry, setCustomerCountry] = useState<string>("");
-  const [customerStateProvince, setCustomerStateProvince] =
-    useState<string>("");
-  const [taxId, setTaxId] = useState<string>("");
-  const [isBusiness, setIsBusiness] = useState<boolean>(false);
+  const [customerEmail, setCustomerEmail] = useState<string>(
+    initialCustomer?.email || userEmail || ""
+  );
+  const [customerName, setCustomerName] = useState<string>(
+    initialCustomer?.name || ""
+  );
+  const [businessName, setBusinessName] = useState<string>(
+    initialCustomer?.businessName || ""
+  );
+  const [customerAddress, setCustomerAddress] = useState<string>(
+    initialCustomer?.address || ""
+  );
+  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>(
+    initialCustomer?.addressLine2 || ""
+  );
+  const [customerZip, setCustomerZip] = useState<string>(
+    initialCustomer?.zip || ""
+  );
+  const [customerCity, setCustomerCity] = useState<string>(
+    initialCustomer?.city || ""
+  );
+  const [customerCountry, setCustomerCountry] = useState<string>(
+    initialCustomer?.country || ""
+  );
+  const [customerStateProvince, setCustomerStateProvince] = useState<string>(
+    initialCustomer?.stateProvince || ""
+  );
+  const [taxId, setTaxId] = useState<string>(initialCustomer?.taxId || "");
+  const [isBusiness, setIsBusiness] = useState<boolean>(
+    initialCustomer?.isBusiness || false
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2436,6 +2609,7 @@ const PaymentModalDodo = ({
         customerEmail,
         customerName,
         userId,
+        ...(organizationId && { organizationId }),
         planId: plan.planId,
         priceId,
         currency: plan.currency || "USD",
@@ -2758,3 +2932,1037 @@ const PaymentModalDodo = ({
     </Overlay>
   );
 };
+
+// ----------------------------------------------------------------------------
+// Customer Portal (Shadcn)
+// ----------------------------------------------------------------------------
+
+// Simple Tabs component (inline to avoid import issues)
+type TabsInternalProps = {
+  activeTab?: string;
+  setActiveTab?: (value: string) => void;
+};
+interface TabsProps {
+  defaultValue: string;
+  children: React.ReactNode;
+  className?: string;
+}
+
+interface TabsListProps {
+  children: React.ReactNode;
+  className?: string;
+}
+
+interface TabsTriggerProps {
+  value: string;
+  children: React.ReactNode;
+  className?: string;
+  onClick?: () => void;
+  isActive?: boolean;
+}
+
+interface TabsContentProps {
+  value: string;
+  children: React.ReactNode;
+  className?: string;
+  isActive?: boolean;
+}
+
+const Tabs: React.FC<TabsProps> = ({
+  defaultValue,
+  children,
+  className = "",
+}) => {
+  const [activeTab, setActiveTab] = useState(defaultValue);
+
+  return (
+    <div className={className}>
+      {React.Children.map(children, (child) => {
+        if (React.isValidElement(child)) {
+          return React.cloneElement(
+            child as React.ReactElement<TabsInternalProps>,
+            {
+              activeTab,
+              setActiveTab,
+            }
+          );
+        }
+        return child;
+      })}
+    </div>
+  );
+};
+
+const TabsList: React.FC<
+  TabsListProps & { activeTab?: string; setActiveTab?: (value: string) => void }
+> = ({ children, className = "", activeTab, setActiveTab }) => (
+  <div
+    className={`inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground ${className}`}
+  >
+    {React.Children.map(children, (child) => {
+      if (React.isValidElement(child)) {
+        return React.cloneElement(
+          child as React.ReactElement<TabsInternalProps>,
+          {
+            activeTab,
+            setActiveTab,
+          }
+        );
+      }
+      return child;
+    })}
+  </div>
+);
+
+const TabsTrigger: React.FC<
+  TabsTriggerProps & {
+    activeTab?: string;
+    setActiveTab?: (value: string) => void;
+  }
+> = ({ value, children, className = "", activeTab, setActiveTab }) => {
+  const isActive = activeTab === value;
+  return (
+    <button
+      className={cn(
+        "inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+        isActive
+          ? "bg-background text-foreground shadow-sm"
+          : "hover:bg-background/50",
+        className
+      )}
+      onClick={() => setActiveTab?.(value)}
+    >
+      {children}
+    </button>
+  );
+};
+
+const TabsContent: React.FC<TabsContentProps & { activeTab?: string }> = ({
+  value,
+  children,
+  className = "",
+  activeTab,
+}) => {
+  if (activeTab !== value) return null;
+  return (
+    <div
+      className={cn(
+        "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+        className
+      )}
+    >
+      {children}
+    </div>
+  );
+};
+
+interface PortalOverview {
+  portal: {
+    customer: { id: string; name: string | null; email: string | null };
+    subscription: {
+      id: string;
+      stableSubscriptionId: string;
+      status: string;
+      planId: string;
+      gracePeriodEndsAt: string | null;
+      paymentMethodId: string | null;
+    } | null;
+    paymentMethods: Array<{
+      id: string;
+      provider: string | null;
+      paymentType: string | null;
+      status: string | null;
+      cardBrand: string | null;
+      cardLastFour: string | null;
+      cardExpiryMonth: number | null;
+      cardExpiryYear: number | null;
+      linkedToSubscription: boolean;
+    }>;
+    invoices: Array<{
+      id: string;
+      number: string | null;
+      status: string;
+      totalAmountCents: number;
+      currency: string;
+      issueDate: string | null;
+      paidDate: string | null;
+      pdfUrl: string | null;
+      paymentStatus: string | null;
+      // Optional: refund document metadata
+      documentType?: "standard" | "cancellation" | "credit_note" | null;
+      originalInvoiceId?: string | null;
+      originalInvoiceNumber?: string | null;
+    }>;
+    payments: Array<{
+      id: string;
+      amountCents: number;
+      currency: string;
+      status: string;
+      createdAt: string;
+      errorMessage: string | null;
+      invoiceId: string | null;
+    }>;
+  };
+}
+
+type CreateSetupIntentResponse =
+  | {
+      provider: "stripe";
+      stripe: {
+        clientSecret: string;
+        intentId: string;
+        publishableKey: string;
+      };
+    }
+  | {
+      provider: "dodo";
+      dodo: { paymentLink: string };
+    };
+
+export function CustomerPortal({
+  lumenHandlerUrl,
+  externalCustomerId,
+  className,
+  apiBaseUrl = "https://api.getlumen.dev/v1",
+  environment = "live",
+}: {
+  lumenHandlerUrl: string;
+  externalCustomerId: string;
+  className?: string;
+  apiBaseUrl?: string;
+  environment?: "test" | "live";
+}) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<PortalOverview["portal"] | null>(null);
+  const [subscriptionStatus, setSubscriptionStatus] = useState<{
+    hasActiveSubscription: boolean;
+    subscription: {
+      planName: string;
+      planDescription: string | null;
+      startTimestamp: string;
+      currency: string;
+    } | null;
+  } | null>(null);
+  const [pdfLoadingId, setPdfLoadingId] = useState<string | null>(null);
+  const initialPmCountRef = useRef<number | null>(null);
+  const dodoPollTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Initialize Dodo overlay once if available; fallback handled in startAddPaymentMethod
+    try {
+      const mode =
+        typeof window !== "undefined" &&
+        window.location.hostname === "localhost"
+          ? "test"
+          : "live";
+      DodoPayments.Initialize({
+        mode,
+        theme: "light",
+        linkType: "dynamic",
+        displayType: "overlay",
+        onEvent: (ev) => console.log("Dodo checkout event", ev),
+      });
+    } catch {
+      // ignore; we'll open in new tab as fallback
+    }
+  }, []);
+
+  const [addingPm, setAddingPm] = useState(false);
+  const [stripePromise, setStripePromise] =
+    useState<Promise<Stripe | null> | null>(null);
+  const [clientSecret, setClientSecret] = useState<string | null>(null);
+  const [setupIntentId, setSetupIntentId] = useState<string | null>(null);
+  const [pmRefreshing, setPmRefreshing] = useState(false);
+  const [listeningForSetupEvent, setListeningForSetupEvent] = useState(false);
+
+  const fetchOverview = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [portalRes, statusRes] = await Promise.all([
+        fetch(
+          `${lumenHandlerUrl}/customers/portal/overview?externalCustomerId=${encodeURIComponent(
+            externalCustomerId
+          )}`,
+          { credentials: "include" }
+        ),
+        fetch(
+          `${lumenHandlerUrl}/customers/subscription-status?externalCustomerId=${encodeURIComponent(
+            externalCustomerId
+          )}`,
+          { credentials: "include" }
+        ),
+      ]);
+
+      if (!portalRes.ok)
+        throw new Error(`Failed to load (${portalRes.status})`);
+      const portalJson: PortalOverview = await portalRes.json();
+      setData(portalJson.portal);
+
+      if (statusRes.ok) {
+        const statusJson = await statusRes.json();
+        setSubscriptionStatus(statusJson);
+      }
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to load");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchOverview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalCustomerId, lumenHandlerUrl]);
+
+  const startAddPaymentMethod = async () => {
+    setError(null);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/customers/portal/create-setup-intent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ externalCustomerId }),
+        }
+      );
+      if (!res.ok)
+        throw new Error(`Failed to create setup intent (${res.status})`);
+      const json: CreateSetupIntentResponse = await res.json();
+      if (json.provider === "stripe") {
+        setClientSecret(json.stripe.clientSecret);
+        setStripePromise(loadStripe(json.stripe.publishableKey));
+        setSetupIntentId(json.stripe.intentId);
+        setAddingPm(true);
+        setListeningForSetupEvent(true);
+      } else if (json.provider === "dodo") {
+        try {
+          const link = json.dodo.paymentLink;
+          const mode = environment;
+          DodoPayments.Initialize({
+            mode,
+            theme: "light",
+            linkType: "dynamic",
+            displayType: "overlay",
+          });
+          DodoPayments.Checkout.open({
+            paymentLink: link,
+            redirectUrl: window.location.href,
+          });
+        } catch (e) {
+          console.warn(
+            "Failed to initialize Dodo overlay, opening in new tab",
+            e
+          );
+          window.open(json.dodo.paymentLink, "_blank");
+        }
+        // Start polling for PM change
+        initialPmCountRef.current = data?.paymentMethods.length ?? 0;
+        setPmRefreshing(true);
+        let attempts = 0;
+        const maxAttempts = 15;
+        const poll = async () => {
+          try {
+            const portalRes = await fetch(
+              `${lumenHandlerUrl}/customers/portal/overview?externalCustomerId=${encodeURIComponent(
+                externalCustomerId
+              )}`,
+              { credentials: "include" }
+            );
+            if (portalRes.ok) {
+              const portalJson: PortalOverview = await portalRes.json();
+              setData(portalJson.portal);
+              const newCount = portalJson.portal.paymentMethods.length;
+              if (
+                (initialPmCountRef.current ?? 0) < newCount ||
+                portalJson.portal.subscription?.status === "active"
+              ) {
+                setPmRefreshing(false);
+                if (dodoPollTimerRef.current) {
+                  clearTimeout(dodoPollTimerRef.current);
+                  dodoPollTimerRef.current = null;
+                }
+                return;
+              }
+            }
+          } catch {
+            // ignore network errors and continue polling
+          }
+          if (++attempts <= maxAttempts) {
+            dodoPollTimerRef.current = window.setTimeout(poll, 2000);
+          } else {
+            setPmRefreshing(false);
+          }
+        };
+        poll();
+      }
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to start payment method setup");
+    }
+  };
+
+  // Listen for setup intent completion to refresh immediately
+  useEffect(() => {
+    if (!listeningForSetupEvent || !setupIntentId) return;
+    try {
+      const es = new EventSource(
+        `${apiBaseUrl}/public/events/${encodeURIComponent(setupIntentId)}`
+      );
+      es.addEventListener("stripe_event", async (ev: MessageEvent) => {
+        try {
+          const data = JSON.parse((ev as MessageEvent).data);
+          const type = data.type as string;
+          if (type === "setup_intent.succeeded") {
+            setAddingPm(false);
+            setClientSecret(null);
+            setSetupIntentId(null);
+            setPmRefreshing(true);
+            es.close();
+            window.setTimeout(async () => {
+              await fetchOverview();
+              setPmRefreshing(false);
+              setListeningForSetupEvent(false);
+            }, 2000);
+          }
+        } catch {
+          // ignore
+        }
+      });
+      es.onerror = () => {
+        es.close();
+      };
+      return () => es.close();
+    } catch {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listeningForSetupEvent, setupIntentId, apiBaseUrl]);
+
+  const setDefaultPaymentMethod = async (paymentMethodId: string) => {
+    setError(null);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/customers/portal/set-subscription-payment-method`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ externalCustomerId, paymentMethodId }),
+        }
+      );
+      if (!res.ok)
+        throw new Error(`Failed to set payment method (${res.status})`);
+      await fetchOverview();
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to set default payment method");
+    }
+  };
+
+  const removePaymentMethod = async (paymentMethodId: string) => {
+    setError(null);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/customers/portal/payment-methods/${encodeURIComponent(paymentMethodId)}`,
+        { method: "DELETE", credentials: "include" }
+      );
+      if (!res.ok)
+        throw new Error(`Failed to remove payment method (${res.status})`);
+      await fetchOverview();
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to remove payment method");
+    }
+  };
+
+  const formatCurrency = (amountCents: number, currency: string) => {
+    const amount = (amountCents / 100).toFixed(2);
+    const symbol = currencySymbol(currency);
+    return `${symbol}${amount}`;
+  };
+
+  const formatDate = (dateString: string | null) => {
+    if (!dateString) return "—";
+    return new Date(dateString).toLocaleDateString();
+  };
+
+  const formatDateTime = (dateString: string | null) => {
+    if (!dateString) return "—";
+    try {
+      const d = new Date(dateString);
+      return d.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+    } catch {
+      return formatDate(dateString);
+    }
+  };
+
+  const getStatusBadgeColor = (status: string) => {
+    switch (status.toLowerCase()) {
+      case "active":
+      case "paid":
+      case "succeeded":
+        return "bg-green-100 text-green-800 border-green-200";
+      case "past_due":
+      case "failed":
+        return "bg-red-100 text-red-800 border-red-200";
+      case "pending":
+      case "processing":
+        return "bg-yellow-100 text-yellow-800 border-yellow-200";
+      case "canceled":
+      case "cancelled":
+        return "bg-gray-100 text-gray-800 border-gray-200";
+      default:
+        return "bg-blue-100 text-blue-800 border-blue-200";
+    }
+  };
+
+  const getCardBrandTheme = (brand?: string) => {
+    const name = (brand || "").toLowerCase();
+    switch (name) {
+      case "visa":
+        return { bg: "bg-blue-50 border-blue-200", fg: "text-blue-700" };
+      case "mastercard":
+        return { bg: "bg-amber-50 border-amber-200", fg: "text-amber-700" };
+      case "amex":
+      case "american express":
+        return { bg: "bg-cyan-50 border-cyan-200", fg: "text-cyan-700" };
+      case "discover":
+        return { bg: "bg-orange-50 border-orange-200", fg: "text-orange-700" };
+      case "diners":
+      case "diners club":
+        return { bg: "bg-pink-50 border-pink-200", fg: "text-pink-700" };
+      case "jcb":
+        return { bg: "bg-indigo-50 border-indigo-200", fg: "text-indigo-700" };
+      default:
+        return { bg: "bg-gray-50 border-gray-200", fg: "text-gray-700" };
+    }
+  };
+
+  const toTitleCase = (value: string) =>
+    value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+
+  const formatPaymentMethodTitle = (pm: {
+    cardBrand: string | null;
+    paymentType: string | null;
+    provider: string | null;
+    cardLastFour: string | null;
+  }) => {
+    const name = toTitleCase(
+      String(pm.cardBrand || pm.paymentType || pm.provider || "Card")
+    );
+    return pm.cardLastFour ? `${name} ending in ${pm.cardLastFour}` : name;
+  };
+
+  const BrandLogo: React.FC<{
+    brand?: string | null;
+    className?: string;
+  }> = ({ brand, className = "" }) => {
+    const b = (brand || "").toLowerCase();
+    if (b === "mastercard") {
+      return (
+        <svg viewBox="0 0 40 24" className={className} aria-hidden>
+          <circle cx="15" cy="12" r="7.5" fill="#EB001B" />
+          <circle cx="25" cy="12" r="7.5" fill="#F79E1B" />
+        </svg>
+      );
+    }
+    if (b === "visa") {
+      return (
+        <svg viewBox="0 0 40 24" className={className} aria-hidden>
+          <text
+            x="4"
+            y="16"
+            fontSize="12"
+            fontWeight="700"
+            fill="#1A1F71"
+            fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+          >
+            VISA
+          </text>
+        </svg>
+      );
+    }
+    if (b === "amex" || b === "american express") {
+      return (
+        <svg viewBox="0 0 40 24" className={className} aria-hidden>
+          <rect x="3" y="5" width="34" height="14" rx="2" fill="#2E77BC" />
+          <text
+            x="20"
+            y="16"
+            fontSize="10"
+            fontWeight="700"
+            fill="#fff"
+            textAnchor="middle"
+            fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+          >
+            AMEX
+          </text>
+        </svg>
+      );
+    }
+    if (b === "discover") {
+      return (
+        <svg viewBox="0 0 40 24" className={className} aria-hidden>
+          <circle cx="30" cy="12" r="6" fill="#F76B1C" />
+          <text
+            x="4"
+            y="16"
+            fontSize="10"
+            fontWeight="700"
+            fill="#111827"
+            fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+          >
+            DISC
+          </text>
+        </svg>
+      );
+    }
+    if (b === "jcb") {
+      return (
+        <svg viewBox="0 0 40 24" className={className} aria-hidden>
+          <text
+            x="8"
+            y="16"
+            fontSize="12"
+            fontWeight="700"
+            fill="#0B6BB8"
+            fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+          >
+            JCB
+          </text>
+        </svg>
+      );
+    }
+    return <CreditCard className={className} />;
+  };
+
+  const handleDownloadInvoice = async (invoiceId: string) => {
+    setPdfLoadingId(invoiceId);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/invoices/${encodeURIComponent(invoiceId)}/pdf`,
+        { credentials: "include" }
+      );
+      if (!res.ok) throw new Error(`Failed to get PDF URL (${res.status})`);
+      const data = await res.json();
+      if (!data?.pdfUrl) throw new Error("No PDF URL received");
+      window.open(data.pdfUrl as string, "_blank");
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to download invoice");
+    } finally {
+      setPdfLoadingId(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <Card className={className}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            Loading Customer Portal
+          </CardTitle>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  if (error) {
+    return (
+      <Card className={className}>
+        <CardHeader>
+          <CardTitle className="text-red-600 flex items-center gap-2">
+            <AlertCircle className="h-5 w-5" />
+            Error Loading Portal
+          </CardTitle>
+          <CardDescription className="text-red-600">{error}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={fetchOverview} variant="outline">
+            Try Again
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!data) return null;
+
+  return (
+    <Card className={className}>
+      <CardHeader className="pb-4">
+        <div className="flex items-start justify-between">
+          <div>
+            <CardTitle>Account Overview</CardTitle>
+            <CardDescription className="mt-1">
+              {data.customer.name && (
+                <span className="font-medium">{data.customer.name} • </span>
+              )}
+              {data.customer.email}
+            </CardDescription>
+            {subscriptionStatus?.hasActiveSubscription &&
+              subscriptionStatus.subscription && (
+                <div className="text-xs text-muted-foreground mt-1">
+                  Plan: {subscriptionStatus.subscription.planName} • Active
+                  since{" "}
+                  {formatDateTime(
+                    subscriptionStatus.subscription.startTimestamp
+                  )}
+                </div>
+              )}
+          </div>
+          {data.subscription && (
+            <Badge className={getStatusBadgeColor(data.subscription.status)}>
+              {data.subscription.status}
+            </Badge>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent>
+        <Tabs defaultValue="payment-methods" className="w-full">
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="payment-methods">Payment Methods</TabsTrigger>
+            <TabsTrigger value="invoices">Invoices</TabsTrigger>
+            <TabsTrigger value="payments">Payment History</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="payment-methods" className="mt-6">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="font-medium">Payment Methods</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Manage your saved payment methods
+                  </p>
+                </div>
+                <Button onClick={startAddPaymentMethod} size="sm">
+                  Add Payment Method
+                </Button>
+              </div>
+
+              {pmRefreshing ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                  <span className="ml-2 text-sm text-muted-foreground">
+                    Updating payment methods...
+                  </span>
+                </div>
+              ) : data.paymentMethods.length === 0 ? (
+                <div className="text-center py-8">
+                  <div className="text-muted-foreground mb-2">
+                    No payment methods found
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Add a payment method to manage your subscription
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {data.paymentMethods.map((pm) => (
+                    <div
+                      key={pm.id}
+                      className="flex items-center justify-between p-4 border rounded-xl hover:bg-gray-50 shadow-sm hover:shadow transition-colors"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={cn(
+                            "h-10 w-16 rounded-md border flex items-center justify-center",
+                            getCardBrandTheme(
+                              pm.cardBrand || pm.provider || undefined
+                            ).bg
+                          )}
+                        >
+                          <BrandLogo
+                            brand={pm.cardBrand || pm.provider}
+                            className={cn(
+                              "h-5 w-auto",
+                              getCardBrandTheme(
+                                pm.cardBrand || pm.provider || undefined
+                              ).fg
+                            )}
+                          />
+                        </div>
+                        <div>
+                          <div className="font-medium">
+                            {formatPaymentMethodTitle(pm)}
+                          </div>
+                          {pm.cardExpiryMonth && pm.cardExpiryYear ? (
+                            <div className="text-xs text-muted-foreground">
+                              Expires{" "}
+                              {pm.cardExpiryMonth.toString().padStart(2, "0")}/
+                              {pm.cardExpiryYear}
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {data.subscription?.paymentMethodId === pm.id ? (
+                          <Badge className="bg-green-100 text-green-800 border-green-200">
+                            Default
+                          </Badge>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setDefaultPaymentMethod(pm.id)}
+                          >
+                            Set as Default
+                          </Button>
+                        )}
+                        {!(
+                          pm.linkedToSubscription ||
+                          data.subscription?.paymentMethodId === pm.id
+                        ) && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => removePaymentMethod(pm.id)}
+                            className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                          >
+                            Remove
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="invoices" className="mt-6">
+            <div className="space-y-4">
+              <div>
+                <h3 className="font-medium">Invoices</h3>
+                <p className="text-sm text-muted-foreground">
+                  View and download your invoices
+                </p>
+              </div>
+
+              {data.invoices.length === 0 ? (
+                <div className="text-center py-8">
+                  <div className="text-muted-foreground mb-2">
+                    No invoices found
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Your invoices will appear here once generated
+                  </p>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Invoice #</TableHead>
+                      <TableHead>Date</TableHead>
+                      <TableHead>Amount</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.invoices.map((inv) => (
+                      <TableRow key={inv.id}>
+                        <TableCell className="font-medium">
+                          <div className="flex flex-col">
+                            <div className="flex items-center gap-2">
+                              <span>#{inv.number || inv.id.slice(-6)}</span>
+                              {inv.documentType &&
+                                inv.documentType !== "standard" && (
+                                  <Badge variant="outline">
+                                    {inv.documentType === "cancellation"
+                                      ? "Cancellation"
+                                      : "Credit Note"}
+                                  </Badge>
+                                )}
+                            </div>
+                            {inv.originalInvoiceId && (
+                              <div className="text-xs text-muted-foreground mt-1">
+                                Ref: #
+                                {inv.originalInvoiceNumber ||
+                                  inv.originalInvoiceId}
+                              </div>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {formatDateTime(inv.issueDate)}
+                        </TableCell>
+                        <TableCell className="font-medium">
+                          {formatCurrency(inv.totalAmountCents, inv.currency)}
+                        </TableCell>
+                        <TableCell>
+                          <Badge className={getStatusBadgeColor(inv.status)}>
+                            {inv.status}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleDownloadInvoice(inv.id)}
+                            disabled={!inv.pdfUrl || pdfLoadingId === inv.id}
+                            aria-disabled={!inv.pdfUrl}
+                          >
+                            {pdfLoadingId === inv.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              "PDF"
+                            )}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="payments" className="mt-6">
+            <div className="space-y-4">
+              <div>
+                <h3 className="font-medium">Payment History</h3>
+                <p className="text-sm text-muted-foreground">
+                  View your recent payment transactions
+                </p>
+              </div>
+
+              {data.payments.length === 0 ? (
+                <div className="text-center py-8">
+                  <div className="text-muted-foreground mb-2">
+                    No payments found
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Your payment history will appear here
+                  </p>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Amount</TableHead>
+                      <TableHead>Date</TableHead>
+                      <TableHead>Status</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.payments.map((p) => (
+                      <TableRow key={p.id}>
+                        <TableCell className="font-medium">
+                          {formatCurrency(p.amountCents, p.currency)}
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {formatDateTime(p.createdAt)}
+                        </TableCell>
+                        <TableCell>
+                          <div>
+                            <Badge className={getStatusBadgeColor(p.status)}>
+                              {p.status}
+                            </Badge>
+                            {p.errorMessage && (
+                              <div className="text-xs text-red-600 mt-1">
+                                {p.errorMessage}
+                              </div>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </div>
+          </TabsContent>
+        </Tabs>
+
+        {addingPm && stripePromise && clientSecret ? (
+          <Elements stripe={stripePromise} options={{ clientSecret }}>
+            <CustomerPortalAddPaymentMethodModal
+              onClose={(reason) => {
+                setAddingPm(false);
+                setClientSecret(null);
+                if (reason === "cancelled") {
+                  setListeningForSetupEvent(false);
+                  setSetupIntentId(null);
+                }
+              }}
+            />
+          </Elements>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function CustomerPortalAddPaymentMethodModal({
+  onClose,
+}: {
+  onClose: (reason: "submitted" | "cancelled") => void;
+}) {
+  const stripe = useStripe();
+  const elements = useElements();
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!stripe || !elements) return;
+    setError(null);
+    setProcessing(true);
+    try {
+      const { error } = await elements.submit();
+      if (error) throw new Error(error.message);
+      const result = await stripe.confirmSetup({
+        elements,
+        redirect: "if_required",
+      });
+      if (result.error) throw new Error(result.error.message);
+      onClose("submitted");
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to confirm payment method");
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <Overlay>
+      <Card className="w-full max-w-md">
+        <CardHeader>
+          <CardTitle>Add payment method</CardTitle>
+          <CardDescription>
+            Your card will be stored for future charges.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={submit} className="space-y-3">
+            <PaymentElement id="payment-element" />
+            {error ? <div className="text-sm text-red-600">{error}</div> : null}
+            <div className="flex gap-2 justify-end">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => onClose("cancelled")}
+                disabled={processing}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={processing}>
+                {processing ? "Processing..." : "Confirm"}
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+    </Overlay>
+  );
+}
+
+export { CustomerPortal as CustomerPortalShadcn };

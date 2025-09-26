@@ -28,6 +28,7 @@ import {
   ExternalLink,
   Timer,
   RefreshCw,
+  HelpCircle,
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -62,7 +63,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { LocaleAwareDate } from "@/components/ui/locale-aware-date";
 import { formatCurrency } from "@lumen/common/utils";
 import { useDateFormatter } from "@/lib/locale-context";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogHeader,
+  DialogFooter,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -81,6 +89,8 @@ interface Subscription {
   versionNumber: number;
   startTimestamp: string;
   endTimestamp: string | null;
+  status: string;
+  gracePeriodEndsAt?: string | null;
   createdAt: string;
   customer: {
     id: string;
@@ -136,6 +146,9 @@ interface Payment {
   errorMessage: string | null;
   refundedAmountCents?: number | null;
   refundStatus?: string | null;
+  // Optional linkage to subscription for filtering
+  subscriptionId?: string;
+  subscriptionStableId?: string;
 }
 
 interface Invoice {
@@ -147,6 +160,16 @@ interface Invoice {
   issueDate: string;
   dueDate: string;
   hasPdf: boolean;
+  // Optional linkage to subscription for filtering
+  subscriptionId?: string;
+  subscription?: { id: string; stableSubscriptionId?: string };
+  // Optional fields for document metadata
+  documentType?: "standard" | "cancellation" | "credit_note" | null;
+  originalInvoiceId?: string | null;
+  originalInvoice?: {
+    id: string;
+    customerInvoiceNumber?: string | null;
+  } | null;
 }
 
 interface CreditGrant {
@@ -158,10 +181,18 @@ interface CreditGrant {
   expiryDate: string | null;
   applicationType: string;
   source: string;
+  // Optional linkage for filtering
+  planId?: string | null;
+  priceId?: string | null;
   creditDefinition: {
     name: string;
     description: string | null;
     scope: string;
+  };
+  // For seat-aware grants
+  customer?: {
+    id: string;
+    externalCustomerId: string | null;
   };
 }
 
@@ -224,6 +255,9 @@ interface FeatureEntitlement {
     creditsRemaining: number;
     nextExpiryDate: Date | null;
   };
+  // For seat-aware entitlements
+  customerId?: string;
+  externalCustomerId?: string | null;
 }
 
 interface TrialInfo {
@@ -384,11 +418,6 @@ const getBillingPeriod = (
 };
 
 // Helper functions
-const getSubscriptionStatus = (
-  subscription: Subscription
-): "active" | "ended" => {
-  return subscription.endTimestamp ? "ended" : "active";
-};
 
 const calculateMRRContribution = (
   subscription: Subscription,
@@ -495,8 +524,15 @@ const getStatusColor = (status: string) => {
     case "succeeded":
     case "paid":
       return "bg-green-100 text-green-800 border-green-200 hover:bg-green-200";
+    case "past_due":
+      return "bg-amber-100 text-amber-800 border-amber-200 hover:bg-amber-200";
+    case "paused":
+      return "bg-yellow-100 text-yellow-800 border-yellow-200 hover:bg-yellow-200";
+    case "unpaid":
+      return "bg-orange-100 text-orange-800 border-orange-200 hover:bg-orange-200";
     case "ended":
     case "cancelled":
+    case "canceled":
       return "bg-gray-100 text-gray-800 border-gray-200 hover:bg-gray-200";
     case "failed":
     case "expired":
@@ -515,6 +551,12 @@ const getStatusIcon = (status: string) => {
     case "succeeded":
     case "paid":
       return <CheckCircle className="w-4 h-4" />;
+    case "paused":
+      return <Clock className="w-4 h-4" />;
+    case "past_due":
+      return <AlertCircle className="w-4 h-4" />;
+    case "unpaid":
+      return <AlertCircle className="w-4 h-4" />;
     case "failed":
     case "expired":
       return <XCircle className="w-4 h-4" />;
@@ -616,6 +658,7 @@ export default function SubscriptionDetailsPage() {
     useState<Payment | null>(null);
   const [isPartialRefund, setIsPartialRefund] = useState(false);
   const [refundAmountInput, setRefundAmountInput] = useState("");
+  const [showExpiredCredits, setShowExpiredCredits] = useState(false);
   // Removed terminate toggle; action chosen via buttons
 
   const deleteSubscriptionMutation = useMutation({
@@ -631,6 +674,100 @@ export default function SubscriptionDetailsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["subscriptions"] });
       router.push("/subscriptions");
+    },
+  });
+
+  const pauseSubscriptionMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiClient.subscriptions[":id"].pause.$post({
+        param: { id: stableSubscriptionId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to pause"
+        );
+      }
+    },
+    onSuccess: () => {
+      toast.success("Subscription paused");
+      queryClient.invalidateQueries({
+        queryKey: ["subscription", stableSubscriptionId],
+      });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to pause");
+    },
+  });
+
+  const resumeSubscriptionMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiClient.subscriptions[":id"].resume.$post({
+        param: { id: stableSubscriptionId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to resume"
+        );
+      }
+    },
+    onSuccess: () => {
+      toast.success("Subscription resumed");
+      queryClient.invalidateQueries({
+        queryKey: ["subscription", stableSubscriptionId],
+      });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to resume");
+    },
+  });
+
+  const reactivateSubscriptionMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiClient.subscriptions[":id"].reactivate.$post({
+        param: { id: stableSubscriptionId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to reactivate"
+        );
+      }
+    },
+    onSuccess: () => {
+      toast.success("Subscription reactivated");
+      queryClient.invalidateQueries({
+        queryKey: ["subscription", stableSubscriptionId],
+      });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to reactivate");
+    },
+  });
+
+  const enforceDunningNowMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiClient.subscriptions[":id"][
+        "enforce-dunning-now"
+      ].$post({
+        param: { id: stableSubscriptionId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to enforce"
+        );
+      }
+    },
+    onSuccess: () => {
+      toast.success("Dunning action enforced");
+      queryClient.invalidateQueries({
+        queryKey: ["subscription", stableSubscriptionId],
+      });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to enforce");
     },
   });
 
@@ -672,6 +809,30 @@ export default function SubscriptionDetailsPage() {
       toast.error(
         err instanceof Error ? err.message : "Failed to issue refund"
       );
+    },
+  });
+
+  const retryInvoicePaymentMutation = useMutation({
+    mutationFn: async (invoiceId: string) => {
+      const response = await apiClient.invoices[":id"]["retry-payment"].$post({
+        param: { id: invoiceId },
+      });
+      const data = await response.json();
+      if (!response.ok || ("error" in data && data.error)) {
+        throw new Error(
+          (data as { error?: string }).error || "Failed to queue retry"
+        );
+      }
+      return data as { success: boolean; attemptNumber?: number };
+    },
+    onSuccess: () => {
+      toast.success("Payment retry queued");
+      queryClient.invalidateQueries({
+        queryKey: ["payments", subscription?.customerId],
+      });
+    },
+    onError: (err: unknown) => {
+      toast.error(err instanceof Error ? err.message : "Failed to queue retry");
     },
   });
 
@@ -732,8 +893,15 @@ export default function SubscriptionDetailsPage() {
         param: { id: stableSubscriptionId },
       });
       const data = await response.json();
-      if ("error" in data) throw new Error(data.error);
-      if (!data.subscription) throw new Error("Subscription not found");
+      if ("error" in data) {
+        console.error("Error fetching subscription:", data.error);
+        // Return null instead of throwing to allow graceful error handling
+        return null;
+      }
+      if (!data.subscription) {
+        console.error("No subscription data received");
+        return null;
+      }
       return data.subscription as unknown as Subscription;
     },
     enabled: !!stableSubscriptionId,
@@ -799,20 +967,48 @@ export default function SubscriptionDetailsPage() {
     enabled: !!subscription?.customerId,
   });
 
-  // Fetch credit grants
+  // Fetch credit grants (seat-aware for seat-based subscriptions)
   const { data: credits } = useQuery({
-    queryKey: ["credits", subscription?.customerId],
+    queryKey: [
+      "credits",
+      subscription?.customerId,
+      subscription?.price?.pricingData?.components?.some(
+        (c) => c.type === "per_unit"
+      )
+        ? "seat-aware"
+        : "regular",
+    ],
     queryFn: async () => {
       if (!subscription?.customerId) return [];
-      const response = await apiClient.credits.customers[
-        ":customerId"
-      ].grants.$get({
-        param: { customerId: subscription.customerId },
-        query: {},
-      });
-      const data = await response.json();
-      if ("error" in data) return [];
-      return (data.grants || []) as CreditGrant[];
+
+      // Check if this is a seat-based subscription
+      const isSeatBasedSubscription =
+        subscription.price?.pricingData?.components?.some(
+          (component) => component.type === "per_unit"
+        );
+
+      // Use seat-aware endpoint for seat-based subscriptions
+      if (isSeatBasedSubscription) {
+        const response = await apiClient.credits.customers[
+          ":customerId"
+        ].grants["seat-aware"].$get({
+          param: { customerId: subscription.customerId },
+          query: {},
+        });
+        const data = await response.json();
+        if ("error" in data) return [];
+        return (data.grants || []) as CreditGrant[];
+      } else {
+        const response = await apiClient.credits.customers[
+          ":customerId"
+        ].grants.$get({
+          param: { customerId: subscription.customerId },
+          query: {},
+        });
+        const data = await response.json();
+        if ("error" in data) return [];
+        return (data.grants || []) as CreditGrant[];
+      }
     },
     enabled: !!subscription?.customerId,
   });
@@ -824,13 +1020,36 @@ export default function SubscriptionDetailsPage() {
     refetch: refetchEvents,
     isRefetching: eventsRefetching,
   } = useQuery({
-    queryKey: ["subscription-events", subscription?.customerId, eventsLimit],
+    queryKey: [
+      "subscription-events",
+      subscription?.customerId,
+      // include ext ID if known below via separate query
+      eventsLimit,
+    ],
     queryFn: async () => {
       if (!subscription?.customerId) return { data: [], hasMore: false };
       try {
+        // Try to fetch externalCustomerId for this customer to support either-id events
+        let externalId: string | null = null;
+        try {
+          const res = await apiClient.customers[":id"].$get({
+            param: { id: subscription.customerId },
+          });
+          const customerData = await res.json();
+          if (!("error" in customerData)) {
+            externalId = customerData.customer?.externalCustomerId || null;
+          }
+        } catch {
+          // ignore and proceed with internal ID only
+        }
+
+        const combinedIds = externalId
+          ? `${subscription.customerId},${externalId}`
+          : subscription.customerId;
+
         const response = await apiClient.events.$get({
           query: {
-            customerId: subscription.customerId,
+            customerId: combinedIds,
             limit: eventsLimit.toString(),
             offset: "0",
           },
@@ -868,22 +1087,52 @@ export default function SubscriptionDetailsPage() {
     }
   }, [activeTab]);
 
-  // Fetch entitlements to get usage-based features and their current usage
+  // Fetch entitlements to get usage-based features and their current usage (seat-aware for seat-based subscriptions)
   const { data: entitlements } = useQuery({
-    queryKey: ["entitlements", subscription?.customerId],
+    queryKey: [
+      "entitlements",
+      subscription?.customerId,
+      subscription?.price?.pricingData?.components?.some(
+        (c) => c.type === "per_unit"
+      )
+        ? "seat-aware"
+        : "regular",
+    ],
     queryFn: async () => {
       if (!subscription?.customerId) return [];
       try {
-        const response = await apiClient.entitlements[":customerId"].$get({
-          param: { customerId: subscription.customerId },
-          query: { isExtCustId: "false" },
-        });
-        const data = await response.json();
-        if ("error" in data) {
-          console.error("Entitlements API error:", data.error);
-          return [];
+        // Check if this is a seat-based subscription
+        const isSeatBasedSubscription =
+          subscription.price?.pricingData?.components?.some(
+            (component) => component.type === "per_unit"
+          );
+
+        // Use seat-aware endpoint for seat-based subscriptions
+        if (isSeatBasedSubscription) {
+          const response = await apiClient.entitlements[":customerId"][
+            "seat-aware"
+          ].$get({
+            param: { customerId: subscription.customerId },
+            query: { isExtCustId: "false" },
+          });
+          const data = await response.json();
+          if ("error" in data) {
+            console.error("Seat-aware entitlements API error:", data.error);
+            return [];
+          }
+          return (data.entitlements || []) as FeatureEntitlement[];
+        } else {
+          const response = await apiClient.entitlements[":customerId"].$get({
+            param: { customerId: subscription.customerId },
+            query: { isExtCustId: "false" },
+          });
+          const data = await response.json();
+          if ("error" in data) {
+            console.error("Entitlements API error:", data.error);
+            return [];
+          }
+          return (data.entitlements || []) as FeatureEntitlement[];
         }
-        return (data.entitlements || []) as FeatureEntitlement[];
       } catch (error) {
         console.error("Failed to fetch entitlements for subscription:", error);
         return [];
@@ -1032,8 +1281,51 @@ export default function SubscriptionDetailsPage() {
       }
       return data.subscriptionDetails as SubscriptionDetail[];
     },
-    enabled: !!stableSubscriptionId,
+    enabled:
+      !!stableSubscriptionId &&
+      !!subscription &&
+      subscription.endTimestamp === null,
   });
+
+  // Filter data to only this subscription
+  const paymentsForSubscription = useMemo(() => {
+    if (!payments) return [] as Payment[];
+    return payments.filter(
+      (p) => p.subscriptionStableId === stableSubscriptionId
+    );
+  }, [payments, stableSubscriptionId]);
+
+  const invoicesForSubscription = useMemo(() => {
+    if (!invoices) return [] as Invoice[];
+    return invoices.filter((inv) => {
+      const stableId = inv.subscription?.stableSubscriptionId;
+      return stableId ? stableId === stableSubscriptionId : false;
+    });
+  }, [invoices, stableSubscriptionId]);
+
+  // Get all credits for the subscription (not filtered by UI toggle)
+  const allCreditsForSubscription = useMemo(() => {
+    if (!credits || !subscription) return [] as CreditGrant[];
+    return credits.filter((g) => {
+      const matchesPlan = g.planId && g.planId === subscription.plan.id;
+      const matchesPrice =
+        g.priceId && g.priceId === subscription.effectivePriceId;
+      return Boolean(matchesPlan || matchesPrice);
+    });
+  }, [credits, subscription]);
+
+  const creditsForSubscription = useMemo(() => {
+    // Filter by status based on showExpiredCredits toggle
+    if (!showExpiredCredits) {
+      return allCreditsForSubscription.filter((g) => g.status === "ACTIVE");
+    }
+
+    return allCreditsForSubscription;
+  }, [allCreditsForSubscription, showExpiredCredits]);
+
+  const activeCredits = useMemo(() => {
+    return allCreditsForSubscription.filter((c) => c.status === "ACTIVE");
+  }, [allCreditsForSubscription]);
 
   // Calculate upcoming billing grouped by date
   const upcomingBilling: UpcomingBilling[] = useMemo(() => {
@@ -1182,6 +1474,59 @@ export default function SubscriptionDetailsPage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [handleNavigateBack]);
 
+  // Helper function to check if subscription is cancelled/ended
+  const isSubscriptionCancelled = (subscription: Subscription): boolean => {
+    return subscription.endTimestamp !== null;
+  };
+
+  // Check if this is a seat-based subscription - calculate safely with fallback
+  const isSeatBasedSubscription =
+    subscription?.price?.pricingData?.components?.some(
+      (component) => component.type === "per_unit"
+    ) ?? false;
+
+  // Filter entitlements to show usage-based features with usage data (including overage scenarios)
+  const usageBasedEntitlements = useMemo(() => {
+    return (
+      entitlements?.filter(
+        (entitlement) =>
+          entitlement.usages &&
+          entitlement.usages.length > 0 &&
+          entitlement.feature &&
+          (typeof entitlement.feature.value === "number" ||
+            entitlement.feature.value === "usage_based") &&
+          entitlement.creditInfo
+        // Removed creditsRemaining > 0 check to show overage scenarios
+      ) || []
+    );
+  }, [entitlements]);
+
+  // Group entitlements by feature for seat-based subscriptions
+  const groupedEntitlements = useMemo(() => {
+    if (!isSeatBasedSubscription) {
+      return usageBasedEntitlements.map((entitlement) => ({
+        feature: entitlement.feature,
+        customers: [entitlement],
+      }));
+    }
+
+    // Group by feature slug for seat-based subscriptions
+    const groups = new Map<string, FeatureEntitlement[]>();
+    usageBasedEntitlements.forEach((entitlement) => {
+      if (entitlement.feature?.slug) {
+        const existing = groups.get(entitlement.feature.slug) || [];
+        existing.push(entitlement);
+        groups.set(entitlement.feature.slug, existing);
+      }
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    return Array.from(groups.entries()).map(([slug, customers]) => ({
+      feature: customers[0].feature, // All should have the same feature info
+      customers,
+    }));
+  }, [usageBasedEntitlements, isSeatBasedSubscription]);
+
   if (subscriptionLoading) {
     return (
       <div className="container mx-auto py-8">
@@ -1205,8 +1550,12 @@ export default function SubscriptionDetailsPage() {
             Subscription Not Found
           </h1>
           <p className="text-gray-600 mt-2">
-            The subscription you&apos;re looking for doesn&apos;t exist or has
-            been deleted.
+            The subscription you&apos;re looking for doesn&apos;t exist, has
+            been cancelled, or has been deleted.
+          </p>
+          <p className="text-sm text-gray-500 mt-1">
+            If this subscription was recently cancelled, it may no longer be
+            accessible.
           </p>
           <Button onClick={handleNavigateBack} className="mt-4">
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -1217,25 +1566,19 @@ export default function SubscriptionDetailsPage() {
     );
   }
 
-  // Check if this is a seat-based subscription
-  const isSeatBasedSubscription =
-    subscription.price?.pricingData?.components?.some(
-      (component) => component.type === "per_unit"
-    );
-
   const isBusinessCustomer = Boolean(
     subscription.customer.taxId || subscription.customer.businessName
   );
 
-  const status = getSubscriptionStatus(subscription);
+  const status = subscription.status;
   const mrrContribution = calculateMRRContribution(
     subscription,
     currentSeatCount
   );
   const priceDisplay = formatPriceDisplay(subscription);
-  const activeCredits = credits?.filter((c) => c.status === "ACTIVE") || [];
-  const recentPayments = payments?.slice(0, 5) || [];
-  const recentInvoices = invoices?.slice(0, 5) || [];
+
+  const recentPayments = paymentsForSubscription.slice(0, 5);
+  const recentInvoices = invoicesForSubscription.slice(0, 5);
 
   // Use trial data from API
   const trialInfo = trialData || { isOnTrial: false };
@@ -1243,19 +1586,6 @@ export default function SubscriptionDetailsPage() {
     trialInfo.daysRemaining !== null && trialInfo.daysRemaining !== undefined
       ? getTrialStatusBadge(trialInfo.daysRemaining)
       : null;
-
-  // Filter entitlements to show only usage-based features with usage data and available credits
-  const usageBasedEntitlements =
-    entitlements?.filter(
-      (entitlement) =>
-        entitlement.usages &&
-        entitlement.usages.length > 0 &&
-        entitlement.feature &&
-        (typeof entitlement.feature.value === "number" ||
-          entitlement.feature.value === "usage_based") &&
-        entitlement.creditInfo &&
-        entitlement.creditInfo.creditsRemaining > 0
-    ) || [];
 
   return (
     <div className="container mx-auto py-8">
@@ -1270,46 +1600,163 @@ export default function SubscriptionDetailsPage() {
               ESC
             </kbd>
           </Button>
+          <div className="flex items-center gap-2">
+            {status === "active" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    onClick={() => pauseSubscriptionMutation.mutate()}
+                    disabled={pauseSubscriptionMutation.isPending}
+                  >
+                    {pauseSubscriptionMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
+                    Pause
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <span className="text-xs">
+                    Pauses billing. No new charges until resumed.
+                  </span>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {status === "paused" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    onClick={() => resumeSubscriptionMutation.mutate()}
+                    disabled={resumeSubscriptionMutation.isPending}
+                  >
+                    {resumeSubscriptionMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
+                    Resume
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <span className="text-xs">
+                    Resumes billing on this subscription.
+                  </span>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {status === "past_due" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    onClick={() => enforceDunningNowMutation.mutate()}
+                    disabled={enforceDunningNowMutation.isPending}
+                  >
+                    {enforceDunningNowMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
+                    Enforce Now
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <span className="text-xs">
+                    Apply your configured end-of-dunning action immediately.
+                  </span>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {status === "unpaid" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    onClick={() => reactivateSubscriptionMutation.mutate()}
+                    disabled={reactivateSubscriptionMutation.isPending}
+                  >
+                    {reactivateSubscriptionMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
+                    Reactivate
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <span className="text-xs">
+                    Moves from unpaid to active. Billing resumes on the next
+                    cycle.
+                  </span>
+                </TooltipContent>
+              </Tooltip>
+            )}
 
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button variant="destructive">
-                <Trash2 className="mr-2 h-4 w-4" />
-                Cancel Subscription
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Cancel Subscription</AlertDialogTitle>
-                <AlertDialogDescription>
-                  This will immediately cancel the subscription and end billing.
-                  The customer will lose access to all features. This action
-                  cannot be undone.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
                 <Button
                   variant="destructive"
-                  onClick={() => deleteSubscriptionMutation.mutate()}
-                  disabled={deleteSubscriptionMutation.isPending}
+                  disabled={isSubscriptionCancelled(subscription)}
                 >
-                  {deleteSubscriptionMutation.isPending ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Cancelling...
-                    </>
-                  ) : (
-                    <>
-                      <Trash2 className="mr-2 h-4 w-4" />
-                      Cancel Subscription
-                    </>
-                  )}
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  {isSubscriptionCancelled(subscription)
+                    ? "Cancelled"
+                    : "Cancel Subscription"}
                 </Button>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Cancel Subscription</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This will immediately cancel the subscription and end
+                    billing. The customer will lose access to all features. This
+                    action cannot be undone.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <Button
+                    variant="destructive"
+                    onClick={() => deleteSubscriptionMutation.mutate()}
+                    disabled={deleteSubscriptionMutation.isPending}
+                  >
+                    {deleteSubscriptionMutation.isPending ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Cancelling...
+                      </>
+                    ) : (
+                      <>
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Cancel Subscription
+                      </>
+                    )}
+                  </Button>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
         </div>
+
+        {/* Cancelled Subscription Banner */}
+        {isSubscriptionCancelled(subscription) && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+            <div className="flex items-start gap-3">
+              <div className="flex-shrink-0 mt-1">
+                <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+              </div>
+              <div className="flex-1">
+                <h3 className="text-sm font-semibold text-red-800">
+                  Subscription Cancelled
+                </h3>
+                <div className="text-sm text-red-700 mt-1">
+                  This subscription was cancelled on{" "}
+                  <LocaleAwareDate
+                    date={subscription.endTimestamp}
+                    fallback="unknown date"
+                    className="font-medium inline"
+                  />
+                  . No further billing will occur.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Title and ID Section */}
         <div>
@@ -1361,6 +1808,66 @@ export default function SubscriptionDetailsPage() {
             <Badge className={getStatusColor(status)}>
               {status.charAt(0).toUpperCase() + status.slice(1)}
             </Badge>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <HelpCircle className="ml-2 h-4 w-4 text-muted-foreground cursor-help inline" />
+              </TooltipTrigger>
+              <TooltipContent className="max-w-xs">
+                <div className="text-xs leading-relaxed">
+                  {status === "active" && (
+                    <>
+                      Billing is active. We will attempt the next charge on the
+                      next billing date.
+                    </>
+                  )}
+                  {status === "trialing" && (
+                    <>On a trial. Billing starts when the trial ends.</>
+                  )}
+                  {status === "past_due" && (
+                    <>
+                      Last charge failed. Within grace
+                      {subscription.gracePeriodEndsAt ? (
+                        <>
+                          {" "}
+                          until{" "}
+                          <LocaleAwareDate
+                            date={subscription.gracePeriodEndsAt}
+                            fallback="grace end"
+                            className="font-medium inline"
+                          />
+                          . We retry automatically; you can also Enforce Now to
+                          apply the configured end-of-dunning action.
+                        </>
+                      ) : (
+                        ". We will retry automatically."
+                      )}
+                    </>
+                  )}
+                  {status === "paused" && (
+                    <>Billing is paused. No new charges until you resume.</>
+                  )}
+                  {status === "unpaid" && (
+                    <>
+                      Marked as unpaid. Billing will not auto-resume even if a
+                      payment succeeds. Use Reactivate to resume billing.
+                    </>
+                  )}
+                  {(status === "canceled" || status === "cancelled") && (
+                    <>Subscription ended. No further billing or access.</>
+                  )}
+                </div>
+              </TooltipContent>
+            </Tooltip>
+            {status === "past_due" && subscription.gracePeriodEndsAt && (
+              <div className="text-xs text-muted-foreground mt-2">
+                Grace ends{" "}
+                <LocaleAwareDate
+                  date={subscription.gracePeriodEndsAt}
+                  fallback="unknown"
+                  className="font-medium inline"
+                />
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -1402,7 +1909,7 @@ export default function SubscriptionDetailsPage() {
           </CardContent>
         </Card>
 
-        {isSeatBasedSubscription ? (
+        {isSeatBasedSubscription && status === "active" ? (
           <Card>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle className="text-sm font-medium">
@@ -1505,7 +2012,7 @@ export default function SubscriptionDetailsPage() {
               </div>
 
               {/* Seat Information Section for Seat-based Subscriptions */}
-              {isSeatBasedSubscription && (
+              {isSeatBasedSubscription && status === "active" && (
                 <div>
                   <p className="text-sm font-medium text-muted-foreground mb-4">
                     Seat Information
@@ -1870,7 +2377,7 @@ export default function SubscriptionDetailsPage() {
                 { id: "invoices", label: "Invoices", icon: DollarSign },
                 { id: "credits", label: "Credits", icon: CreditCard },
                 { id: "usage", label: "Current Usage", icon: TrendingUp },
-                ...(isSeatBasedSubscription
+                ...(isSeatBasedSubscription && status === "active"
                   ? [{ id: "seats", label: "Seats", icon: User }]
                   : []),
                 { id: "events", label: "Events", icon: Activity },
@@ -2194,15 +2701,43 @@ export default function SubscriptionDetailsPage() {
                           {recentInvoices.map((invoice) => (
                             <TableRow key={invoice.id}>
                               <TableCell className="font-medium">
-                                <a
-                                  href={`/invoices/${invoice.id}`}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="flex items-center gap-1 text-blue-600 hover:text-blue-800 hover:underline"
-                                >
-                                  {invoice.customerInvoiceNumber}
-                                  <ExternalLink className="h-3 w-3" />
-                                </a>
+                                <div className="flex flex-col">
+                                  <a
+                                    href={`/invoices/${invoice.id}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="flex items-center gap-1 text-blue-600 hover:text-blue-800 hover:underline"
+                                  >
+                                    {invoice.customerInvoiceNumber}
+                                    <ExternalLink className="h-3 w-3" />
+                                  </a>
+                                  {invoice.documentType &&
+                                    invoice.documentType !== "standard" && (
+                                      <div className="mt-1 flex items-center gap-2">
+                                        <Badge variant="outline">
+                                          {invoice.documentType ===
+                                          "cancellation"
+                                            ? "Cancellation"
+                                            : "Credit Note"}
+                                        </Badge>
+                                        {invoice.originalInvoiceId && (
+                                          <span className="text-xs text-muted-foreground">
+                                            Ref:{" "}
+                                            <a
+                                              href={`/invoices/${invoice.originalInvoiceId}`}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="underline hover:text-foreground"
+                                            >
+                                              {invoice.originalInvoice
+                                                ?.customerInvoiceNumber ||
+                                                invoice.originalInvoiceId}
+                                            </a>
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                </div>
                               </TableCell>
                               <TableCell>
                                 <LocaleAwareDate
@@ -2258,6 +2793,25 @@ export default function SubscriptionDetailsPage() {
                                       PDF
                                     </Button>
                                   )}
+                                  {invoice.status === "issued" && (
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      onClick={() =>
+                                        retryInvoicePaymentMutation.mutate(
+                                          invoice.id
+                                        )
+                                      }
+                                      disabled={
+                                        retryInvoicePaymentMutation.isPending
+                                      }
+                                    >
+                                      {retryInvoicePaymentMutation.isPending ? (
+                                        <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                                      ) : null}
+                                      Retry Payment
+                                    </Button>
+                                  )}
                                 </div>
                               </TableCell>
                             </TableRow>
@@ -2278,13 +2832,29 @@ export default function SubscriptionDetailsPage() {
               <div className="space-y-4">
                 <Card>
                   <CardHeader>
-                    <CardTitle className="flex items-center">
-                      <CreditCard className="mr-2 h-5 w-5" />
-                      Credit Grants
-                    </CardTitle>
+                    <div className="flex items-center justify-between">
+                      <CardTitle className="flex items-center">
+                        <CreditCard className="mr-2 h-5 w-5" />
+                        Credit Grants
+                      </CardTitle>
+                      <div className="flex items-center space-x-2">
+                        <Label
+                          htmlFor="show-expired-credits"
+                          className="text-sm text-muted-foreground"
+                        >
+                          Show expired
+                        </Label>
+                        <Switch
+                          id="show-expired-credits"
+                          checked={showExpiredCredits}
+                          onCheckedChange={setShowExpiredCredits}
+                        />
+                      </div>
+                    </div>
                   </CardHeader>
                   <CardContent>
-                    {credits && credits.length > 0 ? (
+                    {creditsForSubscription &&
+                    creditsForSubscription.length > 0 ? (
                       <div className="rounded-md border">
                         <Table>
                           <TableHeader>
@@ -2292,14 +2862,16 @@ export default function SubscriptionDetailsPage() {
                               <TableHead>Credit</TableHead>
                               <TableHead>Type</TableHead>
                               <TableHead>Status</TableHead>
-                              <TableHead>Remaining</TableHead>
-                              <TableHead>Total</TableHead>
+                              <TableHead>Amount</TableHead>
                               <TableHead>Expires</TableHead>
                               <TableHead>Source</TableHead>
+                              {isSeatBasedSubscription && (
+                                <TableHead>Customer</TableHead>
+                              )}
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {credits.map((grant) => {
+                            {creditsForSubscription.map((grant) => {
                               const statusInfo = formatCreditStatus(
                                 grant.status
                               );
@@ -2338,21 +2910,19 @@ export default function SubscriptionDetailsPage() {
                                     <div className="font-medium">
                                       {grant.applicationType === "monetary"
                                         ? formatCurrencyLocal(
-                                            grant.remainingAmount,
-                                            grant.currency
-                                          )
-                                        : grant.remainingAmount.toLocaleString()}
-                                    </div>
-                                  </TableCell>
-                                  <TableCell>
-                                    <div className="text-muted-foreground">
-                                      {grant.applicationType === "monetary"
-                                        ? formatCurrencyLocal(
                                             grant.initialAmount,
                                             grant.currency
                                           )
                                         : grant.initialAmount.toLocaleString()}
                                     </div>
+                                    {grant.status === "ACTIVE" &&
+                                      grant.remainingAmount !==
+                                        grant.initialAmount && (
+                                        <div className="text-xs text-muted-foreground">
+                                          {grant.remainingAmount.toLocaleString()}{" "}
+                                          remaining
+                                        </div>
+                                      )}
                                   </TableCell>
                                   <TableCell>
                                     <div className="text-sm">
@@ -2374,6 +2944,27 @@ export default function SubscriptionDetailsPage() {
                                       {grant.source.toLowerCase()}
                                     </Badge>
                                   </TableCell>
+                                  {isSeatBasedSubscription && (
+                                    <TableCell>
+                                      {grant.customer?.externalCustomerId ? (
+                                        <Link
+                                          href={`/customers/${grant.customer.id}`}
+                                        >
+                                          <Button
+                                            variant="link"
+                                            className="p-0 h-auto font-mono text-xs text-blue-600 hover:text-blue-800"
+                                          >
+                                            {grant.customer.externalCustomerId}
+                                            <ExternalLink className="h-3 w-3 ml-1" />
+                                          </Button>
+                                        </Link>
+                                      ) : (
+                                        <span className="text-xs text-muted-foreground font-mono">
+                                          {grant.customer?.id || "Unknown"}
+                                        </span>
+                                      )}
+                                    </TableCell>
+                                  )}
                                 </TableRow>
                               );
                             })}
@@ -2401,11 +2992,12 @@ export default function SubscriptionDetailsPage() {
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
-                    {usageBasedEntitlements.length > 0 ? (
+                    {groupedEntitlements.length > 0 ? (
                       <div className="space-y-4">
                         <div className="text-sm text-muted-foreground">
                           Usage for features in this subscription for the
                           current billing period
+                          {isSeatBasedSubscription ? " (per customer)" : ""}
                         </div>
                         <Table>
                           <TableHeader>
@@ -2416,129 +3008,200 @@ export default function SubscriptionDetailsPage() {
                               <TableHead>Usage %</TableHead>
                               <TableHead>Status</TableHead>
                               <TableHead>Credit Expiry</TableHead>
+                              {isSeatBasedSubscription && (
+                                <TableHead>Customer</TableHead>
+                              )}
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {usageBasedEntitlements.map(
-                              (entitlement, index) => {
-                                const totalUsage =
-                                  entitlement.usages?.reduce(
-                                    (sum, usage) => sum + usage.usage,
-                                    0
-                                  ) || 0;
-                                const limit =
-                                  typeof entitlement.feature?.value === "number"
-                                    ? entitlement.feature.value
-                                    : entitlement.creditInfo?.creditAllowance ||
-                                      0;
-                                const usagePercent =
-                                  limit > 0
-                                    ? Math.round((totalUsage / limit) * 100)
-                                    : 0;
-                                const isOverLimit = totalUsage > limit;
+                            {groupedEntitlements.map((group, groupIndex) =>
+                              group.customers.map(
+                                (entitlement, customerIndex) => {
+                                  const totalUsage =
+                                    entitlement.usages?.reduce(
+                                      (sum, usage) => sum + usage.usage,
+                                      0
+                                    ) || 0;
+                                  const limit =
+                                    typeof entitlement.feature?.value ===
+                                    "number"
+                                      ? entitlement.feature.value
+                                      : entitlement.creditInfo
+                                          ?.creditAllowance || 0;
+                                  const usagePercent =
+                                    limit > 0
+                                      ? Math.round((totalUsage / limit) * 100)
+                                      : 0;
+                                  const isOverLimit = totalUsage > limit;
+                                  const overage = Math.max(
+                                    0,
+                                    totalUsage - limit
+                                  );
 
-                                return (
-                                  <TableRow key={index}>
-                                    <TableCell className="font-medium">
-                                      {(() => {
-                                        const slug = entitlement.feature?.slug;
-                                        if (!slug) return "Unknown Feature";
-                                        const name = featureNameMap.get(slug);
-                                        if (name && name !== slug) {
-                                          return `${name} (${slug})`;
-                                        }
-                                        return slug;
-                                      })()}
-                                    </TableCell>
-                                    <TableCell>
-                                      <div className="font-mono text-sm">
-                                        {totalUsage.toLocaleString()}
-                                      </div>
-                                      {entitlement.usages &&
-                                        entitlement.usages.length > 1 && (
-                                          <div className="text-xs text-muted-foreground">
-                                            {entitlement.usages.map(
-                                              (usage, idx) => (
-                                                <div key={idx}>
-                                                  Metric {idx + 1}:{" "}
-                                                  {usage.usage.toLocaleString()}
-                                                </div>
-                                              )
-                                            )}
+                                  return (
+                                    <TableRow
+                                      key={`${groupIndex}-${customerIndex}`}
+                                    >
+                                      <TableCell className="font-medium">
+                                        {(() => {
+                                          const slug =
+                                            entitlement.feature?.slug;
+                                          if (!slug) return "Unknown Feature";
+                                          const name = featureNameMap.get(slug);
+                                          if (name && name !== slug) {
+                                            return `${name} (${slug})`;
+                                          }
+                                          return slug;
+                                        })()}
+                                      </TableCell>
+                                      <TableCell>
+                                        <div className="font-mono text-sm">
+                                          <span
+                                            className={
+                                              isOverLimit
+                                                ? "text-red-600 font-semibold"
+                                                : ""
+                                            }
+                                          >
+                                            {totalUsage.toLocaleString()}
+                                          </span>
+                                        </div>
+                                        {overage > 0 && (
+                                          <div className="text-xs text-red-600 font-medium mt-1">
+                                            +{overage.toLocaleString()} overage
                                           </div>
                                         )}
-                                    </TableCell>
-                                    <TableCell>
-                                      <div className="font-mono text-sm">
-                                        {limit.toLocaleString()}
-                                      </div>
-                                      <div className="text-xs text-muted-foreground">
-                                        {entitlement.source === "credits"
-                                          ? "Credit Allowance"
-                                          : "Plan Limit"}
-                                      </div>
-                                    </TableCell>
-                                    <TableCell>
-                                      <div className="flex items-center gap-2">
-                                        <div className="w-16 h-2 bg-gray-200 rounded-full overflow-hidden">
-                                          <div
-                                            className={`h-full transition-all ${
-                                              usagePercent > 100
-                                                ? "bg-red-500"
-                                                : usagePercent > 80
-                                                  ? "bg-yellow-500"
-                                                  : "bg-green-500"
-                                            }`}
-                                            style={{
-                                              width: `${Math.min(usagePercent, 100)}%`,
-                                            }}
-                                          />
+                                        {entitlement.usages &&
+                                          entitlement.usages.length > 1 && (
+                                            <div className="text-xs text-muted-foreground">
+                                              {entitlement.usages.map(
+                                                (usage, idx) => (
+                                                  <div key={idx}>
+                                                    Metric {idx + 1}:{" "}
+                                                    {usage.usage.toLocaleString()}
+                                                  </div>
+                                                )
+                                              )}
+                                            </div>
+                                          )}
+                                      </TableCell>
+                                      <TableCell>
+                                        <div className="font-mono text-sm">
+                                          {limit.toLocaleString()}
                                         </div>
-                                        <span className="text-sm font-medium">
-                                          {usagePercent}%
-                                        </span>
-                                      </div>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        className={
-                                          isOverLimit
-                                            ? "bg-red-100 text-red-800 border-red-200"
-                                            : entitlement.entitled
-                                              ? "bg-green-100 text-green-800 border-green-200"
-                                              : "bg-gray-100 text-gray-800 border-gray-200"
-                                        }
-                                      >
-                                        {isOverLimit
-                                          ? "Over Limit"
-                                          : entitlement.entitled
-                                            ? "Entitled"
-                                            : "Not Entitled"}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      {entitlement.creditInfo
-                                        ?.nextExpiryDate ? (
-                                        <LocaleAwareDate
-                                          date={
-                                            entitlement.creditInfo
-                                              .nextExpiryDate
+                                        <div className="text-xs text-muted-foreground">
+                                          {entitlement.source === "credits"
+                                            ? "Credit Allowance"
+                                            : "Plan Limit"}
+                                        </div>
+                                        {entitlement.creditInfo
+                                          ?.creditsRemaining === 0 && (
+                                          <div className="text-xs text-amber-600 font-medium mt-1">
+                                            Credits depleted
+                                          </div>
+                                        )}
+                                      </TableCell>
+                                      <TableCell>
+                                        <div className="flex items-center gap-2">
+                                          <div className="w-16 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                            <div
+                                              className={`h-full transition-all ${
+                                                isOverLimit
+                                                  ? "bg-red-500"
+                                                  : usagePercent > 80
+                                                    ? "bg-yellow-500"
+                                                    : "bg-green-500"
+                                              }`}
+                                              style={{
+                                                width: `${Math.min(usagePercent, 100)}%`,
+                                              }}
+                                            />
+                                            {isOverLimit && (
+                                              <div
+                                                className="h-full bg-red-600 bg-opacity-60"
+                                                style={{
+                                                  width: "100%",
+                                                  marginTop: "-8px",
+                                                }}
+                                              />
+                                            )}
+                                          </div>
+                                          <span
+                                            className={`text-sm font-medium ${isOverLimit ? "text-red-600" : ""}`}
+                                          >
+                                            {usagePercent}%
+                                          </span>
+                                        </div>
+                                      </TableCell>
+                                      <TableCell>
+                                        <Badge
+                                          className={
+                                            isOverLimit
+                                              ? "bg-red-100 text-red-800 border-red-200"
+                                              : entitlement.creditInfo
+                                                    ?.creditsRemaining === 0
+                                                ? "bg-amber-100 text-amber-800 border-amber-200"
+                                                : entitlement.entitled
+                                                  ? "bg-green-100 text-green-800 border-green-200"
+                                                  : "bg-gray-100 text-gray-800 border-gray-200"
                                           }
-                                          className="text-sm"
-                                        />
-                                      ) : entitlement.source === "credits" ? (
-                                        <span className="text-sm text-muted-foreground">
-                                          Never
-                                        </span>
-                                      ) : (
-                                        <span className="text-sm text-muted-foreground">
-                                          —
-                                        </span>
+                                        >
+                                          {isOverLimit
+                                            ? `Over Limit (+${overage.toLocaleString()})`
+                                            : entitlement.creditInfo
+                                                  ?.creditsRemaining === 0
+                                              ? "Credits Depleted"
+                                              : entitlement.entitled
+                                                ? "Entitled"
+                                                : "Not Entitled"}
+                                        </Badge>
+                                      </TableCell>
+                                      <TableCell>
+                                        {entitlement.creditInfo
+                                          ?.nextExpiryDate ? (
+                                          <LocaleAwareDate
+                                            date={
+                                              entitlement.creditInfo
+                                                .nextExpiryDate
+                                            }
+                                            className="text-sm"
+                                          />
+                                        ) : entitlement.source === "credits" ? (
+                                          <span className="text-sm text-muted-foreground">
+                                            Never
+                                          </span>
+                                        ) : (
+                                          <span className="text-sm text-muted-foreground">
+                                            —
+                                          </span>
+                                        )}
+                                      </TableCell>
+                                      {isSeatBasedSubscription && (
+                                        <TableCell>
+                                          {entitlement.externalCustomerId ? (
+                                            <Link
+                                              href={`/customers/${entitlement.customerId}`}
+                                            >
+                                              <Button
+                                                variant="link"
+                                                className="p-0 h-auto font-mono text-xs text-blue-600 hover:text-blue-800"
+                                              >
+                                                {entitlement.externalCustomerId}
+                                                <ExternalLink className="h-3 w-3 ml-1" />
+                                              </Button>
+                                            </Link>
+                                          ) : (
+                                            <span className="text-xs text-muted-foreground font-mono">
+                                              {entitlement.customerId ||
+                                                "Unknown"}
+                                            </span>
+                                          )}
+                                        </TableCell>
                                       )}
-                                    </TableCell>
-                                  </TableRow>
-                                );
-                              }
+                                    </TableRow>
+                                  );
+                                }
+                              )
                             )}
                           </TableBody>
                         </Table>
@@ -2546,13 +3209,11 @@ export default function SubscriptionDetailsPage() {
                     ) : (
                       <div className="text-center py-8 text-muted-foreground">
                         <TrendingUp className="h-8 w-8 mx-auto mb-2 opacity-50" />
-                        <p className="mb-2">
-                          No usage-based features with available credits found
-                        </p>
+                        <p className="mb-2">No usage-based features found</p>
                         <div className="text-xs space-y-1">
                           <p>
                             This subscription may only have fixed-price
-                            features, or all usage credits have been depleted.
+                            features, or no usage has been tracked yet.
                           </p>
                         </div>
                       </div>
@@ -2562,197 +3223,203 @@ export default function SubscriptionDetailsPage() {
               </div>
             )}
 
-            {activeTab === "seats" && isSeatBasedSubscription && (
-              <div className="space-y-4">
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center">
-                      <User className="mr-2 h-5 w-5" />
-                      Seat Management
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="space-y-6">
-                      {/* Current Seat Count */}
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
-                        <div className="flex items-center justify-between mb-4">
-                          <div>
-                            <h3 className="text-lg font-semibold text-blue-900">
-                              Current Active Seats
-                            </h3>
-                            <p className="text-sm text-blue-700">
-                              Based on seat events in the current billing period
-                            </p>
-                          </div>
-                          <div className="text-3xl font-bold text-blue-900">
-                            {currentSeatCount}
-                          </div>
-                        </div>
-
-                        {/* Pending Removals Warning */}
-                        {pendingRemovals > 0 && (
-                          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4">
-                            <div className="flex items-center">
-                              <AlertCircle className="h-5 w-5 text-amber-600 mr-2" />
-                              <div>
-                                <h4 className="text-sm font-medium text-amber-800">
-                                  Pending Removals
-                                </h4>
-                                <p className="text-sm text-amber-700">
-                                  {pendingRemovals} seat
-                                  {pendingRemovals > 1 ? "s" : ""} removed in
-                                  current period will take effect in next
-                                  billing cycle
-                                </p>
-                              </div>
+            {activeTab === "seats" &&
+              isSeatBasedSubscription &&
+              status === "active" && (
+                <div className="space-y-4">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center">
+                        <User className="mr-2 h-5 w-5" />
+                        Seat Management
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="space-y-6">
+                        {/* Current Seat Count */}
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
+                          <div className="flex items-center justify-between mb-4">
+                            <div>
+                              <h3 className="text-lg font-semibold text-blue-900">
+                                Current Active Seats
+                              </h3>
+                              <p className="text-sm text-blue-700">
+                                Based on seat events in the current billing
+                                period
+                              </p>
+                            </div>
+                            <div className="text-3xl font-bold text-blue-900">
+                              {currentSeatCount}
                             </div>
                           </div>
-                        )}
 
-                        {/* Pricing Information */}
-                        <div className="border-t border-blue-200 pt-4">
-                          <h4 className="text-sm font-medium text-blue-900 mb-2">
-                            Pricing Information
-                          </h4>
-                          <div className="text-sm text-blue-700">
-                            {subscription.price?.pricingData?.components
-                              ?.filter((c) => c.type === "per_unit")
-                              .map((component, index) => (
-                                <div key={index} className="mb-1">
-                                  {formatCurrency(
-                                    component.amount_cents ||
-                                      component.unit_cost_cents ||
-                                      0,
-                                    subscription.price?.currency || "USD"
-                                  )}{" "}
-                                  per {component.unit_label || "unit"}{" "}
-                                  {formatRecurrence(component.recurrence_rule)}
+                          {/* Pending Removals Warning */}
+                          {pendingRemovals > 0 && (
+                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4">
+                              <div className="flex items-center">
+                                <AlertCircle className="h-5 w-5 text-amber-600 mr-2" />
+                                <div>
+                                  <h4 className="text-sm font-medium text-amber-800">
+                                    Pending Removals
+                                  </h4>
+                                  <p className="text-sm text-amber-700">
+                                    {pendingRemovals} seat
+                                    {pendingRemovals > 1 ? "s" : ""} removed in
+                                    current period will take effect in next
+                                    billing cycle
+                                  </p>
                                 </div>
-                              ))}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Next Billing Estimate */}
-                      <div className="bg-green-50 border border-green-200 rounded-lg p-6">
-                        <div className="flex items-center justify-between mb-4">
-                          <div>
-                            <h3 className="text-lg font-semibold text-green-900">
-                              Next Billing Estimate
-                            </h3>
-                            <p className="text-sm text-green-700">
-                              Estimated amount for next billing cycle
-                            </p>
-                          </div>
-                          <div className="text-3xl font-bold text-green-900">
-                            {formatCurrency(
-                              nextBillingAmount,
-                              subscription.price?.currency || "USD"
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="border-t border-green-200 pt-4">
-                          <div className="text-sm text-green-700">
-                            <div className="flex justify-between items-center mb-2">
-                              <span>Seats to be billed:</span>
-                              <span className="font-medium">
-                                {currentSeatCount}
-                              </span>
+                              </div>
                             </div>
-                            {pendingRemovals > 0 && (
-                              <div className="flex justify-between items-center mb-2 text-amber-700">
-                                <span>
-                                  Removals (take effect after billing):
-                                </span>
+                          )}
+
+                          {/* Pricing Information */}
+                          <div className="border-t border-blue-200 pt-4">
+                            <h4 className="text-sm font-medium text-blue-900 mb-2">
+                              Pricing Information
+                            </h4>
+                            <div className="text-sm text-blue-700">
+                              {subscription.price?.pricingData?.components
+                                ?.filter((c) => c.type === "per_unit")
+                                .map((component, index) => (
+                                  <div key={index} className="mb-1">
+                                    {formatCurrency(
+                                      component.amount_cents ||
+                                        component.unit_cost_cents ||
+                                        0,
+                                      subscription.price?.currency || "USD"
+                                    )}{" "}
+                                    per {component.unit_label || "unit"}{" "}
+                                    {formatRecurrence(
+                                      component.recurrence_rule
+                                    )}
+                                  </div>
+                                ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Next Billing Estimate */}
+                        <div className="bg-green-50 border border-green-200 rounded-lg p-6">
+                          <div className="flex items-center justify-between mb-4">
+                            <div>
+                              <h3 className="text-lg font-semibold text-green-900">
+                                Next Billing Estimate
+                              </h3>
+                              <p className="text-sm text-green-700">
+                                Estimated amount for next billing cycle
+                              </p>
+                            </div>
+                            <div className="text-3xl font-bold text-green-900">
+                              {formatCurrency(
+                                nextBillingAmount,
+                                subscription.price?.currency || "USD"
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="border-t border-green-200 pt-4">
+                            <div className="text-sm text-green-700">
+                              <div className="flex justify-between items-center mb-2">
+                                <span>Seats to be billed:</span>
                                 <span className="font-medium">
-                                  -{pendingRemovals}
+                                  {currentSeatCount}
                                 </span>
                               </div>
-                            )}
-                            <div className="flex justify-between items-center font-medium border-t border-green-200 pt-2">
-                              <span>Seats after next billing:</span>
-                              <span>
-                                {Math.max(
-                                  0,
-                                  currentSeatCount - pendingRemovals
-                                )}
-                              </span>
+                              {pendingRemovals > 0 && (
+                                <div className="flex justify-between items-center mb-2 text-amber-700">
+                                  <span>
+                                    Removals (take effect after billing):
+                                  </span>
+                                  <span className="font-medium">
+                                    -{pendingRemovals}
+                                  </span>
+                                </div>
+                              )}
+                              <div className="flex justify-between items-center font-medium border-t border-green-200 pt-2">
+                                <span>Seats after next billing:</span>
+                                <span>
+                                  {Math.max(
+                                    0,
+                                    currentSeatCount - pendingRemovals
+                                  )}
+                                </span>
+                              </div>
                             </div>
                           </div>
                         </div>
-                      </div>
 
-                      {/* Recent Seat Events */}
-                      <div>
-                        <h3 className="text-lg font-semibold mb-4">
-                          Recent Seat Events
-                        </h3>
-                        {subscriptionEvents.filter(
-                          (e) =>
-                            e.eventName === "seat_added" ||
-                            e.eventName === "seat_removed"
-                        ).length > 0 ? (
-                          <Table>
-                            <TableHeader>
-                              <TableRow>
-                                <TableHead>Event</TableHead>
-                                <TableHead>User ID</TableHead>
-                                <TableHead>Date & Time</TableHead>
-                                <TableHead>Properties</TableHead>
-                              </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                              {subscriptionEvents
-                                .filter(
-                                  (e) =>
-                                    e.eventName === "seat_added" ||
-                                    e.eventName === "seat_removed"
-                                )
-                                .slice(0, 10)
-                                .map((event, index) => (
-                                  <TableRow key={index}>
-                                    <TableCell>
-                                      <Badge
-                                        className={
-                                          event.eventName === "seat_added"
-                                            ? "bg-green-100 text-green-800 border-green-200"
-                                            : "bg-red-100 text-red-800 border-red-200"
-                                        }
-                                      >
-                                        {event.eventName === "seat_added"
-                                          ? "Added"
-                                          : "Removed"}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {event.eventString || "Unknown"}
-                                    </TableCell>
-                                    <TableCell>
-                                      <div className="text-sm">
-                                        <LocaleAwareDate
-                                          date={event.eventTimestamp}
-                                          className="block"
-                                        />
-                                        <span className="text-xs text-muted-foreground">
-                                          {new Date(
-                                            event.eventTimestamp
-                                          ).toLocaleTimeString("en-US", {
-                                            hour: "2-digit",
-                                            minute: "2-digit",
-                                            hour12: true,
-                                          })}
-                                        </span>
-                                      </div>
-                                    </TableCell>
-                                    <TableCell>
-                                      {event.properties &&
-                                      typeof event.properties === "object" &&
-                                      Object.keys(event.properties).length >
-                                        0 ? (
-                                        <div className="text-xs">
-                                          {Object.entries(event.properties).map(
-                                            ([key, value]) => (
+                        {/* Recent Seat Events */}
+                        <div>
+                          <h3 className="text-lg font-semibold mb-4">
+                            Recent Seat Events
+                          </h3>
+                          {subscriptionEvents.filter(
+                            (e) =>
+                              e.eventName === "seat_added" ||
+                              e.eventName === "seat_removed"
+                          ).length > 0 ? (
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead>Event</TableHead>
+                                  <TableHead>User ID</TableHead>
+                                  <TableHead>Date & Time</TableHead>
+                                  <TableHead>Properties</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {subscriptionEvents
+                                  .filter(
+                                    (e) =>
+                                      e.eventName === "seat_added" ||
+                                      e.eventName === "seat_removed"
+                                  )
+                                  .slice(0, 10)
+                                  .map((event, index) => (
+                                    <TableRow key={index}>
+                                      <TableCell>
+                                        <Badge
+                                          className={
+                                            event.eventName === "seat_added"
+                                              ? "bg-green-100 text-green-800 border-green-200"
+                                              : "bg-red-100 text-red-800 border-red-200"
+                                          }
+                                        >
+                                          {event.eventName === "seat_added"
+                                            ? "Added"
+                                            : "Removed"}
+                                        </Badge>
+                                      </TableCell>
+                                      <TableCell className="font-mono text-sm">
+                                        {event.eventString || "Unknown"}
+                                      </TableCell>
+                                      <TableCell>
+                                        <div className="text-sm">
+                                          <LocaleAwareDate
+                                            date={event.eventTimestamp}
+                                            className="block"
+                                          />
+                                          <span className="text-xs text-muted-foreground">
+                                            {new Date(
+                                              event.eventTimestamp
+                                            ).toLocaleTimeString("en-US", {
+                                              hour: "2-digit",
+                                              minute: "2-digit",
+                                              hour12: true,
+                                            })}
+                                          </span>
+                                        </div>
+                                      </TableCell>
+                                      <TableCell>
+                                        {event.properties &&
+                                        typeof event.properties === "object" &&
+                                        Object.keys(event.properties).length >
+                                          0 ? (
+                                          <div className="text-xs">
+                                            {Object.entries(
+                                              event.properties
+                                            ).map(([key, value]) => (
                                               <div key={key} className="mb-1">
                                                 <span className="font-medium text-muted-foreground">
                                                   {key}:
@@ -2763,35 +3430,37 @@ export default function SubscriptionDetailsPage() {
                                                     : JSON.stringify(value)}
                                                 </code>
                                               </div>
-                                            )
-                                          )}
-                                        </div>
-                                      ) : event.properties ? (
-                                        <code className="text-xs bg-muted px-2 py-1 rounded">
-                                          {typeof event.properties === "string"
-                                            ? event.properties
-                                            : JSON.stringify(event.properties)}
-                                        </code>
-                                      ) : (
-                                        "—"
-                                      )}
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                            </TableBody>
-                          </Table>
-                        ) : (
-                          <div className="text-center py-8 text-muted-foreground">
-                            <User className="h-8 w-8 mx-auto mb-2 opacity-50" />
-                            <p>No seat events found for this subscription</p>
-                          </div>
-                        )}
+                                            ))}
+                                          </div>
+                                        ) : event.properties ? (
+                                          <code className="text-xs bg-muted px-2 py-1 rounded">
+                                            {typeof event.properties ===
+                                            "string"
+                                              ? event.properties
+                                              : JSON.stringify(
+                                                  event.properties
+                                                )}
+                                          </code>
+                                        ) : (
+                                          "—"
+                                        )}
+                                      </TableCell>
+                                    </TableRow>
+                                  ))}
+                              </TableBody>
+                            </Table>
+                          ) : (
+                            <div className="text-center py-8 text-muted-foreground">
+                              <User className="h-8 w-8 mx-auto mb-2 opacity-50" />
+                              <p>No seat events found for this subscription</p>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              </div>
-            )}
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
 
             {activeTab === "events" && (
               <Card>
@@ -2867,12 +3536,9 @@ export default function SubscriptionDetailsPage() {
                                 </TableCell>
                                 <TableCell>
                                   <div className="font-medium">
-                                    {event.eventValue ?? "—"}
-                                    {event.eventString && (
-                                      <div className="text-xs text-muted-foreground mt-1">
-                                        &ldquo;{event.eventString}&rdquo;
-                                      </div>
-                                    )}
+                                    {event.eventValue ??
+                                      event.eventString ??
+                                      "—"}
                                   </div>
                                 </TableCell>
                                 <TableCell>
@@ -3026,18 +3692,20 @@ export default function SubscriptionDetailsPage() {
 
       {/* Refund Modal */}
       <Dialog open={refundModalOpen} onOpenChange={setRefundModalOpen}>
-        <DialogContent className="max-w-3xl">
-          <DialogTitle>Issue Refund</DialogTitle>
-          <div className="space-y-4">
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Issue Refund</DialogTitle>
             {refundTargetPayment && (
-              <div className="text-sm text-muted-foreground">
+              <DialogDescription>
                 Total paid:{" "}
                 {formatCurrency(
                   refundTargetPayment.amountCents,
                   refundTargetPayment.currency
                 )}
-              </div>
+              </DialogDescription>
             )}
+          </DialogHeader>
+          <div className="space-y-4">
             <div className="flex items-center justify-between">
               <Label htmlFor="partial-refund">Partial refund</Label>
               <Switch
@@ -3078,99 +3746,88 @@ export default function SubscriptionDetailsPage() {
                   )}
               </div>
             )}
-            {/* Show different buttons based on subscription status */}
+          </div>
+          <DialogFooter className="mt-2">
             {status === "active" ? (
-              // Active subscription: show all three buttons (Cancel, Refund & keep active, Refund & terminate)
-              <div className="grid gap-4 sm:grid-cols-2 pt-4">
-                <Button
-                  variant="outline"
-                  className="w-full px-6 py-3"
-                  onClick={() => setRefundModalOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  variant="outline"
-                  className="w-full px-6 py-3"
-                  onClick={() => {
-                    if (!refundTargetPayment) return;
-                    const payloadAmount = isPartialRefund
-                      ? refundAmountInput === ""
-                        ? undefined
-                        : parseStringToCents(refundAmountInput)
-                      : undefined;
-                    if (
-                      isPartialRefund &&
-                      (refundAmountInput === "" ||
-                        parseStringToCents(refundAmountInput) <= 0 ||
-                        parseStringToCents(refundAmountInput) >
-                          refundTargetPayment.amountCents)
-                    ) {
-                      toast.error(
-                        "Enter a valid refund amount less than total"
-                      );
-                      return;
-                    }
-                    refundPaymentMutation.mutate({
-                      paymentId: refundTargetPayment.id,
-                      amountCents: payloadAmount,
-                      terminate: false,
-                    });
-                  }}
-                  disabled={refundPaymentMutation.isPending}
-                >
-                  {refundPaymentMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                  ) : null}
-                  Refund & keep subscription active
-                </Button>
-                <Button
-                  onClick={() => {
-                    if (!refundTargetPayment) return;
-                    const payloadAmount = isPartialRefund
-                      ? refundAmountInput === ""
-                        ? undefined
-                        : parseStringToCents(refundAmountInput)
-                      : undefined;
-                    if (
-                      isPartialRefund &&
-                      (refundAmountInput === "" ||
-                        parseStringToCents(refundAmountInput) <= 0 ||
-                        parseStringToCents(refundAmountInput) >
-                          refundTargetPayment.amountCents)
-                    ) {
-                      toast.error(
-                        "Enter a valid refund amount less than total"
-                      );
-                      return;
-                    }
-                    refundPaymentMutation.mutate({
-                      paymentId: refundTargetPayment.id,
-                      amountCents: payloadAmount,
-                      terminate: true,
-                    });
-                  }}
-                  disabled={refundPaymentMutation.isPending}
-                  className="w-full sm:col-span-2 px-6 py-3"
-                >
-                  {refundPaymentMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                  ) : null}
-                  Refund & terminate subscription
-                </Button>
+              <div className="flex w-full flex-col gap-2">
+                <div className="flex w-full">
+                  <Button
+                    className="w-full"
+                    onClick={() => {
+                      if (!refundTargetPayment) return;
+                      const payloadAmount = isPartialRefund
+                        ? refundAmountInput === ""
+                          ? undefined
+                          : parseStringToCents(refundAmountInput)
+                        : undefined;
+                      if (
+                        isPartialRefund &&
+                        (refundAmountInput === "" ||
+                          parseStringToCents(refundAmountInput) <= 0 ||
+                          parseStringToCents(refundAmountInput) >
+                            refundTargetPayment.amountCents)
+                      ) {
+                        toast.error(
+                          "Enter a valid refund amount less than total"
+                        );
+                        return;
+                      }
+                      refundPaymentMutation.mutate({
+                        paymentId: refundTargetPayment.id,
+                        amountCents: payloadAmount,
+                        terminate: false,
+                      });
+                    }}
+                    disabled={refundPaymentMutation.isPending}
+                  >
+                    {refundPaymentMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                    ) : null}
+                    Refund & keep subscription active
+                  </Button>
+                </div>
+                <div className="flex w-full">
+                  <Button
+                    className="w-full"
+                    variant="destructive"
+                    onClick={() => {
+                      if (!refundTargetPayment) return;
+                      const payloadAmount = isPartialRefund
+                        ? refundAmountInput === ""
+                          ? undefined
+                          : parseStringToCents(refundAmountInput)
+                        : undefined;
+                      if (
+                        isPartialRefund &&
+                        (refundAmountInput === "" ||
+                          parseStringToCents(refundAmountInput) <= 0 ||
+                          parseStringToCents(refundAmountInput) >
+                            refundTargetPayment.amountCents)
+                      ) {
+                        toast.error(
+                          "Enter a valid refund amount less than total"
+                        );
+                        return;
+                      }
+                      refundPaymentMutation.mutate({
+                        paymentId: refundTargetPayment.id,
+                        amountCents: payloadAmount,
+                        terminate: true,
+                      });
+                    }}
+                    disabled={refundPaymentMutation.isPending}
+                  >
+                    {refundPaymentMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                    ) : null}
+                    Refund & terminate subscription
+                  </Button>
+                </div>
               </div>
             ) : (
-              // Inactive subscription: show only Cancel and Refund buttons (no terminate option)
-              <div className="grid gap-4 sm:grid-cols-2 pt-4">
+              <div className="flex w-full">
                 <Button
-                  variant="outline"
-                  className="w-full px-6 py-3"
-                  onClick={() => setRefundModalOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  className="w-full px-6 py-3"
+                  className="w-full"
                   onClick={() => {
                     if (!refundTargetPayment) return;
                     const payloadAmount = isPartialRefund
@@ -3205,7 +3862,7 @@ export default function SubscriptionDetailsPage() {
                 </Button>
               </div>
             )}
-          </div>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

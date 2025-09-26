@@ -83,6 +83,12 @@ type Invoice = z.infer<typeof invoiceSelectSchemaAPI> & {
     currency: string;
   }>;
   hasPdf?: boolean;
+  documentType?: "standard" | "cancellation" | "credit_note" | null;
+  originalInvoiceId?: string | null;
+  originalInvoice?: {
+    id: string;
+    customerInvoiceNumber?: string | null;
+  } | null;
 };
 
 // Response type for PDF download
@@ -371,11 +377,36 @@ export default function InvoicesPage() {
             <ArrowUpDown className="ml-2 h-4 w-4" />
           </div>
         ),
-        cell: ({ row }) => (
-          <div className="font-medium">
-            {row.getValue("customerInvoiceNumber") || "—"}
-          </div>
-        ),
+        cell: ({ row }) => {
+          const inv = row.original;
+          const number = row.getValue("customerInvoiceNumber") as string | null;
+          const label =
+            inv.documentType === "cancellation"
+              ? "Cancellation"
+              : inv.documentType === "credit_note"
+                ? "Credit Note"
+                : null;
+          const refNumber = inv.originalInvoice?.customerInvoiceNumber;
+          return (
+            <div className="font-medium">
+              <div className="flex items-center gap-2">
+                <span>{number || "—"}</span>
+                {label && <Badge variant="outline">{label}</Badge>}
+              </div>
+              {label && inv.originalInvoiceId && (
+                <div className="text-xs text-muted-foreground mt-1">
+                  Ref:{" "}
+                  <Link
+                    href={`/invoices/${inv.originalInvoiceId}`}
+                    className="underline hover:text-foreground"
+                  >
+                    {refNumber || inv.originalInvoiceId}
+                  </Link>
+                </div>
+              )}
+            </div>
+          );
+        },
         size: 120,
         minSize: 100,
       },

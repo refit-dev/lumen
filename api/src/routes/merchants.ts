@@ -5,6 +5,7 @@ import {
   merchantsInsertSchema,
   merchantTaxConfig,
   plans,
+  dunningConfigs,
 } from "@lumen/common/schema";
 import { ID_PREFIXES, createPrefixValidator } from "@lumen/common";
 import { z } from "zod";
@@ -13,9 +14,14 @@ import { eq, and, isNull } from "drizzle-orm";
 import { createApiKey } from "../helpers/api_keys";
 import Stripe from "stripe";
 import { getPaymentProvider } from "../helpers/paymentprovider";
+import { isProdOrStaging } from "../helpers";
+import { createNotificationProvider } from "../helpers/notificationProvider";
+import { auth } from "../auth";
 
 const merchantsInsertSchemaAPIKey = merchantsInsertSchema.omit({
   id: true,
+  organizationId: true,
+  userId: true,
 });
 
 const merchantsUpdateSchema = merchantsInsertSchema
@@ -117,7 +123,12 @@ const merchantsRouter = new Hono()
   })
   .post(
     "/onboarding-create-merchant",
-    zValidator("json", merchantsInsertSchemaAPIKey),
+    zValidator(
+      "json",
+      merchantsInsertSchemaAPIKey.extend({
+        isDemo: z.boolean().default(false),
+      })
+    ),
     async (c) => {
       try {
         // Merchant cannot be created via API keys
@@ -138,9 +149,60 @@ const merchantsRouter = new Hono()
         }
         // Get validated data
         const data = c.req.valid("json");
+        const orgs = await auth.api.listOrganizations({
+          headers: c.req.raw.headers,
+        });
+        if (orgs.length > 0) {
+          return c.json({ error: "User already has an organization" }, 400);
+        }
+        const orgData = await auth.api.createOrganization({
+          body: {
+            name: data.legalName,
+            slug:
+              data.legalName
+                .replace(/[^a-zA-Z0-9]/g, "") // remove special characters
+                .split(" ")
+                .join("-") +
+              "-" +
+              Date.now(),
+            userId: c.get("user")!.id,
+            keepCurrentActiveOrganization: false,
+          },
+          headers: c.req.raw.headers,
+        });
+
+        if (!orgData) {
+          return c.json({ error: "Failed to create organization" }, 500);
+        }
 
         // Create merchant
-        const [merchant] = await db.insert(merchants).values(data).returning();
+        const [merchant] = await db
+          .insert(merchants)
+          .values({
+            ...data,
+            organizationId: orgData.id,
+            userId: c.get("user")!.id,
+          })
+          .returning();
+
+        // Create default dunning config (merchant-level) if not present
+        try {
+          await db
+            .insert(dunningConfigs)
+            .values({
+              merchantId: merchant.id,
+              planId: null,
+              gracePeriodDays: 7,
+              retrySchedule: [1, 3, 7],
+              endOfDunningAction: "pause_subscription",
+            })
+            .onConflictDoNothing();
+        } catch (e) {
+          console.warn(
+            "Failed to create default dunning config during onboarding:",
+            e
+          );
+        }
 
         // Create a publishable API key for the merchant
         try {
@@ -155,7 +217,20 @@ const merchantsRouter = new Hono()
           // Continue with the response as the merchant was created successfully
         }
 
-        // Return with specific status code for RPC type inference
+        if (isProdOrStaging) {
+          // call without await so it runs in the background and doesn't block the response
+          const notificationProvider = createNotificationProvider();
+          if (data.isDemo) {
+            notificationProvider.sendSlack({
+              text: `DEMO CTA onboarding: ${c.get("user")?.name} (${c.get("user")?.email})`,
+            });
+          } else {
+            notificationProvider.sendSlack({
+              text: `🎉 User ${c.get("user")?.name} (${c.get("user")?.email}) successfully completed merchant onboarding!`,
+            });
+          }
+        }
+
         return c.json(merchant, 201);
       } catch (error) {
         console.error("Error creating merchant:", error);
@@ -169,6 +244,118 @@ const merchantsRouter = new Hono()
           return c.json({ error: formattedErrors }, 400);
         }
 
+        return c.json({ error: "Internal server error" }, 500);
+      }
+    }
+  )
+  .get("/dunning-config", async (c) => {
+    try {
+      const merchantId = c.get("merchant")?.id;
+
+      if (!merchantId) {
+        return c.json(
+          { error: "No merchant associated with this account" },
+          404
+        );
+      }
+
+      let config = await db.query.dunningConfigs.findFirst({
+        where: (dunningConfigs, { and, eq, isNull }) =>
+          and(
+            eq(dunningConfigs.merchantId, merchantId),
+            isNull(dunningConfigs.planId),
+            isNull(dunningConfigs.deletedAt)
+          ),
+      });
+
+      if (!config) {
+        const created = await db
+          .insert(dunningConfigs)
+          .values({
+            merchantId,
+            planId: null,
+            gracePeriodDays: 7,
+            retrySchedule: [1, 3, 7],
+            endOfDunningAction: "pause_subscription",
+          })
+          .returning();
+        config = created[0];
+      }
+
+      return c.json({ config }, 200);
+    } catch (error) {
+      console.error("Error fetching dunning config:", error);
+      return c.json({ error: "Internal server error" }, 500);
+    }
+  })
+  .post(
+    "/dunning-config",
+    zValidator(
+      "json",
+      z.object({
+        gracePeriodDays: z.number().int().min(0).max(365),
+        endOfDunningAction: z.enum([
+          "pause_subscription",
+          "cancel_subscription",
+          "mark_as_unpaid",
+        ]),
+        retrySchedule: z.array(z.number().int().min(1)).optional(),
+      })
+    ),
+    async (c) => {
+      try {
+        const merchantId = c.get("merchant")?.id;
+        if (!merchantId) {
+          return c.json(
+            { error: "No merchant associated with this account" },
+            404
+          );
+        }
+
+        const { gracePeriodDays, endOfDunningAction, retrySchedule } =
+          c.req.valid("json");
+
+        const existing = await db.query.dunningConfigs.findFirst({
+          where: (dunningConfigs, { and, eq, isNull }) =>
+            and(
+              eq(dunningConfigs.merchantId, merchantId),
+              isNull(dunningConfigs.planId),
+              isNull(dunningConfigs.deletedAt)
+            ),
+        });
+
+        if (existing) {
+          const [updated] = await db
+            .update(dunningConfigs)
+            .set({
+              gracePeriodDays,
+              endOfDunningAction,
+              retrySchedule: retrySchedule ?? existing.retrySchedule,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(dunningConfigs.id, existing.id),
+                isNull(dunningConfigs.deletedAt)
+              )
+            )
+            .returning();
+          return c.json({ config: updated }, 200);
+        }
+
+        const [created] = await db
+          .insert(dunningConfigs)
+          .values({
+            merchantId,
+            planId: null,
+            gracePeriodDays,
+            endOfDunningAction,
+            retrySchedule: retrySchedule ?? [1, 3, 7],
+          })
+          .returning();
+        return c.json({ config: created }, 201);
+      } catch (error) {
+        console.error("Error updating dunning config:", error);
         return c.json({ error: "Internal server error" }, 500);
       }
     }

@@ -55,8 +55,9 @@ export const LumenPlugin = (options: FreeSubscriptionOptions) => {
         {
           matcher: (context) => {
             return (
-              context.path.includes("sign-in/email") ||
-              context.path.includes("callback")
+              context.path.includes("sign-in/email") || // dev mode when DEV_SKIP_EMAIL_CHECK is true (default)
+              context.path.includes("callback") || // google auth
+              context.path.includes("verify-email") // necessary for prod/staging where we send verification emails (newSession will be null when hitting /sign-in/email)
             );
           },
           handler: createAuthMiddleware(async (ctx) => {
@@ -66,51 +67,44 @@ export const LumenPlugin = (options: FreeSubscriptionOptions) => {
 
             // If prodOnly is true, only run in production/staging
             if (prodOnly && process.env.NODE_ENV === "development") {
-              logger("Skipping free subscription creation in development mode");
+              logger("Skipping subscription enrollment in development mode");
               return;
             }
 
             const newSession = ctx.context.newSession;
 
             if (!newSession) {
-              logger(
-                "No new session found, skipping free subscription creation"
-              );
+              logger("No new session; skipping subscription enrollment");
               return;
             }
 
             if (!apiKey) {
-              logger(
-                "No API key provided, skipping free subscription creation"
-              );
+              logger("No API key provided; skipping subscription enrollment");
               return;
             }
 
             try {
               logger(
-                "Creating free subscription for user:",
+                "Enrolling user into plan (if eligible):",
                 newSession.user.email
               );
 
-              const response = await fetch(
-                `${apiUrl}/v1/subscriptions/create-free-subscription`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${apiKey}`,
-                  },
-                  body: JSON.stringify({
-                    customerEmail: newSession.user.email,
-                    customerName: newSession.user.name,
-                    userId: newSession.user.id,
-                  }),
-                }
-              );
+              const response = await fetch(`${apiUrl}/v1/enrollment/enroll`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${apiKey}`,
+                },
+                body: JSON.stringify({
+                  customerEmail: newSession.user.email,
+                  customerName: newSession.user.name,
+                  userId: newSession.user.id,
+                }),
+              });
 
               if (!response.ok) {
                 const responseBody = await response.json();
-                logger("Failed to create free subscription:", responseBody);
+                logger("Subscription enrollment failed:", responseBody);
 
                 if (onError) {
                   onError(newSession.user, responseBody);
@@ -118,7 +112,7 @@ export const LumenPlugin = (options: FreeSubscriptionOptions) => {
               } else {
                 const subscriptionData = await response.json();
                 logger(
-                  "Successfully created free subscription for user:",
+                  "Subscription enrollment succeeded for:",
                   newSession.user.email
                 );
 
@@ -127,7 +121,7 @@ export const LumenPlugin = (options: FreeSubscriptionOptions) => {
                 }
               }
             } catch (error) {
-              logger("Error creating free subscription:", error);
+              logger("Error during subscription enrollment:", error);
 
               if (onError) {
                 onError(newSession.user, error);

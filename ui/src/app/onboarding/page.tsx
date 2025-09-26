@@ -16,13 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { Check, Loader2 } from "lucide-react";
-import {
-  organization,
-  useActiveOrganization,
-  useSession,
-  useListOrganizations,
-  signOut,
-} from "@/lib/auth-client";
+import { useSession, signOut } from "@/lib/auth-client";
 import { apiClient } from "@/lib/hono-client";
 import { useRouter } from "next/navigation";
 import { useAppForm } from "@/hooks/form";
@@ -35,6 +29,20 @@ import {
   getCurrenciesForProvider,
   formatCurrencyOption,
 } from "@/lib/currencies";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { HelpCircle, Info } from "lucide-react";
 
 interface MerchantData {
   legalName: string;
@@ -100,10 +108,6 @@ interface CreateApiKeyPayload {
   environment: "live" | "test";
 }
 
-const removeSpecialChars = (str: string) => {
-  return str.replace(/[^a-zA-Z0-9]/g, "");
-};
-
 export default function OnboardingPage() {
   const [secretKey, setSecretKey] = useState("");
   const [publicKey, setPublicKey] = useState("");
@@ -118,10 +122,12 @@ export default function OnboardingPage() {
   // Add payment provider state
   const [selectedProvider, setSelectedProvider] =
     useState<PaymentProvider>(null);
-  const activeOrganization = useActiveOrganization();
+  const [dunningGraceDays, setDunningGraceDays] = useState<number>(7);
+  const [dunningAction, setDunningAction] = useState<
+    "pause_subscription" | "mark_as_unpaid" | "cancel_subscription"
+  >("pause_subscription");
   // BUG: useSession & React 19, session not reactive http://github.com/better-auth/better-auth/issues/1006
   const { data: session, refetch, isPending } = useSession();
-  const { data: organizations } = useListOrganizations();
   const router = useRouter();
   const [stripeMerchantData, setStripeMerchantData] = useState<MerchantData>();
   const [onboardingChecked, setOnboardingChecked] = useState(false);
@@ -221,12 +227,6 @@ export default function OnboardingPage() {
       router.replace("/login");
     }
   }, [isPending, onboardingChecked, session, router]);
-
-  useEffect(() => {
-    if (organizations?.length) {
-      organization.setActive({ organizationId: organizations[0].id });
-    }
-  }, [organizations]);
 
   // Update default currency when payment provider changes
   useEffect(() => {
@@ -519,19 +519,7 @@ export default function OnboardingPage() {
   const handleSaveMerchant = async (value: MerchantData) => {
     setLoading(true);
     try {
-      let orgId = activeOrganization?.data?.id;
-      if (!orgId) {
-        const org = await organization.create({
-          name: value.legalName,
-          slug:
-            removeSpecialChars(value.legalName).split(" ").join("-") +
-            "-" +
-            Date.now(),
-        });
-        orgId = org?.data?.id;
-      }
       if (
-        orgId &&
         value.addressLine1 &&
         value.city &&
         value.postalCode &&
@@ -542,8 +530,6 @@ export default function OnboardingPage() {
           "onboarding-create-merchant"
         ].$post({
           json: {
-            userId: session!.user!.id,
-            organizationId: orgId,
             legalName: value.legalName,
             displayName: value.displayName,
             taxId: value.taxId,
@@ -566,7 +552,7 @@ export default function OnboardingPage() {
           return;
         }
 
-        await refetch();
+        refetch();
 
         // Save API keys if they were validated earlier
         if (selectedProvider === "stripe" && secretKey && publicKey) {
@@ -602,6 +588,21 @@ export default function OnboardingPage() {
           }
         }
 
+        // Save dunning defaults for merchant
+        try {
+          const dunResp = await apiClient.merchants["dunning-config"].$post({
+            json: {
+              gracePeriodDays: dunningGraceDays,
+              endOfDunningAction: dunningAction,
+            },
+          });
+          if (!dunResp.ok) {
+            console.warn("Failed to save dunning config during onboarding");
+          }
+        } catch (e) {
+          console.warn("Error saving dunning config during onboarding", e);
+        }
+
         // Mark merchant info step as completed and activate NextJS setup (step 3)
         const newSteps = steps.map((step) => {
           if (step.id === 2) return { ...step, completed: true, active: false };
@@ -616,7 +617,7 @@ export default function OnboardingPage() {
         await fetchPublishableKey();
         setLoading(false);
       } else {
-        toast.error("Failed to create organization");
+        toast.error("Failed to create merchant");
         setLoading(false);
       }
     } catch (error) {
@@ -721,7 +722,7 @@ export default function OnboardingPage() {
 
       {/* Main Content */}
       <div className="flex-1 p-6">
-        <div className="max-w-[50%] mx-auto">
+        <div className="w-full max-w-3xl lg:max-w-4xl mx-auto">
           <Card>
             {/* Step 0: Payment Provider Selection */}
             {currentStep === 0 && (
@@ -1029,6 +1030,145 @@ export default function OnboardingPage() {
                         );
                       }}
                     />
+                    {/* Payment Recovery Settings */}
+                    <div className="border rounded-lg p-4 mt-6 mb-4 bg-blue-50 border-blue-200">
+                      <div className="flex items-center gap-2 mb-3">
+                        <Info className="h-5 w-5 text-blue-600" />
+                        <h4 className="font-medium text-blue-900">
+                          Payment Recovery Settings
+                        </h4>
+                      </div>
+                      <p className="text-sm text-blue-800 mb-4">
+                        Configure what happens when a customer&apos;s payment
+                        fails. Don&apos;t worry - you can change these settings
+                        anytime.
+                      </p>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <TooltipProvider>
+                            <div className="flex items-center gap-2 mb-2 h-6">
+                              <Label
+                                htmlFor="grace-period"
+                                className="text-sm font-medium"
+                              >
+                                Grace period (payment retry time)
+                              </Label>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <HelpCircle className="h-4 w-4 text-muted-foreground cursor-help" />
+                                </TooltipTrigger>
+                                <TooltipContent className="max-w-xs">
+                                  <p>
+                                    How long customers have to fix their payment
+                                    method before action is taken.
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
+                          </TooltipProvider>
+                          <Select
+                            value={String(dunningGraceDays)}
+                            onValueChange={(val: string) =>
+                              setDunningGraceDays(parseInt(val))
+                            }
+                          >
+                            <SelectTrigger id="grace-period">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {[0, 1, 3, 7, 14, 30].map((d) => (
+                                <SelectItem key={d} value={String(d)}>
+                                  {d === 0
+                                    ? "No grace period (immediate action)"
+                                    : `${d} day${d > 1 ? "s" : ""}`}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <div>
+                          <div className="flex items-center gap-2 mb-2 h-6">
+                            <Label
+                              htmlFor="failed-payment-action"
+                              className="text-sm font-medium"
+                            >
+                              When payment can&apos;t be recovered
+                            </Label>
+                          </div>
+                          <Select
+                            value={dunningAction}
+                            onValueChange={(val: string) =>
+                              setDunningAction(
+                                val as
+                                  | "pause_subscription"
+                                  | "mark_as_unpaid"
+                                  | "cancel_subscription"
+                              )
+                            }
+                          >
+                            <SelectTrigger id="failed-payment-action">
+                              <SelectValue>
+                                {dunningAction === "pause_subscription"
+                                  ? "Pause subscription (Recommended)"
+                                  : dunningAction === "mark_as_unpaid"
+                                    ? "Mark as unpaid"
+                                    : dunningAction === "cancel_subscription"
+                                      ? "Cancel subscription"
+                                      : "Choose action"}
+                              </SelectValue>
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem
+                                value="pause_subscription"
+                                className="py-3"
+                              >
+                                <div className="w-full space-y-1">
+                                  <div className="font-medium">
+                                    Pause subscription (Recommended)
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    Subscription is paused after grace period.
+                                    Customer can resume after updating payment
+                                    method.
+                                  </div>
+                                </div>
+                              </SelectItem>
+                              <SelectItem
+                                value="mark_as_unpaid"
+                                className="py-3"
+                              >
+                                <div className="w-full space-y-1">
+                                  <div className="font-medium">
+                                    Mark as unpaid
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    Subscription continues but marked as having
+                                    payment issues
+                                  </div>
+                                </div>
+                              </SelectItem>
+                              <SelectItem
+                                value="cancel_subscription"
+                                className="py-3"
+                              >
+                                <div className="w-full space-y-1">
+                                  <div className="font-medium">
+                                    Cancel subscription
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    Subscription is canceled after grace period.
+                                    Customer can resubscribe after updating
+                                    payment method.
+                                  </div>
+                                </div>
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                    </div>
                     <form.AppForm>
                       <Button
                         type="submit"

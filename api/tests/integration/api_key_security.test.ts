@@ -17,7 +17,6 @@ describe("API Key Security Features", () => {
   let client: ReturnType<typeof createTestApiClient>;
 
   beforeEach(async () => {
-    // Set up a test environment
     const { user, merchant } = await createFullTestEnvironment();
     merchantId = merchant.id;
 

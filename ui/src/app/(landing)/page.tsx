@@ -150,22 +150,19 @@ export default function Home() {
           </div>
 
           <div className="flex flex-col sm:flex-row gap-6 justify-center items-center">
-            <Link
-              href="https://docs.getlumen.dev/getting-started"
-              target="_blank"
-            >
+            <Link href="/demo">
               <Button
                 size="lg"
                 className="group relative bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 hover:from-gray-800 hover:via-gray-700 hover:to-gray-800 text-white px-12 py-5 text-lg font-semibold shadow-2xl hover:shadow-3xl transition-all duration-500 rounded-2xl border border-gray-700/50 hover:border-gray-600/50 overflow-hidden"
               >
                 <div className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/5 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
                 <span className="relative z-10 flex items-center">
-                  Get Started
+                  See demo
                   <ArrowRight className="ml-3 w-5 h-5 group-hover:translate-x-1 transition-transform duration-300" />
                 </span>
               </Button>
             </Link>
-            <Link href="https://cal.com/ramongarate/quick-chat" target="_blank">
+            <Link href="https://docs.getlumen.dev" target="_blank">
               <Button
                 size="lg"
                 variant="outline"
@@ -173,7 +170,7 @@ export default function Home() {
               >
                 <div className="absolute inset-0 bg-gradient-to-r from-gray-50/0 via-gray-50/50 to-gray-50/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700"></div>
                 <span className="relative z-10 flex items-center">
-                  Schedule a Call
+                  Documentation
                 </span>
               </Button>
             </Link>
@@ -327,8 +324,63 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Testimonial Section */}
+      {/* Lumen Next.js Starter Section */}
       <section className="py-32 px-6 lg:px-8">
+        <div className="max-w-7xl mx-auto">
+          <div className="grid lg:grid-cols-2 gap-12 items-center">
+            <div>
+              <h2 className="text-4xl sm:text-5xl font-light text-gray-900 mb-6 tracking-tight">
+                Lumen Next.js Starter
+              </h2>
+              <p className="text-lg text-gray-600 mb-8 font-light leading-relaxed">
+                Kickstart your SaaS with our open-source Next.js starter kit. It
+                includes authentication, billing, pricing tables, and real-time
+                usage tracking wired up with Lumen.
+              </p>
+              <div className="flex flex-col sm:flex-row gap-4">
+                <Link
+                  href="https://github.com/pretzelai/lumen-nextjs-starter"
+                  target="_blank"
+                >
+                  <Button
+                    size="lg"
+                    className="group relative bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 hover:from-gray-800 hover:via-gray-700 hover:to-gray-800 text-white px-10 py-4 text-lg font-semibold shadow-xl hover:shadow-2xl transition-all duration-300 rounded-xl"
+                  >
+                    <span className="relative z-10 flex items-center">
+                      View on GitHub
+                      <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform duration-300" />
+                    </span>
+                  </Button>
+                </Link>
+                <Link
+                  href="https://lumen-nextjs-starter.vercel.app"
+                  target="_blank"
+                >
+                  <Button
+                    size="lg"
+                    variant="outline"
+                    className="px-10 py-4 text-lg font-semibold border-2 border-gray-300 hover:border-gray-400 bg-white hover:bg-gray-50 text-gray-800 hover:text-gray-900 shadow-lg hover:shadow-xl transition-all duration-300 rounded-xl"
+                  >
+                    Live Demo
+                  </Button>
+                </Link>
+              </div>
+            </div>
+            <div>
+              <Image
+                src="/lumen-nextjs-starter.png"
+                alt="Lumen Next.js Starter"
+                width={1200}
+                height={800}
+                className="rounded-2xl shadow-lg hover:shadow-xl border border-gray-200/50 transition-all duration-300"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Testimonial Section */}
+      {/* <section className="py-32 px-6 lg:px-8">
         <div className="max-w-5xl mx-auto">
           <div className="bg-gradient-to-br from-gray-50 to-white rounded-3xl p-12 md:p-16 shadow-2xl border border-gray-100/50">
             <div className="flex flex-col md:flex-row items-center gap-12">
@@ -367,13 +419,13 @@ export default function Home() {
             </div>
           </div>
         </div>
-      </section>
+      </section> */}
 
       {/* Implementation Guide Section */}
       <section className="py-32 px-6 lg:px-8 bg-gradient-to-b from-white to-gray-50/50">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-20">
-            <h2 className="text-5xl md:text-6xl font-light text-gray-900 mb-6 tracking-tight">
+            <h2 className="text-4xl sm:text-5xl md:text-6xl font-light text-gray-900 mb-6 tracking-tight">
               Get Started in Minutes
             </h2>
             <p className="text-xl text-gray-600 font-light">
@@ -391,7 +443,7 @@ export default function Home() {
                       1
                     </span>
                   </div>
-                  <h3 className="text-3xl font-light text-gray-900">
+                  <h3 className="flex-1 min-w-0 text-2xl sm:text-3xl font-light text-gray-900 break-words">
                     Install the Packages & Pricing Table
                   </h3>
                 </div>
@@ -400,7 +452,7 @@ export default function Home() {
                   easily edit the styling with Cursor or similar tools
                 </p>
               </div>
-              <div className="space-y-4">
+              <div className="space-y-4 min-w-0">
                 <CodeBlock
                   language="bash"
                   code={`npm install @getlumen/react @getlumen/server`}
@@ -421,7 +473,7 @@ export default function Home() {
                       2
                     </span>
                   </div>
-                  <h3 className="text-3xl font-light text-gray-900">
+                  <h3 className="flex-1 min-w-0 text-2xl sm:text-3xl font-light text-gray-900 break-words">
                     Frontend Integration
                   </h3>
                 </div>
@@ -430,7 +482,7 @@ export default function Home() {
                   pricing page
                 </p>
               </div>
-              <div>
+              <div className="min-w-0">
                 <CodeBlock
                   language="tsx"
                   code={`import { PricingTable } from '@/components/ui/pricing-table';
@@ -459,7 +511,7 @@ export default function PricingPage() {
                       3
                     </span>
                   </div>
-                  <h3 className="text-3xl font-light text-gray-900">
+                  <h3 className="flex-1 min-w-0 text-2xl sm:text-3xl font-light text-gray-900 break-words">
                     Backend Integration
                   </h3>
                 </div>
@@ -468,10 +520,10 @@ export default function PricingPage() {
                   1 line of code
                 </p>
               </div>
-              <div>
+              <div className="min-w-0">
                 <CodeBlock
                   language="tsx"
-                  code={`import { sendEvent, isFeatureEntitled } from "@getlumen/server";;
+                  code={`import { sendEvent, isFeatureEntitled } from "@getlumen/server"
 
 export async function POST(request: NextRequest) {
   const supabase = await createClient();
@@ -486,7 +538,7 @@ export async function POST(request: NextRequest) {
     ) {
     // Do something here ...
     // after completion you can record usage with:
-    sendEvent({
+    await sendEvent({
       name: "ai-chat-requests",
       userId: user.id,
     });
@@ -504,7 +556,7 @@ export async function POST(request: NextRequest) {
                       4
                     </span>
                   </div>
-                  <h3 className="text-3xl font-light text-gray-900">
+                  <h3 className="flex-1 min-w-0 text-2xl sm:text-3xl font-light text-gray-900 break-words">
                     Set up your plans & features in the dashboard
                   </h3>
                 </div>

@@ -21,6 +21,8 @@ import {
   formatZeroTaxDescription,
   formatSpecificTaxDescription,
   getTaxReasonInfo,
+  getExemptionReasonCode,
+  getExemptionFullDescription,
 } from "./tax-rates";
 import { getSecret } from "./secrets";
 import { env } from "../env";
@@ -125,7 +127,7 @@ export async function calculateTaxes(
 
       return createExemptTaxResult(
         context.subtotalAfterCredits,
-        customerData.customer.taxExemptionReason || "customer_exempt",
+        customerData.customer.taxExemptionReason || "other",
         context.lineItems[0]?.billingPeriodStart || context.billingDate,
         context.lineItems[0]?.billingPeriodEnd || context.billingDate
       );
@@ -377,6 +379,8 @@ export async function calculateTaxesForPaymentFlow({
         preferredLanguage: null,
         preferredCurrency: null,
         metadata: null,
+        customerOrganizationId: null,
+        orgRole: null,
       },
     };
 
@@ -1079,7 +1083,7 @@ async function calculateManualTax(
 }
 
 /**
- * Create exempt tax result
+ * Create exempt tax result with appropriate reason code based on exemption type
  */
 function createExemptTaxResult(
   subtotalAfterCredits: number,
@@ -1087,8 +1091,19 @@ function createExemptTaxResult(
   billingPeriodStart: Date,
   billingPeriodEnd: Date
 ): TaxCalculationResult {
-  const reasonCode = 15; // tax_exempt_customer
+  // Get the appropriate reason code for this exemption
+  const reasonCode = getExemptionReasonCode(exemptionReason);
+
   const reasonInfo = getTaxReasonInfo(reasonCode);
+
+  // Use the tax type from the reason info, or default to "exempt"
+  const taxType = reasonInfo.tax_type || "exempt";
+
+  // Get enhanced description that includes custom reason when applicable
+  const fullDescription = getExemptionFullDescription(
+    exemptionReason,
+    reasonCode
+  );
 
   return {
     taxableAmount: subtotalAfterCredits,
@@ -1100,12 +1115,12 @@ function createExemptTaxResult(
         description: formatZeroTaxDescription(reasonCode),
         subtotalCents: 0,
         taxMetadata: {
-          taxType: "exempt",
+          taxType,
           jurisdiction: "exempt",
           taxRate: 0,
-          exemptionReason,
+          exemptionReason, // Preserve the original specific reason (e.g., "nonprofit_organization" or custom text)
           reasonCode,
-          fullDescription: reasonInfo.full_description,
+          fullDescription, // Enhanced description that includes custom reason when applicable
         },
         billingPeriodStart,
         billingPeriodEnd,
@@ -1114,7 +1129,7 @@ function createExemptTaxResult(
     jurisdiction: "exempt",
     calculationMethod: "exempt",
     taxBreakdown: {},
-    exemptionReason,
+    exemptionReason, // Also preserve at the top level
   };
 }
 

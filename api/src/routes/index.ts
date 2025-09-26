@@ -28,6 +28,8 @@ import { integrationWebhooksRouter } from "./webhook_integrations";
 import { dodoRouter } from "./dodo";
 import { lumenRouter } from "./lumen";
 import { betaRouter } from "./beta";
+import { enrollmentRouter } from "./enrollment";
+import internalKeyValuesRouter from "./internal_key_values";
 
 // Create a subrouter for authenticated routes that require either:
 // 1. Session auth (browser-based user session) OR
@@ -58,8 +60,10 @@ const authenticatedRoutes = new Hono()
   .route("/tax", taxRouter)
   .route("/seats", seatsRoute)
   .route("/webhooks", integrationWebhooksRouter)
+  .route("/enrollment", enrollmentRouter)
   .route("/lumen", lumenRouter) // For dogfooding Lumen stuff
-  .route("/beta", betaRouter);
+  .route("/beta", betaRouter)
+  .route("/internal", internalKeyValuesRouter);
 
 // Router for Trigger.dev webhooks - requires Trigger.dev specific auth
 // These routes are authenticated using the Trigger.dev TRIGGER_API_ACCESS_KEY

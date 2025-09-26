@@ -20,40 +20,45 @@ import {
   createTestApiKeys,
   createPaymentProvider,
   PaymentProviderAdapter,
+  createTestPrice,
+  createApiKeyClient,
 } from "../test-helpers";
+import { cleanupDataFull } from "../test-helpers/test-utils/setup";
+import { clearEventData } from "../test-helpers/test-utils/questdb-helpers";
 import {
   invoices,
   invoiceLineItems,
   subscriptionDetails,
   subscriptions,
   customers,
-  plans,
-  prices,
-  payments,
   metrics,
-  events,
-  subscriptionsScheduledChanges,
-  subscriptionFeatures,
-  paymentMethods,
-  creditUsageTransactions,
   creditGrants,
   creditDefinitions,
-  planFeatures,
+  subscriptionFeatures,
+  customerOrganizations,
+  creditUsageTransactions,
+  payments,
+  paymentMethods,
+  customerInvoiceCounters,
+  plans,
   features,
   featureMetrics,
+  prices,
+  events,
   pricingTablePlans,
   pricingTables,
-  user,
-  organization,
-  billingTasks,
+  planFeatures,
 } from "@lumen/common/schema";
 import { env } from "../../src/env";
-import { setTimeout as sleep } from "timers/promises";
+// QuestDB race conditions so we using real sleep instead of immediate mock
+// import { setTimeout as sleep } from "timers/promises";
+import { sleep } from "../test-helpers/sleep";
 import questDbService from "../../src/db/questDbService";
 import { z } from "zod";
 import { collectPaymentJob } from "../../trigger/jobs/collectPayment";
 import { collectPaymentPayloadSchema } from "../../trigger/helpers/collectPayment";
 import { prorateAmountCents } from "../../src/helpers/proration";
+import fs from "fs";
 
 setDefaultTimeout(10000);
 
@@ -94,6 +99,14 @@ describe("Seat-Based Plans Integration Tests", () => {
   // Webhook lifecycle handled by provider harness
 
   beforeAll(async () => {
+    await cleanupDataFull();
+
+    // Clean up any existing Stripe mock store
+    try {
+      await fs.promises.unlink("/tmp/stripe_mock_store.json");
+    } catch (error) {
+      // File doesn't exist, which is fine
+    }
     paymentProvider = await createPaymentProvider();
 
     // Initialize QuestDB service for the test process
@@ -123,6 +136,39 @@ describe("Seat-Based Plans Integration Tests", () => {
       console.error("Failed to close QuestDB for test process:", error);
     }
   });
+
+  const cleanupTestData = async () => {
+    // this is different from cleanupDataFull because it doesn't clean up the merchant, user, and payment provider config
+    try {
+      await db.execute(sql`
+        DELETE FROM ${creditUsageTransactions};
+        DELETE FROM ${creditGrants};
+        DELETE FROM ${creditDefinitions};
+        DELETE FROM ${payments};
+        DELETE FROM ${invoiceLineItems};
+        DELETE FROM ${invoices};
+        DELETE FROM ${subscriptionFeatures};
+        DELETE FROM ${subscriptionDetails};
+        DELETE FROM ${subscriptions};
+        DELETE FROM ${paymentMethods};
+        DELETE FROM ${customerInvoiceCounters};
+        DELETE FROM ${customers};
+        DELETE FROM ${customerOrganizations};
+        DELETE FROM ${prices};
+        DELETE FROM ${planFeatures};
+        DELETE FROM ${features};
+        DELETE FROM ${featureMetrics};
+        DELETE FROM ${metrics};
+        DELETE FROM ${pricingTablePlans};
+        DELETE FROM ${pricingTables};
+        DELETE FROM ${plans};
+        DELETE FROM ${events};
+      `);
+    } catch (error) {
+      console.error("Error during test cleanup:", error);
+      throw error;
+    }
+  };
 
   beforeEach(async () => {
     testStartTime = new Date();
@@ -263,49 +309,11 @@ describe("Seat-Based Plans Integration Tests", () => {
     await paymentProvider.cleanup();
 
     try {
-      // First batch: Clean up payment and invoice records
-      await db.execute(sql`
-        DELETE FROM ${payments};
-        DELETE FROM ${invoiceLineItems};
-        DELETE FROM ${invoices};
-      `);
+      // Clear event data from both QuestDB and PostgreSQL + event queue
+      await clearEventData();
 
-      // Second batch: Clean up subscription-related records (in proper order)
-      await db.execute(sql`
-        DELETE FROM ${subscriptionsScheduledChanges};
-        DELETE FROM ${subscriptionFeatures};
-        DELETE FROM ${subscriptionDetails};
-        DELETE FROM ${billingTasks};
-        DELETE FROM ${subscriptions};
-        DELETE FROM ${paymentMethods};
-      `);
-
-      // Third batch: Clean up credit records
-      await db.execute(sql`
-        DELETE FROM ${creditUsageTransactions};
-        DELETE FROM ${creditGrants};
-        DELETE FROM ${creditDefinitions};
-      `);
-
-      // Fourth batch: Clean up metrics and events
-      await db.execute(sql`
-        DELETE FROM ${metrics};
-        DELETE FROM ${events};
-      `);
-
-      // Fifth batch: Clean up plan and feature records
-      await db.execute(sql`
-        DELETE FROM ${prices};
-        DELETE FROM ${planFeatures};
-        DELETE FROM ${features};
-        DELETE FROM ${featureMetrics};
-        DELETE FROM ${pricingTablePlans};
-        DELETE FROM ${pricingTables};
-        DELETE FROM ${plans};
-        DELETE FROM ${customers};
-        DELETE FROM ${user};
-        DELETE FROM ${organization};
-      `);
+      // Use selective cleanup function for test data only
+      await cleanupTestData();
     } catch (error) {
       console.error("Error during test cleanup:", error);
       throw error;
@@ -322,6 +330,16 @@ describe("Seat-Based Plans Integration Tests", () => {
       currency?: string;
       minSeats?: number;
       billImmediately?: boolean;
+      features?: Array<{
+        featureName: string;
+        slug: string;
+        eventName?: string;
+        isUsageBased: boolean;
+        usagePricePerUnit?: number;
+        hasCreditAllowance?: boolean;
+        creditAllowanceAmount?: number;
+        creditAllowanceRenewal?: "monthly" | "yearly" | "none";
+      }>;
     }
   ) => {
     // Create plan using the API
@@ -343,7 +361,7 @@ describe("Seat-Based Plans Integration Tests", () => {
         ...(options?.billImmediately !== undefined && {
           billImmediately: options.billImmediately,
         }),
-        newFeatures: [],
+        newFeatures: options?.features || [],
       },
     });
 
@@ -398,17 +416,26 @@ describe("Seat-Based Plans Integration Tests", () => {
   /**
    * Helper function to add seats via API
    */
+  type AddSeatSuccess = {
+    message: string;
+    user_id?: string;
+    organization_id?: string;
+    created_user_id: string;
+    subscription_id: string;
+    idempotency_key: string;
+  };
+  type RemoveSeatSuccess = {
+    message: string;
+    user_id?: string;
+    organization_id?: string;
+    removed_user_id: string;
+    subscription_id: string;
+    idempotency_key: string;
+  };
+  type ErrorResponse = { error: string };
+
   const addSeats = async (userIds: string[], eventTimestamp?: Date) => {
-    const results: (
-      | {
-          message: string;
-          user_id: string;
-          created_user_id: string;
-          subscription_id: string;
-          idempotency_key: string;
-        }
-      | { error: string }
-    )[] = [];
+    const results: Array<AddSeatSuccess | ErrorResponse> = [];
     for (const userId of userIds) {
       const response = await apiClient.seats.add.$post({
         json: {
@@ -432,16 +459,7 @@ describe("Seat-Based Plans Integration Tests", () => {
    * Helper function to remove seats via API
    */
   const removeSeats = async (userIds: string[], eventTimestamp?: Date) => {
-    const results: (
-      | {
-          message: string;
-          user_id: string;
-          removed_user_id: string;
-          subscription_id: string;
-          idempotency_key: string;
-        }
-      | { error: string }
-    )[] = [];
+    const results: Array<RemoveSeatSuccess | ErrorResponse> = [];
     for (const userId of userIds) {
       const response = await apiClient.seats.remove.$post({
         json: {
@@ -546,7 +564,8 @@ describe("Seat-Based Plans Integration Tests", () => {
   const createSubscription = async (
     customerEmail: string,
     priceId: string,
-    planId: string
+    planId: string,
+    primarySeatEventTimestamp?: Date
   ) => {
     // Use the payment-init endpoint to create the proper payment flow
     const paymentInitResponse = await apiClient.public["payment-init"].$post({
@@ -557,6 +576,9 @@ describe("Seat-Based Plans Integration Tests", () => {
         customerEmail,
         customerName: "Seat Test Customer",
         userId: externalCustomerId,
+        ...(primarySeatEventTimestamp && {
+          primarySeatEventTimestamp: primarySeatEventTimestamp.toISOString(),
+        }),
         ...(process.env.PAYMENT_PROVIDER === "dodo"
           ? {
               customerAddress: "123 Test Street",
@@ -692,7 +714,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      testStartTime // No backdating needed for this basic test
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
@@ -711,18 +734,28 @@ describe("Seat-Based Plans Integration Tests", () => {
     // Create seat-based plan
     const seatPlan = await createSeatBasedPlan(1000); // $10 per seat per month
     planId = seatPlan.plan.id;
+    const eventTimestamp = subDays(testStartTime, 15);
 
     // Create subscription using proper payment flow
     const customerEmail = `${externalCustomerId}@example.com`;
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      eventTimestamp
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
 
-    const eventTimestamp = subDays(testStartTime, 15);
+    await sleep(1000, { alsoSleepInStripeMock: true }); // one customer would already have been added in the createSubscription call
+    let seatCount = await getCurrentSeatCount(
+      customerId,
+      subscriptionId,
+      seatPlan.seatMetric!.id,
+      testStartTime,
+      addDays(testStartTime, 30)
+    );
+    expect(seatCount).toBe(1);
 
     // Add 5 seats
     await addSeats(
@@ -731,22 +764,22 @@ describe("Seat-Based Plans Integration Tests", () => {
     );
 
     // Wait a bit to make sure the seat count is updated
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
     // Verify seat count
-    let seatCount = await getCurrentSeatCount(
+    seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
       seatPlan.seatMetric!.id,
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(5);
+    expect(seatCount).toBe(6);
 
     // Remove 2 seats
     await removeSeats(["user2", "user4"], addMinutes(eventTimestamp, 1));
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
     seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -754,7 +787,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime, // new cycle started
       addDays(testStartTime, 30) // 30 days later
     );
-    expect(seatCount).toBe(3);
+    expect(seatCount).toBe(4);
 
     // Trigger billing cycle
     const billingResult = await advanceBillingAndProcess();
@@ -762,7 +795,7 @@ describe("Seat-Based Plans Integration Tests", () => {
 
     await sleep(3000);
 
-    // Check invoice - should bill for ALL 5 seats (removals take effect next month)
+    // Check invoice - should bill for ALL 6 seats (removals take effect next month)
     const invoice = await db.query.invoices.findFirst({
       where: eq(invoices.customerId, customerId),
       with: {
@@ -775,9 +808,9 @@ describe("Seat-Based Plans Integration Tests", () => {
       (item) => item.type !== "tax"
     );
 
-    expect(invoice!.totalAmountCents).toBe(5000); // 5 seats × $10 = $50
+    expect(invoice!.totalAmountCents).toBe(6000); // 6 seats × $10 = $60
     expect(invoice!.lineItems).toHaveLength(1);
-    expect(invoice!.lineItems[0].quantity).toBe(5);
+    expect(invoice!.lineItems[0].quantity).toBe(6);
     expect(invoice!.lineItems[0].unitAmountCents).toBe(1000);
   }, 20000);
 
@@ -791,7 +824,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      subDays(testStartTime, 45) // Primary seat event needs to be at the earliest event timestamp
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
@@ -804,9 +838,9 @@ describe("Seat-Based Plans Integration Tests", () => {
     // Remove 1 seat
     await removeSeats(["user2"], addMinutes(eventTimestamp1, 1));
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
-    // Current active seats: 2, but billing should be for 3 (all additions)
+    // Current active seats: 3 (including primary seat), but billing should be for 4 (all additions)
     let seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -814,7 +848,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(2);
+    expect(seatCount).toBe(3);
 
     // Trigger first billing cycle
     let billingResult = await advanceBillingAndProcess();
@@ -822,7 +856,6 @@ describe("Seat-Based Plans Integration Tests", () => {
 
     await sleep(3000);
 
-    // Check first invoice - should bill for 3 seats (all additions, removals take effect next month)
     let invoices1 = await db.query.invoices.findMany({
       where: eq(invoices.customerId, customerId),
       with: { lineItems: true },
@@ -834,8 +867,8 @@ describe("Seat-Based Plans Integration Tests", () => {
       invoice.lineItems.some((item) => item.type !== "tax")
     );
     expect(invoice1).toHaveLength(1);
-    // 2 seats × $10 = $20, no tax or credits (seat removed in the billing cycle BEFORE the start of the backdated billing cycle)
-    expect(invoice1[0].totalAmountCents).toBe(2000);
+    // 3 seats × $10 = $30, no tax or credits (seat removed in the billing cycle BEFORE the start of the backdated billing cycle)
+    expect(invoice1[0].totalAmountCents).toBe(3000);
 
     // === MONTH 2 ===
     const eventTimestamp2 = subDays(testStartTime, 15); // Events for second billing cycle
@@ -845,9 +878,9 @@ describe("Seat-Based Plans Integration Tests", () => {
     // Remove 1 more seat
     await removeSeats(["user3"], addMinutes(eventTimestamp2, 1));
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
-    // Current active seats should be 3 (user1, user4, user5)
+    // Current active seats should be 4 (primary, user1, user4, user5)
     seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -855,7 +888,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(3);
+    expect(seatCount).toBe(4);
 
     // Trigger second billing cycle
     billingResult = await advanceBillingAndProcess();
@@ -869,17 +902,17 @@ describe("Seat-Based Plans Integration Tests", () => {
     });
 
     expect(invoices2).toHaveLength(2);
-    // the removal of user3 now falls INSIDE the billing cycle after backdating so we have 4 seats
-    expect(invoices2[1].totalAmountCents).toBe(4000); // 4 seats × $10 = $40
+    // the removal of user3 now falls INSIDE the billing cycle after backdating so we have 5 seats
+    expect(invoices2[1].totalAmountCents).toBe(5000); // 5 seats × $10 = $50
 
     // === MONTH 3 ===
     const eventTimestamp3 = subDays(testStartTime, 5); // Events for third billing cycle
     // Only add seats, no removals
     await addSeats(["user6", "user7"], eventTimestamp3);
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
-    // Current active seats should be 5 (user1, user4, user5, user6, user7)
+    // Current active seats should be 6 (primary, user1, user4, user5, user6, user7)
     seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -887,7 +920,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       subDays(testStartTime, 5),
       addDays(testStartTime, 25)
     );
-    expect(seatCount).toBe(5);
+    expect(seatCount).toBe(6);
 
     // Trigger third billing cycle
     billingResult = await advanceBillingAndProcess();
@@ -901,8 +934,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     });
 
     expect(invoices3).toHaveLength(3);
-    // the removal of user3 is still INSIDE the billing cycle after backdating so users 1, 3, 4, 5, 6 and 7
-    expect(invoices3[2].totalAmountCents).toBe(6000); // 5 seats × $10 = $50
+    // the removal of user3 is still INSIDE the billing cycle after backdating so we have 7 seats
+    expect(invoices3[2].totalAmountCents).toBe(7000); // 7 seats × $10 = $70
   }, 30000);
 
   it("should handle seat-based yearly pricing correctly", async () => {
@@ -915,7 +948,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.yearlyPrice!.id,
-      planId
+      planId,
+      subDays(testStartTime, 15)
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
@@ -925,7 +959,7 @@ describe("Seat-Based Plans Integration Tests", () => {
     // Add 3 seats
     await addSeats(["user1", "user2", "user3"], eventTimestamp);
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
     // Verify seat count
     let seatCount = await getCurrentSeatCount(
@@ -935,7 +969,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(3);
+    expect(seatCount).toBe(4);
 
     // Trigger billing cycle
     const billingResult = await advanceBillingAndProcess(1, 365);
@@ -952,13 +986,533 @@ describe("Seat-Based Plans Integration Tests", () => {
       (item) => item.type !== "tax"
     );
 
-    expect(invoice!.totalAmountCents).toBe(28800); // 3 seats × $8 * 12 yearly = $288
+    expect(invoice!.totalAmountCents).toBe(38400); // 4 seats × $8 * 12 yearly = $384
     expect(invoice!.lineItems).toHaveLength(1);
-    expect(invoice!.lineItems[0].quantity).toBe(3);
+    expect(invoice!.lineItems[0].quantity).toBe(4);
     expect(invoice!.lineItems[0].unitAmountCents).toBe(9600); // $8 * 12 = $96 per seat per year
+  }, 50000);
+
+  it("should handle seat-based plan with usage component and usage credits across cycles", async () => {
+    // Create seat-based plan WITH usage features and credits all in one API call
+    const apiCallsEventName = `api_usage_${Date.now()}`;
+    const seatPlan = await createSeatBasedPlan(1000, undefined, {
+      currency: "USD",
+      minSeats: 0,
+      billImmediately: false,
+      features: [
+        {
+          featureName: "API Calls",
+          slug: `api-calls-${Date.now()}`,
+          eventName: apiCallsEventName, // Event name for tracking usage
+          isUsageBased: true,
+          usagePricePerUnit: 5, // $0.05 per call overage
+          hasCreditAllowance: true,
+          creditAllowanceAmount: 100, // 100 free calls per seat per month
+          creditAllowanceRenewal: "monthly",
+        },
+      ],
+    });
+
+    planId = seatPlan.plan.id;
+
+    // Get the created prices (the API creates everything for us)
+    const pricesResponse = await apiClient.prices.$get({
+      query: { planId: seatPlan.plan.id },
+    });
+    const pricesData = await pricesResponse.json();
+    if ("error" in pricesData) {
+      throw new Error(pricesData.error);
+    }
+
+    // Find the monthly price (should have both seat per_unit and usage components)
+    const monthlyPrice = pricesData.prices.find((p) =>
+      p.pricingData.components.some((c) =>
+        c.recurrence_rule?.includes("MONTHLY")
+      )
+    );
+
+    if (!monthlyPrice) {
+      throw new Error("Monthly price not found");
+    }
+
+    // Verify price has both seat and usage components with expected pricing
+    const seatComponent = monthlyPrice.pricingData.components.find(
+      (c: any) => c.type === "per_unit"
+    ) as any;
+    const usageComponent = monthlyPrice.pricingData.components.find(
+      (c: any) => c.type === "usage"
+    ) as any;
+    expect(seatComponent).toBeDefined();
+    expect(usageComponent).toBeDefined();
+    expect(seatComponent!.amount_cents).toBe(1000); // $10 per seat
+    expect(usageComponent!.unit_cost_cents).toBe(5); // $0.05 per call
+
+    // Create subscription using proper payment flow
+    const customerEmail = `${externalCustomerId}@example.com`;
+    const subResult = await createSubscription(
+      customerEmail,
+      monthlyPrice.id,
+      planId,
+      subDays(testStartTime, 20)
+    );
+    subscriptionId = subResult.subscription.id;
+    customerId = subResult.customer.id;
+
+    await sleep(1000, { alsoSleepInStripeMock: true });
+
+    // Check seats current count
+    const seatCount = await getCurrentSeatCount(
+      customerId,
+      subscriptionId,
+      seatPlan.seatMetric!.id,
+      testStartTime,
+      addDays(testStartTime, 10)
+    );
+    expect(seatCount).toBe(1); // Primary customer
+
+    // Assert: primary customer has organization created and role=primary
+    const primaryOrgResult = await db
+      .select({
+        customerOrganizationId: customers.customerOrganizationId,
+        orgRole: customers.orgRole,
+      })
+      .from(customers)
+      .where(eq(customers.id, customerId));
+
+    expect(primaryOrgResult.length).toBe(1);
+    const primaryOrgId = primaryOrgResult[0].customerOrganizationId;
+    const primaryOrgRole = primaryOrgResult[0].orgRole;
+    expect(primaryOrgId).toBeTruthy();
+    expect(primaryOrgRole).toBe("primary");
+
+    // Assert: customer_organizations row exists
+    const orgExists = await db
+      .select({ id: customerOrganizations.id })
+      .from(customerOrganizations)
+      .where(eq(customerOrganizations.id, primaryOrgId!));
+    expect(orgExists.length).toBe(1);
+
+    // Add 2 seats – should create seat customers and grant initial usage credits to each seat
+    await addSeats(["u1", "u2"], subDays(testStartTime, 10));
+
+    // Wait for seats to be processed
+    await sleep(1000, { alsoSleepInStripeMock: true });
+
+    // Find seat customers by external ID
+    const allCustomers = await db
+      .select()
+      .from(customers)
+      .where(
+        and(eq(customers.merchantId, merchantId), isNull(customers.deletedAt))
+      );
+
+    const seatMembers = allCustomers.filter((c) =>
+      ["u1", "u2"].includes(c.externalCustomerId || "")
+    );
+    expect(seatMembers.length).toBe(2);
+
+    // Assert: both seats are attached to same organization and have role=member
+    const seat1Meta = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.merchantId, merchantId),
+        eq(customers.externalCustomerId, "u1"),
+        isNull(customers.deletedAt)
+      ),
+      columns: {
+        id: true,
+        customerOrganizationId: true,
+        orgRole: true,
+        externalCustomerId: true,
+      },
+    });
+    const seat2Meta = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.merchantId, merchantId),
+        eq(customers.externalCustomerId, "u2"),
+        isNull(customers.deletedAt)
+      ),
+      columns: {
+        id: true,
+        customerOrganizationId: true,
+        orgRole: true,
+        externalCustomerId: true,
+      },
+    });
+
+    expect(seat1Meta).toBeDefined();
+    expect(seat2Meta).toBeDefined();
+    expect(seat1Meta!.customerOrganizationId).toBe(primaryOrgId);
+    expect(seat2Meta!.customerOrganizationId).toBe(primaryOrgId);
+    expect(seat1Meta!.orgRole).toBe("member");
+    expect(seat2Meta!.orgRole).toBe("member");
+
+    // Assert: org has exactly 3 active customers (1 primary + 2 seats)
+    const orgCustomers = await db
+      .select({ count: sql<number>`count(*)`.mapWith(Number) })
+      .from(customers)
+      .where(
+        and(
+          eq(customers.merchantId, merchantId),
+          eq(customers.customerOrganizationId, primaryOrgId!),
+          isNull(customers.deletedAt)
+        )
+      );
+    const orgCustomerCount = orgCustomers[0]?.count ?? 0;
+    expect(orgCustomerCount).toBe(3);
+
+    // Verify grants exist for seat customers (exactly one grant with 100/100 and ACTIVE)
+    for (const seat of seatMembers) {
+      const grants = await db.query.creditGrants.findMany({
+        where: and(
+          eq(creditGrants.merchantId, merchantId),
+          eq(creditGrants.customerId, seat.id),
+          eq(creditGrants.priceId, monthlyPrice.id),
+          eq(creditGrants.applicationType, "usage"),
+          isNull(creditGrants.deletedAt)
+        ),
+      });
+
+      expect(grants.length).toBe(1);
+      expect(grants[0].initialAmount).toBe(100);
+      expect(grants[0].remainingAmount).toBe(100);
+      expect(grants[0].status).toBe("ACTIVE");
+    }
+
+    // Verify subscription features copied to seats (should be exactly one feature per seat)
+    for (const seat of seatMembers) {
+      const seatFeatures = await db.query.subscriptionFeatures.findMany({
+        where: and(
+          eq(subscriptionFeatures.merchantId, merchantId),
+          eq(subscriptionFeatures.customerId, seat.id),
+          eq(subscriptionFeatures.subscriptionId, subscriptionId),
+          isNull(subscriptionFeatures.deletedAt)
+        ),
+      });
+      expect(seatFeatures.length).toBe(1);
+    }
+
+    // Create API keys for sending usage events
+    const apiKeys = await createTestApiKeys({
+      merchantId,
+      environment: "test",
+    });
+    const apiKeyClient = createApiKeyClient(apiKeys.secretKey.rawKeyValue);
+
+    // Find the usage metric that was created for the API calls feature
+    const usageMetric = await db.query.metrics.findFirst({
+      where: and(
+        eq(metrics.merchantId, merchantId),
+        eq(metrics.eventName, apiCallsEventName)
+      ),
+    });
+
+    expect(usageMetric).toBeDefined();
+    if (!usageMetric?.eventName) {
+      throw new Error("Usage metric is missing eventName");
+    }
+
+    // Get the subscription billing details to ensure events are in the correct billing period
+    const subDetails = await db.query.subscriptionDetails.findFirst({
+      where: eq(subscriptionDetails.subscriptionId, subscriptionId),
+    });
+    expect(subDetails).toBeDefined();
+
+    // Calculate a timestamp within the billing period
+    const billingPeriodStart =
+      subDetails!.previousBillingDate || subDetails!.subscriptionStartDate;
+    const billingPeriodEnd = subDetails!.nextBillingDate;
+    const eventTimestampInPeriod = subDays(testStartTime, 10);
+
+    console.log(
+      `Billing period: ${billingPeriodStart.toISOString()} to ${billingPeriodEnd.toISOString()}`
+    );
+    console.log(`Event timestamp: ${eventTimestampInPeriod.toISOString()}`);
+
+    // Send real usage events for BOTH seats to test comprehensive billing
+    const seat1 = seatMembers[0]; // Primary customer seat
+    const seat2 = seatMembers[1]; // Second seat
+
+    // Seat 1: Send 60 API calls (within 100 credit allowance, no overage)
+    const seat1Event = {
+      idempotencyKey: `api-call-seat1-${Date.now()}`,
+      eventName: usageMetric.eventName,
+      customerId: seat1.id,
+      eventValue: 60, // Send all 60 calls in one event
+      subscriptionId: subscriptionId,
+      eventTimestamp: eventTimestampInPeriod.toISOString(),
+    };
+    const r1 = await apiKeyClient.events.$post({ json: seat1Event });
+    expect(r1.status).toBe(202);
+
+    // Seat 2: Send 120 API calls (exceeds 100 credit allowance, 20 overage)
+    const seat2Event = {
+      idempotencyKey: `api-call-seat2-${Date.now()}`,
+      eventName: usageMetric.eventName,
+      customerId: seat2.id,
+      eventValue: 120, // Send all 120 calls in one event
+      subscriptionId: subscriptionId,
+      eventTimestamp: eventTimestampInPeriod.toISOString(),
+    };
+    const r2 = await apiKeyClient.events.$post({ json: seat2Event });
+    expect(r2.status).toBe(202);
+
+    // Wait for events to be processed
+    await sleep(2000, { alsoSleepInStripeMock: true });
+
+    // Trigger billing cycle
+    const billingResult = await advanceBillingAndProcess();
+    expect(billingResult.subscriptionsProcessed).toBe(2); // 2 components: per_unit (seats) + usage (API calls)
+
+    // Wait for billing to process
+    await sleep(3000);
+
+    // After billing cycle, check for renewal
+    const postBillingGrants = await db.query.creditGrants.findMany({
+      where: and(
+        eq(creditGrants.merchantId, merchantId),
+        eq(creditGrants.customerId, seat1.id),
+        eq(creditGrants.priceId, monthlyPrice.id),
+        eq(creditGrants.applicationType, "usage"),
+        isNull(creditGrants.deletedAt)
+      ),
+      orderBy: (creditGrants, { desc }) => [desc(creditGrants.createdAt)],
+    });
+
+    // Should have grants (original + renewed or just renewed)
+    expect(postBillingGrants.length).toBeGreaterThan(0);
+
+    // Calculate total available credits for seat1
+    let totalAvailable = 0;
+    for (const grant of postBillingGrants) {
+      // Only count non-expired active grants
+      if (grant.status === "ACTIVE") {
+        totalAvailable += grant.remainingAmount ?? 0;
+      }
+    }
+
+    // Should have renewed credits available after billing cycle
+    // Seat1 used 60/100 credits, so should get renewed to 100 again
+    expect(totalAvailable).toBeGreaterThanOrEqual(100);
+
+    // Verify invoice was created with comprehensive line items (like the example invoice)
+    const invoice = await db.query.invoices.findFirst({
+      where: eq(invoices.customerId, customerId),
+      with: {
+        lineItems: true,
+      },
+    });
+
+    expect(invoice).toBeDefined();
+    expect(invoice!.lineItems.length).toBeGreaterThan(0);
+
+    // Filter out tax line items for cleaner analysis
+    const nonTaxLineItems = invoice!.lineItems.filter(
+      (item) => item.type !== "tax"
+    );
+
+    console.log(nonTaxLineItems);
+
+    // PRECISE TEST: Expected line items structure based on actual billing behavior
+    // 1. Exactly 1 seat line item (3 seats × $10.00)
+    // 2. Exactly 2 usage line items (u1: 60 calls, u2: 120 calls)
+    // 3. Exactly 2 credit line items (u1: 60 credits consumed, u2: 100 credits consumed)
+
+    // 1. SEAT CHARGES - Should have exactly 1 per_unit line item
+    const seatLineItems = nonTaxLineItems.filter(
+      (item) => item.type === "per_unit"
+    );
+    expect(seatLineItems).toHaveLength(1);
+
+    // Should bill for exactly 3 total seats (1 primary + 2 added seats)
+    const seatLineItem = seatLineItems[0];
+    expect(seatLineItem.quantity).toBe(3);
+    expect(seatLineItem.unitAmountCents).toBe(1000); // $10.00 per seat
+    expect(seatLineItem.subtotalCents).toBe(3000); // 3 × $10.00
+    expect(seatLineItem.description).toContain("per month per seat");
+
+    // 2. USAGE CHARGES - Should have exactly 2 usage line items (one per seat with usage)
+    const usageLineItems = nonTaxLineItems.filter(
+      (item) => item.type === "usage"
+    );
+    expect(usageLineItems).toHaveLength(2);
+
+    // Sort by quantity to get consistent ordering (u1=60, u2=120)
+    usageLineItems.sort((a, b) => (a.quantity || 0) - (b.quantity || 0));
+
+    // u1 usage: 60 calls at $0.05 each = $3.00
+    const u1UsageItem = usageLineItems[0];
+    expect(u1UsageItem.quantity).toBe(60);
+    expect(u1UsageItem.unitAmountCents).toBe(5); // $0.05 per call
+    expect(u1UsageItem.subtotalCents).toBe(300); // 60 × $0.05
+    expect(u1UsageItem.description).toContain("API Calls usage (u1)");
+
+    // u2 usage: 120 calls at $0.05 each = $6.00
+    const u2UsageItem = usageLineItems[1];
+    expect(u2UsageItem.quantity).toBe(120);
+    expect(u2UsageItem.unitAmountCents).toBe(5); // $0.05 per call
+    expect(u2UsageItem.subtotalCents).toBe(600); // 120 × $0.05
+    expect(u2UsageItem.description).toContain("API Calls usage (u2)");
+
+    // 3. CREDIT DEDUCTIONS - Should have exactly 2 credit line items (one per seat)
+    const creditLineItems = nonTaxLineItems.filter(
+      (item) => item.type === "credit"
+    );
+    expect(creditLineItems).toHaveLength(2);
+
+    // Sort by quantity to get consistent ordering (u1=60 credits, u2=100 credits)
+    creditLineItems.sort((a, b) => (a.quantity || 0) - (b.quantity || 0));
+
+    // u1 credit deduction: 60 credits consumed × -$0.05 = -$3.00
+    const u1CreditItem = creditLineItems[0];
+    expect(u1CreditItem.quantity).toBe(60);
+    expect(u1CreditItem.unitAmountCents).toBe(-5); // -$0.05 per credit
+    expect(u1CreditItem.subtotalCents).toBe(-300); // 60 × -$0.05
+    expect(u1CreditItem.description).toContain(
+      "Credits (60 units × $0.05) (u1)"
+    );
+
+    // u2 credit deduction: 100 credits consumed × -$0.05 = -$5.00 (maxed out allowance)
+    const u2CreditItem = creditLineItems[1];
+    expect(u2CreditItem.quantity).toBe(100);
+    expect(u2CreditItem.unitAmountCents).toBe(-5); // -$0.05 per credit
+    expect(u2CreditItem.subtotalCents).toBe(-500); // 100 × -$0.05
+    expect(u2CreditItem.description).toContain(
+      "Credits (100 units × $0.05) (u2)"
+    );
+
+    // 4. INVOICE TOTAL CALCULATION
+    // Expected: (3 seats × $10) + (60+120 usage × $0.05) - (60+100 credits × $0.05) = $30 + $9 - $8 = $31
+    expect(invoice!.totalAmountCents).toBe(3100); // $31.00
+
+    console.log("Precise invoice breakdown:");
+    console.log(`- Seat charges: 1 line item, 3 seats, $30.00`);
+    console.log(
+      `- Usage charges: 2 line items, u1=60 calls ($3.00) + u2=120 calls ($6.00) = $9.00`
+    );
+    console.log(
+      `- Credit deductions: 2 line items, u1=60 credits (-$3.00) + u2=100 credits (-$5.00) = -$8.00`
+    );
+    console.log(`- Final total: $${invoice!.totalAmountCents / 100}`);
+
+    // 5. VERIFY TOTAL LINE ITEMS
+    expect(nonTaxLineItems).toHaveLength(5); // 1 seat + 2 usage + 2 credits
+  }, 60000);
+
+  it("should revoke seat credits immediately on seat removal", async () => {
+    // Create seat-based plan WITH usage features and credits
+    const seatPlan = await createSeatBasedPlan(1000, undefined, {
+      currency: "USD",
+      minSeats: 0,
+      billImmediately: false,
+      features: [
+        {
+          featureName: "API Calls",
+          slug: `api-calls-revoke-${Date.now()}`,
+          eventName: `api_usage_revoke_${Date.now()}`,
+          isUsageBased: true,
+          usagePricePerUnit: 5,
+          hasCreditAllowance: true,
+          creditAllowanceAmount: 100,
+          creditAllowanceRenewal: "monthly",
+        },
+      ],
+    });
+
+    planId = seatPlan.plan.id;
+
+    // Create subscription using proper payment flow
+    const customerEmail = `${externalCustomerId}-revoke@example.com`;
+    const subResult = await createSubscription(
+      customerEmail,
+      seatPlan.monthlyPrice!.id,
+      planId
+    );
+    subscriptionId = subResult.subscription.id;
+    customerId = subResult.customer.id;
+
+    // Add 1 seat
+    await addSeats(["revoke_user_1"], subDays(testStartTime, 10));
+
+    await sleep(2000, { alsoSleepInStripeMock: true });
+
+    // Find the seat customer by external ID
+    const seatCustomer = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.merchantId, merchantId),
+        eq(customers.externalCustomerId, "revoke_user_1"),
+        isNull(customers.deletedAt)
+      ),
+    });
+    expect(seatCustomer).toBeDefined();
+
+    // Verify initial grant exists and is ACTIVE with full remaining
+    const initialGrants = await db.query.creditGrants.findMany({
+      where: and(
+        eq(creditGrants.merchantId, merchantId),
+        eq(creditGrants.customerId, seatCustomer!.id),
+        eq(creditGrants.applicationType, "usage"),
+        isNull(creditGrants.deletedAt)
+      ),
+    });
+    expect(initialGrants.length).toBe(1);
+    expect(initialGrants[0].status).toBe("ACTIVE");
+    const prevRemaining = initialGrants[0].remainingAmount;
+    expect(prevRemaining).toBeGreaterThanOrEqual(100);
+
+    // Remove the seat
+    const removeResult = await removeSeats(
+      ["revoke_user_1"],
+      addMinutes(testStartTime, 1)
+    );
+    expect(removeResult.length).toBe(1);
+    if (!("error" in removeResult[0])) {
+      expect(removeResult[0].message).toBe("Seat removed successfully");
+    }
+
+    // Verify grants are revoked immediately
+    const afterRemovalGrants = await db.query.creditGrants.findMany({
+      where: and(
+        eq(creditGrants.merchantId, merchantId),
+        eq(creditGrants.customerId, seatCustomer!.id),
+        isNull(creditGrants.deletedAt)
+      ),
+    });
+    expect(afterRemovalGrants.length).toBeGreaterThan(0);
+    for (const g of afterRemovalGrants) {
+      expect(["REVOKED", "EXPIRED", "DEPLETED", "ACTIVE"]).toContain(g.status);
+    }
+
+    // At least the previously ACTIVE grant should now be REVOKED with 0 remaining
+    const revoked = afterRemovalGrants.find((g) => g.status === "REVOKED");
+    expect(revoked).toBeDefined();
+    expect(revoked!.remainingAmount).toBe(0);
+
+    // Verify there is a revoke transaction for that grant
+    const revokeTx = await db.query.creditUsageTransactions.findMany({
+      where: and(
+        eq(creditUsageTransactions.merchantId, merchantId),
+        eq(creditUsageTransactions.customerId, seatCustomer!.id),
+        eq(creditUsageTransactions.creditGrantId, revoked!.id),
+        eq(creditUsageTransactions.eventName, "revoked")
+      ),
+    });
+    expect(revokeTx.length).toBe(1);
+
+    // Verify entitlements are soft-deleted for the seat on this subscription
+    const entitlements = await db.query.subscriptionFeatures.findMany({
+      where: and(
+        eq(subscriptionFeatures.merchantId, merchantId),
+        eq(subscriptionFeatures.customerId, seatCustomer!.id),
+        eq(subscriptionFeatures.subscriptionId, subscriptionId)
+      ),
+    });
+    // If any entitlements existed, they should be soft-deleted now
+    for (const sf of entitlements) {
+      expect(sf.deletedAt).not.toBeNull();
+    }
   }, 20000);
 
-  it("should handle zero seats correctly", async () => {
+  it("should handle zero added seats correctly", async () => {
     // Create seat-based plan
     const seatPlan = await createSeatBasedPlan(1000); // $10 per seat per month
     planId = seatPlan.plan.id;
@@ -968,12 +1522,13 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      subDays(testStartTime, 20) // No backdating needed, primary seat event should be in billing window
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
 
-    // Don't add any seats - should have 0 seats
+    // Don't add any seats - should have 1 seat (the primary customer)
     let seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -981,13 +1536,13 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(0);
+    expect(seatCount).toBe(1);
 
     // Trigger billing cycle
     const billingResult = await advanceBillingAndProcess();
     expect(billingResult.subscriptionsProcessed).toBe(1);
 
-    // Check invoice - should bill for 0 seats
+    // Check invoice - should bill for 1 seats
     const invoice = await db.query.invoices.findFirst({
       where: eq(invoices.customerId, customerId),
       with: { lineItems: true },
@@ -998,9 +1553,9 @@ describe("Seat-Based Plans Integration Tests", () => {
       (item) => item.type !== "tax"
     );
 
-    expect(invoice!.totalAmountCents).toBe(0); // 0 seats × $10 = $0
+    expect(invoice!.totalAmountCents).toBe(1000); // 1 seats × $10 = $10
     expect(invoice!.lineItems).toHaveLength(1);
-    expect(invoice!.lineItems[0].quantity).toBe(0);
+    expect(invoice!.lineItems[0].quantity).toBe(1);
   }, 20000);
 
   it("should handle seat churning (rapid add/remove) correctly", async () => {
@@ -1013,7 +1568,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      subDays(testStartTime, 45) // Primary seat event needs to be at the earliest event timestamp
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
@@ -1039,9 +1595,9 @@ describe("Seat-Based Plans Integration Tests", () => {
     // Remove 1 seat
     await removeSeats(["user1"], addMinutes(eventTimestamp_1mo_ago, 3));
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
-    // Current active seats should be 3 (user5, user6, user7)
+    // Current active seats should be 3 (primary, user5, user6, user7)
     let seatCount = await getCurrentSeatCount(
       customerId,
       subscriptionId,
@@ -1049,14 +1605,14 @@ describe("Seat-Based Plans Integration Tests", () => {
       testStartTime,
       addDays(testStartTime, 30)
     );
-    expect(seatCount).toBe(3);
+    expect(seatCount).toBe(4);
 
     // Trigger billing cycle in
     const billingResult = await advanceBillingAndProcess();
     expect(billingResult.subscriptionsProcessed).toBe(1);
 
     // We backdate by a month. So, all the additions 2mo ago and 1mo are in (5 + 2)
-    // minus the removals 2mo ago (3) = 5 + 2 - 3 = 4 seats
+    // minus the removals 2mo ago (3) = 5 + 2 - 3 = 4 seats. plus primary is 5
     const invoice = await db.query.invoices.findFirst({
       where: eq(invoices.customerId, customerId),
       with: { lineItems: true },
@@ -1067,9 +1623,9 @@ describe("Seat-Based Plans Integration Tests", () => {
       (item) => item.type !== "tax"
     );
 
-    expect(invoice!.totalAmountCents).toBe(4000); // 4 seats × $10 = $40
+    expect(invoice!.totalAmountCents).toBe(5000); // 5 seats × $10 = $50
     expect(invoice!.lineItems).toHaveLength(1);
-    expect(invoice!.lineItems[0].quantity).toBe(4);
+    expect(invoice!.lineItems[0].quantity).toBe(5);
   }, 20000);
 
   it("should handle proration correctly for mid-cycle changes", async () => {
@@ -1082,7 +1638,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      subDays(testStartTime, 20)
     );
     subscriptionId = subResult.subscription.id;
     customerId = subResult.customer.id;
@@ -1093,12 +1650,12 @@ describe("Seat-Based Plans Integration Tests", () => {
     await addSeats(["user1", "user2"], eventTimestamp);
 
     // Wait a bit to simulate mid-cycle
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
     // Add 1 more seat mid-cycle
     await addSeats(["user3"], addMinutes(eventTimestamp, 1));
 
-    await sleep(1000);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
     // Current active seats should be 3
     let seatCount = await getCurrentSeatCount(
@@ -1108,7 +1665,7 @@ describe("Seat-Based Plans Integration Tests", () => {
       subDays(testStartTime, 15),
       addDays(testStartTime, 15)
     );
-    expect(seatCount).toBe(3);
+    expect(seatCount).toBe(4);
 
     // Trigger billing cycle
     const billingResult = await advanceBillingAndProcess();
@@ -1125,9 +1682,9 @@ describe("Seat-Based Plans Integration Tests", () => {
       (item) => item.type !== "tax"
     );
 
-    expect(invoice!.totalAmountCents).toBe(9000); // 3 seats × $30 = $90
+    expect(invoice!.totalAmountCents).toBe(12000); // 4 seats × $30 = $120
     expect(invoice!.lineItems).toHaveLength(1);
-    expect(invoice!.lineItems[0].quantity).toBe(3);
+    expect(invoice!.lineItems[0].quantity).toBe(4);
   }, 20000);
 
   it("should create USD plan with min seats and bill additional seat immediately", async () => {
@@ -1145,7 +1702,8 @@ describe("Seat-Based Plans Integration Tests", () => {
     const subResult = await createSubscription(
       customerEmail,
       seatPlan.monthlyPrice!.id,
-      planId
+      planId,
+      testStartTime // No backdating needed, this test doesn't use backdated events
     );
 
     subscriptionId = subResult.subscription.id;
@@ -1158,9 +1716,9 @@ describe("Seat-Based Plans Integration Tests", () => {
     expect(invoicesInitial).toHaveLength(1);
     expect(invoicesInitial[0].totalAmountCents).toBe(3000);
 
-    // Step 3: add 3 users (within min seats) – no immediate payment expected
-    await addSeats(["u1", "u2", "u3"]);
-    await sleep(1000);
+    // Step 3: add 2 users (within min seats) – no immediate payment expected
+    await addSeats(["u1", "u2"]);
+    await sleep(1000, { alsoSleepInStripeMock: true });
 
     // Verify still only one invoice
     invoicesInitial = await db.query.invoices.findMany({
@@ -1168,7 +1726,9 @@ describe("Seat-Based Plans Integration Tests", () => {
     });
     expect(invoicesInitial).toHaveLength(1);
 
-    // Step 4: add a 4th user – should trigger immediate overage billing and charge
+    // Step 4: add a 3rd user – should trigger immediate overage billing and charge
+    await addSeats(["u3"]);
+
     // Add a 4th user with a later timestamp to test proration
     const prorationTimestamp = addDays(testStartTime, 10);
     await addSeats(["u4"], prorationTimestamp);
@@ -1181,15 +1741,17 @@ describe("Seat-Based Plans Integration Tests", () => {
     });
 
     const invoiceIds = customerInvoices.map((inv) => inv.id);
-    expect(invoiceIds).toHaveLength(2);
+    expect(invoiceIds).toHaveLength(3);
 
     // filter out the initial invoice
-    const overageInvoice = customerInvoices.filter(
+    const overageInvoices = customerInvoices.filter(
       (inv) => inv.id !== invoicesInitial[0].id
     );
-    expect(overageInvoice).toHaveLength(1);
+    expect(overageInvoices).toHaveLength(2);
+    // sort by amount
+    overageInvoices.sort((a, b) => a.totalAmountCents - b.totalAmountCents);
 
-    // Calculate expected prorated amount
+    // Calculate expected prorated amount for the second overage invoice
     const subDetail = await db.query.subscriptionDetails.findFirst({
       where: eq(subscriptionDetails.subscriptionId, subscriptionId),
     });
@@ -1201,25 +1763,41 @@ describe("Seat-Based Plans Integration Tests", () => {
       prorationTimestamp
     );
 
-    expect(overageInvoice[0].totalAmountCents).toBe(expectedProratedAmount);
-    expect(overageInvoice[0].status).toBe("paid"); // Should be immediately charged
+    // First overage invoice should be for a full seat
+    expect(overageInvoices[1].totalAmountCents).toBe(1000);
+    expect(overageInvoices[1].status).toBe("paid"); // Should be immediately charged
+
+    // Second overage invoice should be prorated
+    expect(overageInvoices[0].totalAmountCents).toBe(expectedProratedAmount);
+    expect(overageInvoices[0].status).toBe("paid"); // Should be immediately charged
 
     // Get line items for the overage invoice
     const overageLineItems = await db.query.invoiceLineItems.findMany({
       where: and(
-        eq(invoiceLineItems.invoiceId, overageInvoice[0].id),
+        eq(invoiceLineItems.invoiceId, overageInvoices[1].id),
         ne(invoiceLineItems.type, "tax")
       ),
     });
     expect(overageLineItems).toHaveLength(1);
-    expect(overageLineItems[0].unitAmountCents).toBe(expectedProratedAmount);
+    expect(overageLineItems[0].unitAmountCents).toBe(1000);
+
+    const proratedOverageLineItems = await db.query.invoiceLineItems.findMany({
+      where: and(
+        eq(invoiceLineItems.invoiceId, overageInvoices[0].id),
+        ne(invoiceLineItems.type, "tax")
+      ),
+    });
+    expect(proratedOverageLineItems).toHaveLength(1);
+    expect(proratedOverageLineItems[0].unitAmountCents).toBe(
+      expectedProratedAmount
+    );
 
     const paymentsForCustomer = await db.query.payments.findMany({
       where: inArray(payments.invoiceId, invoiceIds),
       orderBy: (payments, { asc }) => [asc(payments.createdAt)],
     });
 
-    expect(paymentsForCustomer.length).toBe(2);
+    expect(paymentsForCustomer.length).toBe(3);
 
     // Check that the first payment is for the initial invoice
     expect(paymentsForCustomer[0].invoiceId).toBe(invoicesInitial[0].id);
@@ -1227,10 +1805,17 @@ describe("Seat-Based Plans Integration Tests", () => {
 
     // Check that the second payment corresponds to the overage invoice and amount
     const overagePayment = paymentsForCustomer.find(
-      (p) => p.invoiceId === overageInvoice[0].id
+      (p) => p.invoiceId === overageInvoices[1].id
     );
     expect(overagePayment).toBeDefined();
-    expect(overagePayment!.amountCents).toBe(expectedProratedAmount);
+    expect(overagePayment!.amountCents).toBe(1000);
+
+    // Check that the third payment corresponds to the prorated overage invoice and amount
+    const proratedOveragePayment = paymentsForCustomer.find(
+      (p) => p.invoiceId === overageInvoices[0].id
+    );
+    expect(proratedOveragePayment).toBeDefined();
+    expect(proratedOveragePayment!.amountCents).toBe(expectedProratedAmount);
   }, 20000);
 
   it("should edit a seat-based plan in-place for metadata-only changes when subscribers exist", async () => {
@@ -1247,7 +1832,12 @@ describe("Seat-Based Plans Integration Tests", () => {
 
     // 2. Create a subscription for this plan, so it has an active subscriber.
     const customerEmail = `${externalCustomerId}-metadata-edit@example.com`;
-    await createSubscription(customerEmail, monthlyPrice!.id, originalPlanId);
+    await createSubscription(
+      customerEmail,
+      monthlyPrice!.id,
+      originalPlanId,
+      testStartTime
+    );
 
     // 3. Construct the edit payload with only the name changed.
     const newPlanName = "Updated Seat Plan Name";
@@ -1301,5 +1891,69 @@ describe("Seat-Based Plans Integration Tests", () => {
     expect(updatedPlanInDb.id).toBe(originalPlanId);
     expect(updatedPlanInDb.planName).toBe(newPlanName);
     expect(updatedPlanInDb.planDescription).toBe(newDescription);
+  }, 20000);
+
+  it("should automatically count primary customer as first seat when subscribing to seat-based plan", async () => {
+    // Create a simple seat-based plan
+    const seatPlan = await createSeatBasedPlan(2000); // $20/month per seat
+
+    const planId = seatPlan.plan.id;
+    const monthlyPrice = seatPlan.monthlyPrice;
+
+    if (!monthlyPrice) {
+      throw new Error("Monthly price not found for seat-based plan");
+    }
+
+    // Create subscription for primary customer
+    const customerEmail = `primary-${Date.now()}@example.com`;
+    const subResult = await createSubscription(
+      customerEmail,
+      monthlyPrice.id,
+      planId,
+      testStartTime
+    );
+
+    const primaryCustomerId = subResult.customer.id;
+    const primaryExternalId = subResult.customer.externalCustomerId!;
+
+    // Wait a moment for events to process
+    await sleep(2000);
+
+    // Check that the primary customer has a seat_added event
+    const seatEvents = await questDbService.queryMetrics({
+      merchantId,
+      metricType: "complex",
+      timeframe: { type: "ALL" },
+      rawSql: `
+        SELECT event_name, event_string, customer_id, event_timestamp
+        FROM events
+        WHERE merchant_id = $1
+          AND customer_id = $2
+          AND event_name = 'seat_added'
+          AND event_string = $3
+        ORDER BY event_timestamp DESC
+      `,
+      rawValues: [merchantId, primaryCustomerId, primaryExternalId],
+    });
+
+    expect(seatEvents.error).toBeFalsy();
+    expect(seatEvents.rows?.length).toBe(1);
+
+    const seatEvent = seatEvents.rows![0];
+    expect(seatEvent.event_name).toBe("seat_added");
+    expect(seatEvent.event_string).toBe(primaryExternalId);
+    expect(seatEvent.customer_id).toBe(primaryCustomerId);
+
+    // Verify organization setup
+    const primaryCustomer = await db.query.customers.findFirst({
+      where: eq(customers.id, primaryCustomerId),
+    });
+
+    expect(primaryCustomer?.customerOrganizationId).toBeTruthy();
+    expect(primaryCustomer?.orgRole).toBe("primary");
+
+    console.info(
+      `Test completed: Primary customer ${primaryExternalId} automatically counted as first seat in plan ${planId}`
+    );
   }, 20000);
 });

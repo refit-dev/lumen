@@ -886,6 +886,8 @@ export const publicPricingTablesRouter = new Hono()
           let priceInterval = "month";
           let priceIdMonthly: string | undefined;
           let priceIdYearly: string | undefined;
+          let foundMonthly = false;
+          let foundYearly = false;
 
           // Process all prices for this plan to find monthly and yearly pricing
           if (
@@ -906,7 +908,7 @@ export const publicPricingTablesRouter = new Hono()
                     (component.type === "fixed" ||
                       component.type === "per_unit") &&
                     "amount_cents" in component &&
-                    component.amount_cents
+                    typeof (component as any).amount_cents === "number"
                   ) {
                     let recurrence = "";
 
@@ -924,18 +926,19 @@ export const publicPricingTablesRouter = new Hono()
                     }
 
                     // Assign price based on recurrence - each price object typically has one billing frequency
-                    if (recurrence.includes("month") && priceMonthly === 0) {
-                      priceMonthly = component.amount_cents;
+                    const amountCents = (component as any)
+                      .amount_cents as number;
+                    if (recurrence.includes("month") && !foundMonthly) {
+                      priceMonthly = amountCents;
                       priceIdMonthly = price.id;
-                    } else if (
-                      recurrence.includes("year") &&
-                      priceYearly === 0
-                    ) {
-                      priceYearly = component.amount_cents;
+                      foundMonthly = true;
+                    } else if (recurrence.includes("year") && !foundYearly) {
+                      priceYearly = amountCents;
                       priceIdYearly = price.id;
+                      foundYearly = true;
                     } else if (priceAmount === 0) {
                       // Use the first component as fallback
-                      priceAmount = component.amount_cents;
+                      priceAmount = amountCents;
                       priceInterval = recurrence || "month";
                     }
 
@@ -951,13 +954,13 @@ export const publicPricingTablesRouter = new Hono()
           // If no specific monthly/yearly pricing found, use the first component
           if (
             latestPrice &&
-            priceMonthly === 0 &&
-            priceYearly === 0 &&
+            !foundMonthly &&
+            !foundYearly &&
             priceAmount === 0
           ) {
             const firstComponent = latestPrice.pricingData.components[0];
             if ("amount_cents" in firstComponent) {
-              priceAmount = firstComponent.amount_cents;
+              priceAmount = (firstComponent as any).amount_cents as number;
 
               if (
                 "recurrence_rule" in firstComponent &&
@@ -1003,9 +1006,9 @@ export const publicPricingTablesRouter = new Hono()
             pspPlanId: planData.pspPlanId,
             price: priceAmount / 100, // Convert cents to dollars/euros
             priceMonthly: priceMonthly / 100, // Convert cents to dollars/euros
-            priceYearly: priceYearly
+            priceYearly: foundYearly
               ? priceYearly / 100
-              : priceMonthly
+              : foundMonthly
                 ? (priceMonthly * 12) / 100
                 : 0, // Convert cents to dollars/euros
             currency: latestPrice ? latestPrice.currency.toLowerCase() : "usd",
@@ -1258,6 +1261,8 @@ export const publicPricingTablesRouter = new Hono()
           let priceInterval = "month";
           let priceIdMonthly: string | undefined;
           let priceIdYearly: string | undefined;
+          let foundMonthly = false;
+          let foundYearly = false;
 
           // Process all prices for this plan to find monthly and yearly pricing
           if (
@@ -1278,7 +1283,7 @@ export const publicPricingTablesRouter = new Hono()
                     (component.type === "fixed" ||
                       component.type === "per_unit") &&
                     "amount_cents" in component &&
-                    component.amount_cents
+                    typeof (component as any).amount_cents === "number"
                   ) {
                     let recurrence = "";
 
@@ -1296,18 +1301,19 @@ export const publicPricingTablesRouter = new Hono()
                     }
 
                     // Assign price based on recurrence - each price object typically has one billing frequency
-                    if (recurrence.includes("month") && priceMonthly === 0) {
-                      priceMonthly = component.amount_cents;
+                    const amountCents = (component as any)
+                      .amount_cents as number;
+                    if (recurrence.includes("month") && !foundMonthly) {
+                      priceMonthly = amountCents;
                       priceIdMonthly = price.id;
-                    } else if (
-                      recurrence.includes("year") &&
-                      priceYearly === 0
-                    ) {
-                      priceYearly = component.amount_cents;
+                      foundMonthly = true;
+                    } else if (recurrence.includes("year") && !foundYearly) {
+                      priceYearly = amountCents;
                       priceIdYearly = price.id;
+                      foundYearly = true;
                     } else if (priceAmount === 0) {
                       // Use the first component as fallback
-                      priceAmount = component.amount_cents;
+                      priceAmount = amountCents;
                       priceInterval = recurrence || "month";
                     }
 
@@ -1323,13 +1329,13 @@ export const publicPricingTablesRouter = new Hono()
           // If no specific monthly/yearly pricing found, use the first component
           if (
             latestPrice &&
-            priceMonthly === 0 &&
-            priceYearly === 0 &&
+            !foundMonthly &&
+            !foundYearly &&
             priceAmount === 0
           ) {
             const firstComponent = latestPrice.pricingData.components[0];
             if ("amount_cents" in firstComponent) {
-              priceAmount = firstComponent.amount_cents;
+              priceAmount = (firstComponent as any).amount_cents as number;
 
               if (
                 "recurrence_rule" in firstComponent &&
@@ -1376,9 +1382,9 @@ export const publicPricingTablesRouter = new Hono()
             priceMonthly: ptp.isEnterprisePlan ? 0 : priceMonthly / 100, // Convert cents to dollars/euros
             priceYearly: ptp.isEnterprisePlan
               ? 0
-              : priceYearly
+              : foundYearly
                 ? priceYearly / 100
-                : priceMonthly
+                : foundMonthly
                   ? (priceMonthly * 12) / 100
                   : 0, // Convert cents to dollars/euros
             currency: latestPrice ? latestPrice.currency.toLowerCase() : "usd",

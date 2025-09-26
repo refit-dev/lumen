@@ -30,10 +30,8 @@ import {
   FeatureSelect,
 } from "../test-helpers/types";
 import { FeatureValue } from "../test-helpers/data/feature";
-import {
-  calculateNextBillingDate,
-  upgradeSubscriptionAndInvoice,
-} from "../../src/helpers/billing";
+import { upgradeSubscriptionAndInvoice } from "../../src/helpers/billing";
+import { calculateNextBillingDate } from "../../src/helpers/billing-dates";
 import {
   invoices,
   invoiceLineItems,
@@ -72,7 +70,7 @@ interface Subscription {
   planId: string;
   effectivePriceId: string;
   merchantId: string;
-  stableSubscriptionId: string;
+  stableSubscriptionId?: string;
   versionNumber: number;
   createdAt: string;
   deletedAt: string | null;
@@ -374,7 +372,7 @@ describe("Subscriptions API", () => {
     const overrideResponse = await apiClient.subscriptions["feature-overrides"][
       ":id"
     ].$post({
-      param: { id: subscription.stableSubscriptionId },
+      param: { id: subscription.stableSubscriptionId! },
       json: {
         featureIds: [
           createdFeatures[0].id, // max-users-1 - override
@@ -484,7 +482,7 @@ describe("Subscriptions API", () => {
     const priceOverrideResponse = await apiClient.subscriptions[
       "price-override"
     ][":id"].$post({
-      param: { id: subscription.stableSubscriptionId },
+      param: { id: subscription.stableSubscriptionId! },
       json: {
         priceId: newPrice.id,
       },
@@ -943,7 +941,7 @@ describe("Subscriptions API", () => {
       },
     });
 
-    // Try to create a second subscription - should return the existing one due to new business logic
+    // Try to create a second subscription - should fail with 409 and include existingSubscriptionId
     const createResponse2 = await apiClient.subscriptions.$post({
       json: {
         customerId: testCustomer.id,
@@ -952,18 +950,27 @@ describe("Subscriptions API", () => {
       },
     });
 
-    if ("error" in createResponse2) {
-      throw new Error(`Unexpected error: ${createResponse2.error}`);
-    }
-
-    expect(createResponse2.status).toBe(201);
+    expect(createResponse2.status).toBe(409);
     const createBody2 = await createResponse2.json();
-    if ("error" in createBody2) {
-      throw new Error(`Unexpected error: ${createBody2.error}`);
-    }
 
-    // Should return the existing subscription, not create a new one
-    expect(createBody2.subscription!.id).toBe(createBody1.subscription!.id);
+    // Should include the existing subscription stable ID and not create a new one
+    if ("error" in createBody2) {
+      expect(createBody2.error).toBe(
+        "Customer already has an active subscription."
+      );
+      // Should include existingSubscriptionId pointing to the original subscription
+      expect(
+        "existingSubscriptionId" in createBody2 &&
+          typeof createBody2.existingSubscriptionId === "string"
+      ).toBe(true);
+      if ("existingSubscriptionId" in createBody2) {
+        expect(createBody2.existingSubscriptionId).toBe(
+          createBody1.subscription!.stableSubscriptionId
+        );
+      }
+    } else {
+      throw new Error("Expected 409 error body for duplicate subscription");
+    }
 
     // List subscriptions for the customer
     const listResponse = await apiClient.subscriptions.customer[

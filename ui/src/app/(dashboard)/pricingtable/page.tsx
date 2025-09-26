@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
-import { PricingTable } from "@/components/ui/pricing-table";
+import { PricingTable, fetchPricingTable } from "@/components/ui/pricing-table";
 import { apiClient } from "@/lib/hono-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -61,7 +61,11 @@ export default function PricingTablePreview() {
 
   // User ID state for test mode
   const [userId, setUserId] = useState<string>("tmp-user-2");
+  const [organizationId, setOrganizationId] = useState<string>("");
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
+  const [pricingToggleWarning, setPricingToggleWarning] = useState<
+    string | null
+  >(null);
 
   // Fetch selected pricing table details
   const fetchPricingTableDetails = React.useCallback(
@@ -171,6 +175,45 @@ export default function PricingTablePreview() {
     }
   }, [pricingTableSlug, pricingTables, fetchPricingTableDetails]);
 
+  // Warn if the selected pricing table contains any non-enterprise plans without a yearly price
+  useEffect(() => {
+    const loadAndCheckPlans = async () => {
+      if (!publishableKey || !pricingTableSlug) {
+        setPricingToggleWarning(null);
+        return;
+      }
+      try {
+        const apiBaseUrl = (process.env.NEXT_PUBLIC_API_URL || "") + "/v1";
+        const data = await fetchPricingTable({
+          slug: pricingTableSlug,
+          lumenPublishableKey: publishableKey,
+          apiBaseUrl,
+        });
+        const nonEnterprise = (data.plans || []).filter(
+          (p) => !p.isEnterprisePlan
+        );
+        if (nonEnterprise.length === 0) {
+          setPricingToggleWarning(null);
+          return;
+        }
+        const allHaveYearly = nonEnterprise.every(
+          (p) => p.priceYearly !== undefined && !!p.priceIdYearly
+        );
+        if (!allHaveYearly) {
+          setPricingToggleWarning(
+            "One or more plans are missing a yearly price. The yearly/monthly toggle will be hidden and only monthly pricing will be shown. Add a yearly price for all non-enterprise plans to enable the toggle."
+          );
+        } else {
+          setPricingToggleWarning(null);
+        }
+      } catch {
+        // Non-blocking; ignore warning if we can't load plans here
+        setPricingToggleWarning(null);
+      }
+    };
+    loadAndCheckPlans();
+  }, [publishableKey, pricingTableSlug]);
+
   const handleInputChange = (field: keyof UpdateFormData, value: string) => {
     setFormData((prev) => ({
       ...prev,
@@ -222,6 +265,10 @@ export default function PricingTablePreview() {
 
   const handleGenerateUserId = () => {
     setUserId(generateRandomUserId());
+  };
+
+  const handleGenerateOrganizationId = () => {
+    setOrganizationId(`test-org-${Math.random().toString(36).substr(2, 9)}`);
   };
 
   if (isLoading) {
@@ -286,6 +333,13 @@ export default function PricingTablePreview() {
               </AlertDescription>
             </Alert>
           )}
+          {pricingToggleWarning && (
+            <Alert className="mt-4 border-yellow-200 bg-yellow-50">
+              <AlertDescription className="text-yellow-800">
+                {pricingToggleWarning}
+              </AlertDescription>
+            </Alert>
+          )}
         </div>
 
         <div className="space-y-8">
@@ -344,6 +398,34 @@ export default function PricingTablePreview() {
                         <p className="text-xs text-gray-500 mt-1">
                           This represents the external customer ID from your
                           system (e.g., your database user ID)
+                        </p>
+                      </div>
+                      <div>
+                        <Label htmlFor="organization-id">
+                          Organization ID (Optional)
+                        </Label>
+                        <div className="flex gap-2 mt-1">
+                          <Input
+                            id="organization-id"
+                            type="text"
+                            value={organizationId}
+                            onChange={(e) => setOrganizationId(e.target.value)}
+                            placeholder="Enter external organization ID"
+                            className="flex-1"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={handleGenerateOrganizationId}
+                            className="whitespace-nowrap"
+                          >
+                            Generate Random
+                          </Button>
+                        </div>
+                        <p className="text-xs text-gray-500 mt-1">
+                          Only needed for seat-based plans. This represents the
+                          external organization ID from your system (e.g., your
+                          company/team ID)
                         </p>
                       </div>
                     </div>
@@ -459,17 +541,15 @@ export default function MyPricingPage() {
               <div className="bg-white rounded-lg overflow-hidden">
                 {publishableKey && pricingTableSlug ? (
                   <PricingTable
-                    key={`${pricingTableSlug}-${currentPricingTable?.heading}-${currentPricingTable?.subheading}-${userId}`}
+                    key={`${pricingTableSlug}-${currentPricingTable?.heading}-${currentPricingTable?.subheading}-${userId}-${organizationId}`}
                     lumenPublishableKey={publishableKey}
                     userId={userId}
+                    organizationId={organizationId || undefined}
                     loginRedirectUrl={"/dashboard"}
                     apiBaseUrl={process.env.NEXT_PUBLIC_API_URL + "/v1"}
                     paymentProvider={paymentProvider || "stripe"}
                     environment={isTestMode ? "test" : "live"}
-                    // For this, we don't use the dogfooding URL - instead, we can directly call the internal endpoint
-                    lumenHandlerUrl={
-                      process.env.NEXT_PUBLIC_API_URL + "/v1/lumen"
-                    }
+                    lumenHandlerUrl={process.env.NEXT_PUBLIC_API_URL + "/v1"}
                   />
                 ) : (
                   <div className="p-8 text-center text-gray-500">

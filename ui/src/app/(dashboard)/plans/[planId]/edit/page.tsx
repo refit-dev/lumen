@@ -18,6 +18,7 @@ import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/ui/toggle";
 import { APIPlanWithFeatures } from "../../../../../../../api/src/helpers";
+import { PlanEnrollmentRules } from "@/components/dashboard/PlanEnrollmentRules";
 
 // Feature interface
 export interface FeatureData {
@@ -528,10 +529,9 @@ export default function EditPlanPage() {
             currency: value.currency,
             ...(!value.isEnterprisePlan && {
               monthlyPrice: value.monthlyPrice,
-              ...(hasYearlyPrice &&
-                value.yearlyPrice > 0 && {
-                  yearlyPrice: value.yearlyPrice,
-                }),
+              ...(hasYearlyPrice && {
+                yearlyPrice: value.yearlyPrice,
+              }),
               hasYearlyPrice,
               // Seat-based specific pricing settings
               isSeatBased: value.isSeatBased,
@@ -595,10 +595,11 @@ export default function EditPlanPage() {
       onSubmit: ({ value }) => {
         const errors: Record<string, string> = {};
 
-        // Validate yearly price if enabled and not enterprise plan
+        // Validate yearly price for paid plans when yearly pricing is enabled
         if (
           !value.isEnterprisePlan &&
           hasYearlyPrice &&
+          value.monthlyPrice > 0 &&
           value.yearlyPrice === 0
         ) {
           errors.yearlyPrice =
@@ -718,7 +719,7 @@ export default function EditPlanPage() {
         pricingComponents.push({
           type: "usage",
           label: `${f.featureName} usage`,
-          unit_cost_cents: Math.round(f.usagePricePerUnit * 100),
+          unit_cost_cents: f.usagePricePerUnit,
           component_id: `preview_usage_${f.slug}`,
           component_name: `usage_${f.slug}`,
           unit_label: f.slug,
@@ -1131,6 +1132,11 @@ export default function EditPlanPage() {
                   )}
                 </>
               )}
+            </div>
+
+            {/* Enrollment Rules */}
+            <div className="space-y-2">
+              <PlanEnrollmentRules planId={planId} />
             </div>
 
             {/* Simplified Features Section for now */}

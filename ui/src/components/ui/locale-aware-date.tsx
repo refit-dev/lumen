@@ -38,9 +38,12 @@ export function LocaleAwareDate({
 
     const day = dateObj.getDate();
     const year = dateObj.getFullYear();
+    const isSameYear = year === new Date().getFullYear();
 
-    // Build date string manually to ensure consistent format
-    const datePartFormatted = `${monthName} ${day}, ${year}`;
+    // Build date string manually to ensure consistent format (day first)
+    const datePartFormatted = isSameYear
+      ? `${day} ${monthName}`
+      : `${day} ${monthName} ${year}`;
 
     if (includeTime) {
       // Format time part with locale-aware 12/24 hour format
@@ -53,7 +56,9 @@ export function LocaleAwareDate({
         localeContext.locale,
         timeOptions
       ).format(dateObj);
-      formattedDate = `${datePartFormatted}, ${timePart}`;
+      formattedDate = isSameYear
+        ? `${datePartFormatted} ${timePart}`
+        : `${datePartFormatted}, ${timePart}`;
     } else {
       formattedDate = datePartFormatted;
     }

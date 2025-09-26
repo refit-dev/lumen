@@ -9,7 +9,7 @@ import {
   subscriptionsScheduledChanges,
 } from "@lumen/common/schema";
 import { eq, and, isNull, inArray, asc, desc, lt } from "drizzle-orm";
-import { planFeatures } from "@lumen/common/schema";
+import { planFeatures, PlanWithFeatures } from "@lumen/common/schema";
 import { prices } from "@lumen/common/schema";
 import { features } from "@lumen/common/schema";
 import { metrics } from "@lumen/common/schema";
@@ -43,6 +43,7 @@ import {
   getPaymentProvider,
   createDodoClient,
 } from "../helpers/paymentprovider";
+import { planEnrollmentRules } from "@lumen/common/schema";
 
 // Type definitions for API responses
 type ErrorResponse = {
@@ -63,14 +64,6 @@ interface PlanWithPlanFeature extends Plan {
     enterpriseRedirectUrl: string | null;
     buttonText: string;
   }[];
-}
-
-interface PlanWithFeatures extends Plan {
-  features: Feature[];
-  isVisibleInPricingTable: boolean;
-  isEnterprisePlan: boolean;
-  enterpriseRedirectUrl: string | null;
-  buttonText: string;
 }
 
 interface PlansResponse {
@@ -811,6 +804,7 @@ async function createPlan(
             feature.usagePricePerUnit !== undefined &&
             feature.usagePricePerUnit > 0;
 
+          // Regular plan-scoped definition for all plans (including seat-based)
           const creditDefBase = {
             merchantId,
             scope: "plan" as const,
@@ -1040,7 +1034,7 @@ async function createPlan(
       }
 
       // Create yearly pricing for both fixed and seat-based plans
-      if (hasYearlyPrice && yearlyPrice !== undefined && yearlyPrice > 0) {
+      if (hasYearlyPrice && yearlyPrice !== undefined) {
         let yearlyComponent;
 
         if (isSeatBased) {
@@ -1463,6 +1457,18 @@ export const plansRoute = new Hono()
               }))
             );
           }
+
+          // Migrate enrollment rules to reference the new internal plan ID
+          await tx
+            .update(planEnrollmentRules)
+            .set({ planId: newPlan.id, updatedAt: new Date() })
+            .where(
+              and(
+                eq(planEnrollmentRules.planId, latestPlan.id),
+                eq(planEnrollmentRules.merchantId, merchantId),
+                isNull(planEnrollmentRules.deletedAt)
+              )
+            );
 
           // Return the new plan with its associations
           const planWithFeatures = await tx.query.plans.findFirst({
@@ -2031,6 +2037,17 @@ export const plansRoute = new Hono()
           .set({ deletedAt: currentTimestamp })
           .where(
             and(eq(planFeatures.planId, planId), isNull(planFeatures.deletedAt))
+          );
+
+        // Soft delete all associated plan enrollment rules
+        await tx
+          .update(planEnrollmentRules)
+          .set({ deletedAt: currentTimestamp })
+          .where(
+            and(
+              eq(planEnrollmentRules.planId, planId),
+              isNull(planEnrollmentRules.deletedAt)
+            )
           );
 
         // Update pricing table plans to point to previous version, or remove if none exists

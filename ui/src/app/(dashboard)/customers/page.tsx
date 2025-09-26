@@ -322,71 +322,69 @@ export default function CustomersPage() {
         }
       >();
 
-      data.customers.forEach(
-        (
-          customer: Omit<Customer, "createdAt" | "updatedAt" | "deletedAt"> & {
-            createdAt: string;
-            updatedAt: string;
-            deletedAt: string | null;
-            totalPaymentsCents?: number;
-            paymentCount?: number;
-            currency?: string;
-          }
-        ) => {
-          const totalPaymentsCents = parseInt(
-            customer.totalPaymentsCents?.toString() || "0",
-            10
-          );
-          const paymentCount = parseInt(
-            customer.paymentCount?.toString() || "0",
-            10
-          );
-          const currency = customer.currency || "USD";
+      const customersFromApi = data.customers as Array<
+        Omit<Customer, "createdAt" | "updatedAt" | "deletedAt"> & {
+          createdAt: string;
+          updatedAt: string;
+          deletedAt: string | null;
+          totalPaymentsCents?: number;
+          paymentCount?: number;
+          currency?: string;
+        }
+      >;
 
-          if (customerMap.has(customer.id)) {
-            // Merge with existing customer
-            const existingCustomer = customerMap.get(customer.id)!;
+      customersFromApi.forEach((customer) => {
+        const totalPaymentsCents = parseInt(
+          customer.totalPaymentsCents?.toString() || "0",
+          10
+        );
+        const paymentCount = parseInt(
+          customer.paymentCount?.toString() || "0",
+          10
+        );
+        const currency = customer.currency || "USD";
 
-            // Only add if there are actual payments in this currency
-            if (totalPaymentsCents > 0 || paymentCount > 0) {
-              existingCustomer.currencies.push({
-                currency,
-                totalPaymentsCents,
-                paymentCount,
-              });
+        if (customerMap.has(customer.id)) {
+          // Merge with existing customer
+          const existingCustomer = customerMap.get(customer.id)!;
 
-              // Update totals
-              existingCustomer.totalPaymentsCents += totalPaymentsCents;
-              existingCustomer.paymentCount += paymentCount;
-            }
-          } else {
-            // Create new customer entry
-            const currencies =
-              totalPaymentsCents > 0 || paymentCount > 0
-                ? [
-                    {
-                      currency,
-                      totalPaymentsCents,
-                      paymentCount,
-                    },
-                  ]
-                : [];
-
-            customerMap.set(customer.id, {
-              ...customer,
-              createdAt: new Date(customer.createdAt),
-              updatedAt: new Date(customer.updatedAt),
-              deletedAt: customer.deletedAt
-                ? new Date(customer.deletedAt)
-                : null,
+          // Only add if there are actual payments in this currency
+          if (totalPaymentsCents > 0 || paymentCount > 0) {
+            existingCustomer.currencies.push({
+              currency,
               totalPaymentsCents,
               paymentCount,
-              currency,
-              currencies,
             });
+
+            // Update totals
+            existingCustomer.totalPaymentsCents += totalPaymentsCents;
+            existingCustomer.paymentCount += paymentCount;
           }
+        } else {
+          // Create new customer entry
+          const currencies =
+            totalPaymentsCents > 0 || paymentCount > 0
+              ? [
+                  {
+                    currency,
+                    totalPaymentsCents,
+                    paymentCount,
+                  },
+                ]
+              : [];
+
+          customerMap.set(customer.id, {
+            ...customer,
+            createdAt: new Date(customer.createdAt),
+            updatedAt: new Date(customer.updatedAt),
+            deletedAt: customer.deletedAt ? new Date(customer.deletedAt) : null,
+            totalPaymentsCents,
+            paymentCount,
+            currency,
+            currencies,
+          });
         }
-      );
+      });
 
       return Array.from(customerMap.values());
     },

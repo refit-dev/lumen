@@ -3,26 +3,32 @@ import { useState, useEffect, useRef } from "react";
 import { AlertCircle, Loader2, Check, X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { PaymentModal } from "./PaymentModal";
-import { Plan, PricingTableProps, PricingTableSchema } from "./types";
+import { Plan, PricingTableProps, InitialCustomer } from "./types";
 import { PricingTableCards } from "./pricing-table-cards";
 import { DodoPayments } from "dodopayments-checkout";
+import {
+  getErrorMessage,
+  sanitizeInitialCustomer,
+  currencySymbol,
+} from "../lib/utils";
 
-// Utility to normalize error messages similar to UI component
-const getErrorMessage = (error: unknown): string => {
-  if (typeof error === "string") return error;
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object") {
-    const obj = error as Record<string, unknown>;
-    if (typeof obj.error === "string") return obj.error;
-    if (typeof obj.message === "string") return obj.message;
-    if (typeof obj.details === "string") return obj.details;
-    try {
-      return JSON.stringify(obj);
-    } catch {
-      return "Unknown error occurred";
-    }
-  }
-  return "Unknown error occurred";
+// Simple validation function (replacing Zod)
+const validatePricingTableData = (data: unknown): data is PricingTableProps => {
+  if (!data || typeof data !== "object") return false;
+  const d = data as Record<string, unknown>;
+
+  if (!Array.isArray(d.plans)) return false;
+
+  return d.plans.every((plan) => {
+    if (!plan || typeof plan !== "object") return false;
+    const p = plan as Record<string, unknown>;
+    return (
+      typeof p.title === "string" &&
+      typeof p.buttonText === "string" &&
+      typeof p.price === "number" &&
+      typeof p.interval === "string"
+    );
+  });
 };
 
 export async function fetchPricingTable({
@@ -33,7 +39,7 @@ export async function fetchPricingTable({
   slug?: string;
   lumenPublishableKey: string;
   apiBaseUrl?: string;
-}) {
+}): Promise<PricingTableProps> {
   try {
     const url = slug
       ? `${apiBaseUrl}/public/pricing-tables/${slug}`
@@ -52,7 +58,7 @@ export async function fetchPricingTable({
         const errorData = await response.json();
         errorMessage = getErrorMessage(errorData) || errorMessage;
       } catch {
-        // non-JSON
+        // If response body is not JSON, use the status-based message
       }
       throw new Error(errorMessage);
     }
@@ -61,38 +67,45 @@ export async function fetchPricingTable({
     return data.pricingTable;
   } catch (error) {
     console.error("Error fetching pricing table:", error);
+    // Re-throw with consistent error message format
     throw new Error(getErrorMessage(error));
   }
 }
 
 export async function fetchSubscriptionStatus({
   externalCustomerId,
-  subscriptionStatusUrl,
+  lumenHandlerUrl,
 }: {
   externalCustomerId: string;
-  subscriptionStatusUrl: string;
+  lumenHandlerUrl: string;
 }) {
-  const url = `${subscriptionStatusUrl}?externalCustomerId=${encodeURIComponent(
-    externalCustomerId
-  )}`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    credentials: "include",
-  });
-  if (!response.ok) {
-    let message = `Failed to fetch subscription status (${response.status})`;
-    try {
-      const data = await response.json();
-      message = getErrorMessage(data) || message;
-    } catch {
-      // ignore
+  try {
+    const url = `${lumenHandlerUrl}/customers/subscription-status?externalCustomerId=${encodeURIComponent(externalCustomerId)}`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include", // Include cookies and auth headers for session-based auth
+    });
+
+    if (!response.ok) {
+      let errorMessage = `Failed to fetch subscription status (${response.status})`;
+      try {
+        const errorData = await response.json();
+        errorMessage = getErrorMessage(errorData) || errorMessage;
+      } catch {
+        // If response body is not JSON, use the status-based message
+      }
+      throw new Error(errorMessage);
     }
-    throw new Error(message);
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error("Error fetching subscription status:", error);
+    return null;
   }
-  return response.json();
 }
 
 // Centered high-contrast result overlay shown after the payment modal closes
@@ -103,7 +116,7 @@ const ResultOverlay: React.FC<{
   onClose?: () => void;
 }> = ({ type, message, countdownSeconds, onClose }) => {
   return (
-    <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
       <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full mx-4 overflow-hidden border border-gray-100">
         <div
           className={`px-6 py-5 flex items-center gap-3 ${
@@ -143,6 +156,13 @@ const ResultOverlay: React.FC<{
   );
 };
 
+// Stable overlay container used by inline modals
+const Overlay: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 overflow-y-auto">
+    {children}
+  </div>
+);
+
 // Update the component props
 export const PricingTable = function PricingTable({
   pricingTableSlug,
@@ -150,11 +170,13 @@ export const PricingTable = function PricingTable({
   redirectUrl,
   apiBaseUrl = "https://api.getlumen.dev/v1",
   userId,
+  organizationId,
   loginRedirectUrl,
   pricingData, // For backward compatibility and testing
-  subscriptionStatusUrl,
+  lumenHandlerUrl,
   paymentProvider = "stripe",
   environment = "live",
+  initialCustomer,
 }: {
   /**
    * The slug of the pricing table to fetch from Lumen (REQUIRED)
@@ -186,6 +208,12 @@ export const PricingTable = function PricingTable({
   userId?: string;
 
   /**
+   * Optional organization ID (preferred for seat-based plans)
+   * When provided, the subscription will be created under the organization's billing customer
+   */
+  organizationId?: string;
+
+  /**
    * URL to redirect if the user is not logged in
    */
   loginRedirectUrl: string;
@@ -196,9 +224,10 @@ export const PricingTable = function PricingTable({
    * In production, data is fetched from Lumen API
    */
   pricingData?: Partial<PricingTableProps>;
-  subscriptionStatusUrl?: string;
+  lumenHandlerUrl?: string;
   paymentProvider?: "stripe" | "dodo";
   environment?: "test" | "live";
+  initialCustomer?: InitialCustomer;
 }) {
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
@@ -213,11 +242,13 @@ export const PricingTable = function PricingTable({
     message: string;
     countdown: number | null;
   } | null>(null);
-  const [pendingErrorMessage, setPendingErrorMessage] = useState<string | null>(
-    null
-  );
   const countdownIntervalRef = useRef<number | null>(null);
   const autoDismissTimeoutRef = useRef<number | null>(null);
+
+  const sanitizedInitialCustomer = React.useMemo(
+    () => sanitizeInitialCustomer(initialCustomer),
+    [initialCustomer]
+  );
 
   React.useEffect(() => {
     return () => {
@@ -244,6 +275,61 @@ export const PricingTable = function PricingTable({
     setNotification(null);
   };
 
+  const handleStripePaymentSuccess = () => {
+    setSelectedPlan(null);
+    if (redirectUrl) {
+      setNotification({
+        type: "success",
+        message: "Payment successful.",
+        countdown: 5,
+      });
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
+      countdownIntervalRef.current = window.setInterval(() => {
+        setNotification((prev) => {
+          if (!prev || prev.countdown === null) return prev;
+          if (prev.countdown <= 1) {
+            window.setTimeout(() => {
+              if (countdownIntervalRef.current) {
+                clearInterval(countdownIntervalRef.current);
+                countdownIntervalRef.current = null;
+              }
+              window.location.href = redirectUrl;
+            }, 0);
+            return { ...prev, countdown: 0 };
+          }
+          return { ...prev, countdown: prev.countdown - 1 };
+        });
+      }, 1000);
+    } else {
+      setNotification({
+        type: "success",
+        message: "Payment successful.",
+        countdown: null,
+      });
+      if (autoDismissTimeoutRef.current) {
+        clearTimeout(autoDismissTimeoutRef.current);
+      }
+      autoDismissTimeoutRef.current = window.setTimeout(() => {
+        setNotification(null);
+        autoDismissTimeoutRef.current = null;
+      }, 3000);
+    }
+  };
+
+  const handleStripePaymentError = (err?: string) => {
+    const msg = err || "Payment failed. Please try again.";
+    setNotification({ type: "error", message: msg, countdown: null });
+    if (autoDismissTimeoutRef.current) {
+      clearTimeout(autoDismissTimeoutRef.current);
+    }
+    autoDismissTimeoutRef.current = window.setTimeout(() => {
+      setNotification(null);
+      autoDismissTimeoutRef.current = null;
+    }, 3000);
+  };
+
   // Fetch pricing table and optional subscription status
   useEffect(() => {
     if (lumenPublishableKey) {
@@ -258,11 +344,13 @@ export const PricingTable = function PricingTable({
         }),
       ];
 
-      if (userId && subscriptionStatusUrl) {
+      if (userId) {
+        const resolvedHandlerUrl =
+          lumenHandlerUrl || `${window.location.origin}/api/lumen`;
         fetches.push(
           fetchSubscriptionStatus({
             externalCustomerId: userId,
-            subscriptionStatusUrl,
+            lumenHandlerUrl: resolvedHandlerUrl,
           })
         );
       }
@@ -271,18 +359,19 @@ export const PricingTable = function PricingTable({
         .then((results) => {
           const pricingTableData = results[0];
           const subscriptionStatusData = results[1];
-          const result = PricingTableSchema.safeParse(pricingTableData);
-          if (result.success) {
-            setValidatedPricingData(result.data);
+          if (validatePricingTableData(pricingTableData)) {
+            setValidatedPricingData(pricingTableData);
           } else {
             setError("Invalid pricing table data received from server");
-            console.error("Validation error:", result.error);
           }
 
           if (
             subscriptionStatusData &&
             typeof subscriptionStatusData === "object" &&
-            "hasActiveSubscription" in subscriptionStatusData
+            "hasActiveSubscription" in subscriptionStatusData &&
+            subscriptionStatusData.hasActiveSubscription &&
+            "customer" in subscriptionStatusData &&
+            "subscription" in subscriptionStatusData
           ) {
             setSubscriptionStatus(subscriptionStatusData);
           }
@@ -292,12 +381,10 @@ export const PricingTable = function PricingTable({
         )
         .finally(() => setLoading(false));
     } else if (pricingData) {
-      const result = PricingTableSchema.safeParse(pricingData);
-      if (result.success) {
-        setValidatedPricingData(result.data);
+      if (validatePricingTableData(pricingData)) {
+        setValidatedPricingData(pricingData);
       } else {
         setError("Invalid pricing table configuration");
-        console.error("Validation error:", result.error);
       }
     }
   }, [
@@ -306,7 +393,7 @@ export const PricingTable = function PricingTable({
     apiBaseUrl,
     pricingData,
     userId,
-    subscriptionStatusUrl,
+    lumenHandlerUrl,
   ]);
 
   // Initialize Dodo Payments when applicable
@@ -404,10 +491,7 @@ export const PricingTable = function PricingTable({
         subscriptionStatus={subscriptionStatus}
         setSelectedPlan={
           userId
-            ? (plan) => {
-                setPendingErrorMessage(null);
-                setSelectedPlan(plan);
-              }
+            ? setSelectedPlan
             : () => {
                 window.location.href = loginRedirectUrl;
               }
@@ -418,82 +502,25 @@ export const PricingTable = function PricingTable({
           isOpen={!!selectedPlan}
           lumenPublishableKey={lumenPublishableKey}
           userId={userId || ""}
+          organizationId={organizationId}
           plan={selectedPlan}
           onClose={() => setSelectedPlan(null)}
           apiBaseUrl={apiBaseUrl}
           redirectUrl={redirectUrl}
+          initialCustomer={sanitizedInitialCustomer}
         />
       ) : (
         <PaymentModal
           isOpen={!!selectedPlan}
           lumenPublishableKey={lumenPublishableKey}
           userId={userId || ""}
+          organizationId={organizationId}
           plan={selectedPlan}
-          onPaymentSuccess={() => {
-            setSelectedPlan(null);
-            if (redirectUrl) {
-              setNotification({
-                type: "success",
-                message: "Payment successful.",
-                countdown: 5,
-              });
-              if (countdownIntervalRef.current) {
-                clearInterval(countdownIntervalRef.current);
-              }
-              countdownIntervalRef.current = window.setInterval(() => {
-                setNotification((prev) => {
-                  if (!prev || prev.countdown === null) return prev;
-                  if (prev.countdown <= 1) {
-                    window.setTimeout(() => {
-                      if (countdownIntervalRef.current) {
-                        clearInterval(countdownIntervalRef.current);
-                        countdownIntervalRef.current = null;
-                      }
-                      window.location.href = redirectUrl;
-                    }, 0);
-                    return { ...prev, countdown: 0 };
-                  }
-                  return { ...prev, countdown: prev.countdown - 1 };
-                });
-              }, 1000);
-            } else {
-              setNotification({
-                type: "success",
-                message: "Payment successful.",
-                countdown: null,
-              });
-              if (autoDismissTimeoutRef.current) {
-                clearTimeout(autoDismissTimeoutRef.current);
-              }
-              autoDismissTimeoutRef.current = window.setTimeout(() => {
-                setNotification(null);
-                autoDismissTimeoutRef.current = null;
-              }, 3000);
-            }
-          }}
-          onPaymentError={(err?: string) => {
-            const msg = err || "Payment failed. Please try again.";
-            setPendingErrorMessage(msg);
-          }}
-          onClose={() => {
-            setSelectedPlan(null);
-            if (pendingErrorMessage) {
-              setNotification({
-                type: "error",
-                message: pendingErrorMessage,
-                countdown: null,
-              });
-              setPendingErrorMessage(null);
-              if (autoDismissTimeoutRef.current) {
-                clearTimeout(autoDismissTimeoutRef.current);
-              }
-              autoDismissTimeoutRef.current = window.setTimeout(() => {
-                setNotification(null);
-                autoDismissTimeoutRef.current = null;
-              }, 3000);
-            }
-          }}
+          onPaymentSuccess={handleStripePaymentSuccess}
+          onPaymentError={handleStripePaymentError}
+          onClose={() => setSelectedPlan(null)}
           apiBaseUrl={apiBaseUrl}
+          initialCustomer={sanitizedInitialCustomer}
         />
       )}
     </div>
@@ -507,18 +534,27 @@ interface PaymentModalDodoProps {
   plan: Plan | null;
   userEmail?: string;
   userId: string;
+  organizationId?: string;
   apiBaseUrl?: string;
   onClose?: () => void;
   redirectUrl?: string;
+  initialCustomer?: InitialCustomer;
+  onPaymentError?: (message: string) => void;
 }
 
-import { Input as ShadInput } from "./ui/input";
+import { Input } from "./ui/input";
 import { Checkbox } from "./ui/checkbox";
 import { Label } from "./ui/label";
 import { SearchableSelect } from "./ui/searchable-select";
 import { customerCountries, usStates } from "./utils/countries";
-import { CloseButton } from "./ui/close-button";
 import { Button } from "./ui/button";
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from "./ui/card";
 
 const PaymentModalDodo = ({
   isOpen,
@@ -526,24 +562,46 @@ const PaymentModalDodo = ({
   plan,
   userEmail,
   userId,
+  organizationId,
   onClose,
   apiBaseUrl = "https://api.getlumen.dev/v1",
   redirectUrl,
+  onPaymentError,
+  initialCustomer,
 }: PaymentModalDodoProps) => {
   const [loading, setLoading] = useState(false);
   const [integrationError, setIntegrationError] = useState<string | null>(null);
-  const [customerEmail, setCustomerEmail] = useState<string>(userEmail || "");
-  const [customerName, setCustomerName] = useState<string>("");
-  const [businessName, setBusinessName] = useState<string>("");
-  const [customerAddress, setCustomerAddress] = useState<string>("");
-  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>("");
-  const [customerZip, setCustomerZip] = useState<string>("");
-  const [customerCity, setCustomerCity] = useState<string>("");
-  const [customerCountry, setCustomerCountry] = useState<string>("");
-  const [customerStateProvince, setCustomerStateProvince] =
-    useState<string>("");
-  const [taxId, setTaxId] = useState<string>("");
-  const [isBusiness, setIsBusiness] = useState<boolean>(false);
+  const [customerEmail, setCustomerEmail] = useState<string>(
+    initialCustomer?.email || userEmail || ""
+  );
+  const [customerName, setCustomerName] = useState<string>(
+    initialCustomer?.name || ""
+  );
+  const [businessName, setBusinessName] = useState<string>(
+    initialCustomer?.businessName || ""
+  );
+  const [customerAddress, setCustomerAddress] = useState<string>(
+    initialCustomer?.address || ""
+  );
+  const [customerAddressLine2, setCustomerAddressLine2] = useState<string>(
+    initialCustomer?.addressLine2 || ""
+  );
+  const [customerZip, setCustomerZip] = useState<string>(
+    initialCustomer?.zip || ""
+  );
+  const [customerCity, setCustomerCity] = useState<string>(
+    initialCustomer?.city || ""
+  );
+  const [customerCountry, setCustomerCountry] = useState<string>(
+    initialCustomer?.country || ""
+  );
+  const [customerStateProvince, setCustomerStateProvince] = useState<string>(
+    initialCustomer?.stateProvince || ""
+  );
+  const [taxId, setTaxId] = useState<string>(initialCustomer?.taxId || "");
+  const [isBusiness, setIsBusiness] = useState<boolean>(
+    initialCustomer?.isBusiness || false
+  );
 
   const validateEmail = (email: string) =>
     /[^\s@]+@[^\s@]+\.[^\s@]+/.test(email);
@@ -593,6 +651,7 @@ const PaymentModalDodo = ({
         customerEmail,
         customerName,
         userId,
+        ...(organizationId && { organizationId }),
         planId: plan.planId,
         priceId,
         currency: plan.currency || "USD",
@@ -634,15 +693,7 @@ const PaymentModalDodo = ({
               "lumen-dodo-overlay-notice"
             );
             if (existing) return true;
-            const currency = plan.currency
-              ? plan.currency.toLowerCase()
-              : "eur";
-            const symbol =
-              currency === "usd"
-                ? "$"
-                : currency === "eur"
-                  ? "€"
-                  : currency.toUpperCase();
+            const symbol = plan.currency ? currencySymbol(plan.currency) : "€";
             const amount = (() => {
               const base =
                 isYearly && plan.priceYearly
@@ -715,64 +766,59 @@ const PaymentModalDodo = ({
     } catch (err) {
       console.error(err);
       setIntegrationError("Failed to initialize payment. Please try again.");
+      onPaymentError?.("Failed to initialize payment. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 50,
-        background: "rgba(0,0,0,0.5)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 16,
-      }}
-    >
-      <div className="w-full max-w-lg max-h-[90vh] flex flex-col relative bg-white rounded-md">
-        <div className="p-6 flex-shrink-0 relative">
+    <Overlay>
+      <Card className="w-full max-w-lg max-h-[90vh] flex flex-col relative">
+        <CardHeader className="flex-shrink-0">
           {onClose && (
-            <CloseButton onClick={onClose} aria-label="Close modal">
-              ×
-            </CloseButton>
+            <button
+              onClick={onClose}
+              aria-label="Close modal"
+              className="absolute top-4 right-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none"
+            >
+              <X className="h-4 w-4" />
+              <span className="sr-only">×</span>
+            </button>
           )}
-          <div className="text-xl font-semibold">
+          <CardTitle>
             {plan?.trial?.available
               ? "Start your free trial"
               : "Enter your details"}
-          </div>
-          <div className="text-sm text-muted-foreground mt-1">
+          </CardTitle>
+          <CardDescription>
             {plan?.trial?.available
               ? `Start your ${plan.trial.days}-day free trial for ${plan.title}. You won't be charged today (taxes may apply after trial).`
               : `Please provide your information to proceed with the payment for ${plan?.title}.`}
-          </div>
-        </div>
-        <div className="p-6 pt-0 flex-1 overflow-y-auto">
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex-1 overflow-y-auto">
           {loading ? (
             <div className="flex items-center justify-center min-h-[200px]">
               <Loader2 className="h-10 w-10 animate-spin text-primary" />
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="space-y-4">
-              <ShadInput
+              <Input
                 type="email"
                 placeholder="Email address"
                 value={customerEmail}
-                onChange={(e: any) => {
+                onChange={(e) => {
                   setCustomerEmail(e.target.value);
                   setIntegrationError(null);
                 }}
                 required
               />
-              <ShadInput
+              <Input
                 type="text"
                 placeholder="Full name"
                 value={customerName}
-                onChange={(e: any) => {
+                onChange={(e) => {
                   setCustomerName(e.target.value);
                   setIntegrationError(null);
                 }}
@@ -782,55 +828,55 @@ const PaymentModalDodo = ({
                 <Checkbox
                   id="business-toggle"
                   checked={isBusiness}
-                  onChange={(e: any) => setIsBusiness(e.target.checked)}
+                  onCheckedChange={(checked: boolean) => setIsBusiness(checked)}
                 />
                 <Label htmlFor="business-toggle" className="cursor-pointer">
-                  I'm buying as a business
+                  I&apos;m buying as a business
                 </Label>
               </div>
               {isBusiness && (
                 <>
-                  <ShadInput
+                  <Input
                     type="text"
                     placeholder="Tax ID (VAT/EIN/GST/etc.)"
                     value={taxId}
-                    onChange={(e: any) => setTaxId(e.target.value)}
+                    onChange={(e) => setTaxId(e.target.value)}
                     required
                   />
-                  <ShadInput
+                  <Input
                     type="text"
                     placeholder="Business name"
                     value={businessName}
-                    onChange={(e: any) => setBusinessName(e.target.value)}
+                    onChange={(e) => setBusinessName(e.target.value)}
                     required
                   />
                 </>
               )}
-              <ShadInput
+              <Input
                 type="text"
                 placeholder="Address"
                 value={customerAddress}
-                onChange={(e: any) => setCustomerAddress(e.target.value)}
+                onChange={(e) => setCustomerAddress(e.target.value)}
                 required
               />
-              <ShadInput
+              <Input
                 type="text"
                 placeholder="Address line 2 (Optional)"
                 value={customerAddressLine2}
-                onChange={(e: any) => setCustomerAddressLine2(e.target.value)}
+                onChange={(e) => setCustomerAddressLine2(e.target.value)}
               />
-              <ShadInput
+              <Input
                 type="text"
                 placeholder="ZIP code"
                 value={customerZip}
-                onChange={(e: any) => setCustomerZip(e.target.value)}
+                onChange={(e) => setCustomerZip(e.target.value)}
                 required
               />
-              <ShadInput
+              <Input
                 type="text"
                 placeholder="City"
                 value={customerCity}
-                onChange={(e: any) => setCustomerCity(e.target.value)}
+                onChange={(e) => setCustomerCity(e.target.value)}
                 required
               />
               <SearchableSelect
@@ -861,13 +907,11 @@ const PaymentModalDodo = ({
                   required
                 />
               ) : (
-                <ShadInput
+                <Input
                   type="text"
                   placeholder="State/Province (optional)"
                   value={customerStateProvince}
-                  onChange={(e: any) =>
-                    setCustomerStateProvince(e.target.value)
-                  }
+                  onChange={(e) => setCustomerStateProvince(e.target.value)}
                 />
               )}
               {integrationError && (
@@ -876,19 +920,23 @@ const PaymentModalDodo = ({
                 </Alert>
               )}
               <Button type="submit" className="w-full" disabled={loading}>
-                {plan?.trial?.available
-                  ? "Start Free Trial"
-                  : (plan?.selectedPrice ??
-                        plan?.priceMonthly ??
-                        plan?.price ??
-                        0) === 0
-                    ? "Start free subscription"
-                    : "Continue to payment"}
+                {loading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : plan?.trial?.available ? (
+                  "Start Free Trial"
+                ) : (plan?.selectedPrice ??
+                    plan?.priceMonthly ??
+                    plan?.price ??
+                    0) === 0 ? (
+                  "Start free subscription"
+                ) : (
+                  "Continue to payment"
+                )}
               </Button>
             </form>
           )}
-        </div>
-      </div>
-    </div>
+        </CardContent>
+      </Card>
+    </Overlay>
   );
 };

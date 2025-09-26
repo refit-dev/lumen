@@ -6,16 +6,15 @@ import {
   beforeAll,
   afterAll,
   expect,
-  spyOn,
 } from "bun:test";
 import { db } from "../../src/db/client";
 import {
   createFullTestEnvironment,
   createTestApiKeys,
-  createTestStripe,
   createTestApiClient,
   authenticateTestUser,
   cleanupDataFull,
+  clearEventData,
 } from "../test-helpers";
 import {
   plans,
@@ -39,14 +38,18 @@ import {
 } from "@lumen/common/schema";
 import { env } from "../../src/env";
 import { testEnv } from "../test-env";
-import { eq, and, isNull, desc, lte, sql } from "drizzle-orm";
+import { eq, and, isNull, desc, sql } from "drizzle-orm";
 import Stripe from "stripe";
-import { setTimeout as sleep } from "timers/promises";
+import { sleep } from "../test-helpers/sleep";
 import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
-import { EncryptedField, encryptField } from "../../src/helpers/encryption";
+import { encryptField } from "../../src/helpers/encryption";
 import { addMonths } from "date-fns";
+import {
+  createPaymentProvider,
+  PaymentProviderAdapter,
+} from "../test-helpers/paymentProvider";
 
 // Retry helper from tax.test.ts
 async function retryWithSleep<T>(
@@ -97,34 +100,6 @@ const cleanupTrialTestData = async () => {
   }
 };
 
-// Helper function to find the Stripe CLI (copied from tax.test.ts)
-async function findStripeCLI(): Promise<string | null> {
-  try {
-    const proc = await Bun.spawn(["which", "stripe"], { stdout: "pipe" });
-    const stdout = await new Response(proc.stdout).text();
-    const result = stdout.trim();
-    if (result) return result;
-  } catch (e) {
-    /* ignore */
-  }
-  const possiblePaths = [
-    "/usr/local/bin/stripe",
-    "/opt/homebrew/bin/stripe",
-    path.join(process.env.HOME || "", ".local/bin/stripe"),
-    process.env.STRIPE_CLI_PATH,
-  ];
-  for (const p of possiblePaths) {
-    if (!p) continue;
-    try {
-      await fs.access(p, fs.constants.X_OK);
-      return p;
-    } catch (e) {
-      /* ignore */
-    }
-  }
-  return null;
-}
-
 describe("Trial-to-Paid Plan Flow", () => {
   // Test variables
   let merchantId: string;
@@ -135,6 +110,7 @@ describe("Trial-to-Paid Plan Flow", () => {
   let webhookProcess: ChildProcess | null = null;
   let apiUrl: string;
   let triggerApiAccessKey: string;
+  let paymentProvider: PaymentProviderAdapter;
 
   // Plan and price IDs
   let mainPlanId: string;
@@ -146,11 +122,10 @@ describe("Trial-to-Paid Plan Flow", () => {
   let trialSubscriptionId: string;
   let paidSubscriptionId: string;
   let customerId: string;
-  const tempWebhookSecretFile = "/tmp/test_webhook_secret.txt";
-  const tempMerchantIdFile = "/tmp/test_merchant_id.txt";
 
   beforeAll(async () => {
     await cleanupDataFull();
+    await clearEventData();
     apiUrl = env.API_URL;
     triggerApiAccessKey = env.TRIGGER_API_ACCESS_KEY!;
 
@@ -181,6 +156,8 @@ describe("Trial-to-Paid Plan Flow", () => {
       .where(eq(merchants.id, merchantId));
     console.log(`Set merchant ${merchantId} country to DE for tax test`);
 
+    paymentProvider = await createPaymentProvider();
+
     // Enable automatic tax calculation for the merchant
     await apiClient.tax.config.update.$post({
       json: { autoTaxCalculation: true },
@@ -188,12 +165,7 @@ describe("Trial-to-Paid Plan Flow", () => {
     console.log(`Enabled automatic tax calculation for merchant ${merchantId}`);
 
     // Set up Stripe integration
-    await createTestStripe({
-      merchantId,
-      secretKey: testEnv.TEST_STRIPE_SECRET_KEY,
-      publicKey: testEnv.TEST_STRIPE_PUBLIC_KEY,
-      webhookSecret: testEnv.TEST_STRIPE_WEBHOOK_SECRET,
-    });
+    await paymentProvider.registerIntegration(merchantId);
 
     // Create API keys
     const apiKeys = await createTestApiKeys({
@@ -203,55 +175,7 @@ describe("Trial-to-Paid Plan Flow", () => {
     publishableApiKey = apiKeys.publishableKey.keyValue;
 
     // Set up Stripe CLI webhook forwarding (similar to tax.test.ts)
-    const stripeCLIPath = await findStripeCLI();
-    if (stripeCLIPath) {
-      const secretProc = Bun.spawnSync([
-        stripeCLIPath,
-        "listen",
-        "--print-secret",
-        "--api-key",
-        testEnv.TEST_STRIPE_SECRET_KEY,
-      ]);
-      if (secretProc.exitCode === 0) {
-        const liveWebhookSecret = secretProc.stdout.toString().trim();
-        await fs.writeFile(tempWebhookSecretFile, liveWebhookSecret); // test webhook is read from this file
-
-        await db
-          .update(stripeSchema)
-          .set({ webhookSecret: await encryptField(liveWebhookSecret) })
-          .where(eq(stripeSchema.merchantId, merchantId));
-
-        console.log(`Updated webhook secret for merchant ${merchantId}`);
-
-        webhookProcess = spawn(
-          stripeCLIPath,
-          [
-            "listen",
-            "--forward-to",
-            `${apiUrl}/public/webhook/${merchantId}`,
-            "--api-key",
-            testEnv.TEST_STRIPE_SECRET_KEY,
-            "--events",
-            "payment_intent.succeeded,payment_intent.payment_failed,setup_intent.succeeded",
-          ],
-          { detached: true, stdio: "pipe" }
-        );
-        webhookProcess.stderr?.on("data", (data) => {
-          console.error(`Stripe CLI: ${data}`);
-        });
-        webhookProcess.on("error", (error) => {
-          console.error("Failed to start Stripe CLI:", error);
-        });
-        console.log(
-          `Webhook listener started with PID ${webhookProcess?.pid} for merchant ${merchantId}`
-        );
-        await sleep(3000);
-      }
-    } else {
-      console.warn(
-        "Stripe CLI not found. Webhook-dependent tests may fail or be inaccurate."
-      );
-    }
+    await paymentProvider.startWebhookForwarder(merchantId);
   });
 
   afterAll(async () => {
@@ -264,6 +188,7 @@ describe("Trial-to-Paid Plan Flow", () => {
       webhookProcess = null;
     }
     await cleanupDataFull();
+    await clearEventData();
   });
 
   beforeEach(async () => {
