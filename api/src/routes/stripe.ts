@@ -12,6 +12,7 @@ import {
   EncryptedField,
   decryptWebhookSecret,
 } from "../helpers/encryption";
+import { requireOrgRole } from "../middleware/auth";
 
 const WEBHOOK_BASE_URL = `${env.API_URL}/public/webhook`;
 
@@ -57,6 +58,7 @@ export const stripeRouter = new Hono()
   })
   .post(
     "/validate-keys",
+    requireOrgRole("owner"),
     zValidator(
       "json",
       z.object({
@@ -120,6 +122,7 @@ export const stripeRouter = new Hono()
   )
   .post(
     "/config",
+    requireOrgRole("owner"),
     zValidator(
       "json",
       z.object({

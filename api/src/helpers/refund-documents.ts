@@ -163,6 +163,7 @@ export async function createRefundAdjustmentInvoice(params: {
             currency: newInv.currency,
             originalInvoiceNumber: originalNumber,
             reason: reason || null,
+            db,
           });
           // TODO: Attach Dodo refund PDF once Dodo exposes a refund invoice retrieval API for refunds.
         }

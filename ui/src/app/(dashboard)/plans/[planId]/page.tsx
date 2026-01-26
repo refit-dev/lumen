@@ -15,10 +15,11 @@ import {
   ToggleRight,
   BarChart3,
   Settings,
+  DollarSign,
+  TrendingUp,
 } from "lucide-react";
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useSession } from "@/lib/auth-client";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -75,7 +76,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
-import { CreditCard, Users, Zap } from "lucide-react";
+import { CreditCard, Users, Zap, ExternalLink } from "lucide-react";
 import { PlanMigrationModal } from "@/components/dashboard/PlanMigrationModal";
 import {
   Tooltip,
@@ -328,11 +329,42 @@ const isUsageOnlyPlan = (planPrices: PriceData[] | undefined): boolean => {
   });
 };
 
+// Helper to resolve usage component name
+const getUsageDisplayName = (
+  component: PricingComponent,
+  features: APIFeature[] = []
+) => {
+  // 1. Try to find a feature that is linked to this metric ID
+  if (component.metric_id) {
+    const feature = features.find((f) =>
+      f.metricIds?.includes(component.metric_id!)
+    );
+    if (feature) return feature.displayName;
+  }
+
+  let name = component.component_name || component.label || "";
+
+  // 2. Try to match by slug (stripping 'usage_' prefix if present)
+  const potentialSlug = name.startsWith("usage_")
+    ? name.replace("usage_", "")
+    : name;
+  const featureBySlug = features.find((f) => f.slug === potentialSlug);
+  if (featureBySlug) return featureBySlug.displayName;
+
+  // 3. Fallback: Format the name cleanly
+  // Remove 'usage' prefix if present to avoid "Usage Ai Chat"
+  name = name.replace(/^usage[_\-\s]+/i, "");
+
+  // Clean up snake_case or kebab-case and title case
+  if (!name) return "Usage";
+
+  return name.replace(/[_-]/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+};
+
 export default function PlanDetailsPage() {
   const queryClient = useQueryClient();
   const router = useRouter();
   const params = useParams();
-  const { data: session } = useSession();
 
   // Table states for customers
   const [customerSorting, setCustomerSorting] = useState<SortingState>([
@@ -369,6 +401,11 @@ export default function PlanDetailsPage() {
 
   // Version selection state
   const [selectedVersionId, setSelectedVersionId] = useState<string>("");
+
+  // Tab navigation state
+  const [activeTab, setActiveTab] = useState<
+    "overview" | "customers" | "settings"
+  >("overview");
 
   const planId = params.planId as string;
 
@@ -894,72 +931,78 @@ export default function PlanDetailsPage() {
     }).format(amountCents / 100);
   };
 
-  // Helper function to format recurrence
-  const formatRecurrence = (recurrence?: string) => {
-    if (!recurrence) return "One-time";
-    if (recurrence.toLowerCase().includes("month")) return "Monthly";
-    if (recurrence.toLowerCase().includes("year")) return "Yearly";
-    if (recurrence.toLowerCase().includes("week")) return "Weekly";
-    if (recurrence.toLowerCase().includes("day")) return "Daily";
-    return recurrence;
-  };
+  // Helper to get unified pricing info (monthly and yearly combined)
+  const unifiedPricing = useMemo(() => {
+    if (!planPrices || planPrices.length === 0) return null;
 
-  // Helper function to get feature type display
-  const getFeatureTypeDisplay = (feature: APIFeature) => {
-    if (typeof feature.featureValue === "boolean") {
-      return {
-        type: "Feature",
-        icon: "toggle",
-        color: "text-slate-600",
-        bgColor: "bg-white border-slate-200",
-      };
-    } else if (typeof feature.featureValue === "number") {
-      return {
-        type: "Usage Limit",
-        icon: "meter",
-        color: "text-slate-600",
-        bgColor: "bg-white border-slate-200",
-      };
-    } else {
-      return {
-        type: "Configuration",
-        icon: "settings",
-        color: "text-slate-600",
-        bgColor: "bg-white border-slate-200",
-      };
+    let monthlyPrice: {
+      amount: number;
+      priceId: string;
+      components: PricingComponent[];
+    } | null = null;
+    let yearlyPrice: {
+      amount: number;
+      priceId: string;
+      components: PricingComponent[];
+    } | null = null;
+    const currency = planPrices[0]?.currency || "USD";
+
+    for (const price of planPrices) {
+      const fixedComponent = price.pricingData?.components?.find(
+        (c) => c.type === "fixed" || c.type === "per_unit"
+      );
+      if (!fixedComponent) continue;
+
+      const recurrence = (fixedComponent.recurrence_rule || "").toLowerCase();
+      const amount =
+        fixedComponent.amount_cents ||
+        (fixedComponent as { per_unit_cents?: number }).per_unit_cents ||
+        0;
+
+      if (recurrence.includes("month") && !monthlyPrice) {
+        monthlyPrice = {
+          amount,
+          priceId: price.id,
+          components: price.pricingData.components,
+        };
+      } else if (recurrence.includes("year") && !yearlyPrice) {
+        yearlyPrice = {
+          amount,
+          priceId: price.id,
+          components: price.pricingData.components,
+        };
+      }
     }
-  };
 
-  // Helper function to get component amount
-  const getComponentAmount = (component: PricingComponent): number => {
-    return (
-      component.amount_cents ??
-      component.per_unit_cents ??
-      component.unit_cost_cents ??
-      0
+    // If no yearly found but we have monthly, calculate yearly equivalent
+    const hasYearly = !!yearlyPrice;
+    const calculatedYearlyAmount =
+      yearlyPrice?.amount ?? (monthlyPrice?.amount ?? 0) * 12;
+
+    // Check for usage components
+    const hasUsageComponents = planPrices.some((p) =>
+      p.pricingData?.components?.some(
+        (c) => c.type === "usage" && (c.unit_cost_cents || 0) > 0
+      )
     );
-  };
 
-  // Helper function to get component label
-  const getComponentLabel = (component: PricingComponent): string => {
-    if (component.type === "per_unit" && component.unit_label) {
-      return `per ${component.unit_label}`;
-    }
-    if (component.per_unit_cents) return "per unit";
-    if (component.unit_cost_cents && component.unit_label)
-      return `per ${component.unit_label}`;
-    return "";
-  };
+    // Check for seat-based
+    const isSeatBased = planPrices.some((p) =>
+      p.pricingData?.components?.some((c) => c.type === "per_unit")
+    );
 
-  // Helper function to determine the currency (for trial pricing)
-  const getCurrency = (): string => {
-    // First try to get currency from plan prices
-    if (planPrices && planPrices.length > 0) {
-      return planPrices[0].currency;
-    }
-    // Fallback to merchant's default currency
-    return session?.merchant?.defaultCurrency || "USD";
-  };
+    return {
+      currency,
+      monthlyPrice,
+      yearlyPrice,
+      hasYearly,
+      calculatedYearlyAmount,
+      hasUsageComponents,
+      isSeatBased,
+      isFree: isTrulyFreePlan(planPrices),
+      isUsageOnly: isUsageOnlyPlan(planPrices),
+    };
+  }, [planPrices]);
 
   // Memoize the transformed plan data for pricing table preview
   const transformedPlanData = useMemo(() => {
@@ -983,6 +1026,27 @@ export default function PlanDetailsPage() {
   const pricingTablePlans = useMemo(() => {
     return transformedPlanData ? [transformedPlanData] : [];
   }, [transformedPlanData]);
+
+  // Deduplicate and prepare usage components
+  const usageComponents = useMemo(() => {
+    if (!planPrices) return [];
+    const seen = new Set<string>();
+    return planPrices
+      .flatMap((price) =>
+        price.pricingData?.components?.filter(
+          (c) => c.type === "usage" && (c.unit_cost_cents || 0) > 0
+        )
+      )
+      .filter(Boolean)
+      .filter((component) => {
+        const comp = component as PricingComponent;
+        const key =
+          comp?.component_name || comp?.metric_id || comp?.label || "";
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }) as PricingComponent[];
+  }, [planPrices]);
 
   // Memoize the setSelectedPlan function
   const handlePlanSelection = useCallback(() => {
@@ -1112,15 +1176,10 @@ export default function PlanDetailsPage() {
     return <div>Loading...</div>;
   }
 
-  console.log("🎨 About to render JSX - Final state:", {
-    planId: plan?.id,
-    pricingTablePlansLength: pricingTablePlans.length,
-    hasTransformedData: !!transformedPlanData,
-  });
-
   return (
-    <div className="container mx-auto py-10">
-      <div className="flex justify-between items-center mb-10">
+    <div className="container mx-auto py-8">
+      {/* Header with Back Button and Actions */}
+      <div className="flex justify-between items-center mb-6">
         <Button variant="outline" onClick={() => router.push("/plans")}>
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back
@@ -1237,7 +1296,6 @@ export default function PlanDetailsPage() {
                           version
                         </li>
                       )}
-                      {/* Incoming migrations no longer block deletion, so not listed here */}
                     </ul>
                   </div>
                 </TooltipContent>
@@ -1247,803 +1305,547 @@ export default function PlanDetailsPage() {
         </div>
       </div>
 
-      {/* Plan Header */}
-      <div className="space-y-6 mb-10">
-        <div>
-          <div className="flex items-center gap-3 mb-3">
-            <h1 className="text-3xl font-bold">{plan?.planName}</h1>
-            {planPrices?.some((price) =>
-              price.pricingData?.components?.some(
-                (component) => component.type === "per_unit"
-              )
-            ) && (
-              <Badge variant="secondary" className="text-xs">
-                <Users className="w-3 h-3 mr-1" />
-                Seat-based
-              </Badge>
-            )}
-            {/* Free plan badge */}
-            {!plan?.isEnterprisePlan &&
-              planPrices &&
-              isTrulyFreePlan(planPrices) && (
-                <Badge
-                  variant="outline"
-                  className="text-xs bg-emerald-50 border-emerald-200 text-emerald-700"
-                >
-                  <span className="w-2 h-2 bg-emerald-500 rounded-full mr-1.5"></span>
-                  Free Plan
-                </Badge>
-              )}
-            {/* Usage-only plan badge */}
-            {!plan?.isEnterprisePlan &&
-              planPrices &&
-              isUsageOnlyPlan(planPrices) && (
-                <Badge
-                  variant="outline"
-                  className="text-xs bg-orange-50 border-orange-200 text-orange-700"
-                >
-                  <span className="w-2 h-2 bg-orange-500 rounded-full mr-1.5"></span>
-                  Usage-Based
-                </Badge>
-              )}
-            {trialPlan && (
-              <Badge
-                variant="outline"
-                className="text-xs bg-blue-50 border-blue-200 text-blue-700"
-              >
-                <span className="w-2 h-2 bg-blue-500 rounded-full mr-1.5"></span>
-                {trialPlan.trialDays}-day free trial
-              </Badge>
-            )}
-          </div>
-          <p className="text-muted-foreground text-lg mb-6">
-            {plan?.planDescription || "No description provided"}
-          </p>
-
-          <div className="flex flex-wrap items-center gap-3 mb-6">
-            <IdBadge value={selectedVersionId || ""} />
-            {allPlanVersions && allPlanVersions.length > 1 ? (
-              <Select
-                value={selectedVersionId}
-                onValueChange={(newVersionId) => {
-                  setSelectedVersionId(newVersionId);
-                  // Update the URL to reflect the new version
-                  // router.push(`/plans/${newVersionId}`);
-                }}
-              >
-                <SelectTrigger className="h-7 w-auto min-w-[120px] text-xs">
-                  <SelectValue placeholder="Select version" />
-                </SelectTrigger>
-                <SelectContent>
-                  {allPlanVersions.map((version) => (
-                    <SelectItem
-                      key={version.id}
-                      value={version.id}
-                      className="text-xs"
-                    >
-                      Version {version.versionNumber}
-                      {version.id === latestVersion?.id && " (Latest)"}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : (
-              <Badge variant="outline" className="text-xs">
-                Version {plan?.versionNumber}
-              </Badge>
-            )}
-            {plan?.isEnterprisePlan && (
-              <Badge variant="secondary" className="text-xs">
-                Enterprise Plan
-              </Badge>
-            )}
-            <div className="flex items-center gap-3 text-sm text-muted-foreground">
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    document
-                      .getElementById("customers-section")
-                      ?.scrollIntoView({
-                        behavior: "smooth",
-                      });
-                  }}
-                  className="font-medium text-blue-600 hover:text-blue-700 hover:underline cursor-pointer transition-colors"
-                >
-                  {planSubscriptions.length} subscriber
-                  {planSubscriptions.length !== 1 ? "s" : ""} on this version
-                </button>
-                {((scheduledMigrations && scheduledMigrations.length > 0) ||
-                  (incomingMigrations && incomingMigrations.length > 0)) && (
-                  <>
-                    <span className="text-gray-400">•</span>
-                    <div className="flex items-center gap-2">
-                      {scheduledMigrations &&
-                        scheduledMigrations.length > 0 && (
-                          <button
-                            onClick={() => {
-                              router.push(
-                                `/plans/${selectedVersionId}/scheduled-migrations`
-                              );
-                            }}
-                            className="font-medium text-amber-600 hover:text-amber-700 hover:underline cursor-pointer transition-colors"
-                          >
-                            {scheduledMigrations.length} scheduled to migrate
-                            out
-                          </button>
-                        )}
-                      {scheduledMigrations &&
-                        scheduledMigrations.length > 0 &&
-                        incomingMigrations &&
-                        incomingMigrations.length > 0 && (
-                          <span className="text-gray-400">•</span>
-                        )}
-                      {incomingMigrations && incomingMigrations.length > 0 && (
-                        <button
-                          onClick={() => {
-                            router.push(
-                              `/plans/${selectedVersionId}/scheduled-migrations?view=incoming`
-                            );
-                          }}
-                          className="font-medium text-green-600 hover:text-green-700 hover:underline cursor-pointer transition-colors"
-                        >
-                          {incomingMigrations.length} scheduled to migrate in
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-              <span className="text-xs">
-                Created{" "}
-                {plan?.createdAt ? (
-                  <LocaleAwareDate
-                    date={plan.createdAt}
-                    style="medium"
-                    className="inline font-normal"
-                  />
-                ) : (
-                  "-"
-                )}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-3">
-            <Switch
-              id="pricing-table-visibility"
-              checked={plan?.isVisibleInPricingTable || false}
-              onCheckedChange={(checked) => {
-                togglePricingTableMutation.mutate(checked);
-              }}
-              disabled={togglePricingTableMutation.isPending}
-            />
-            <Label
-              htmlFor="pricing-table-visibility"
-              className="text-sm font-medium"
+      {/* Plan Title and Badges */}
+      <div className="mb-6">
+        <div className="flex items-center gap-3 mb-2">
+          <h1 className="text-3xl font-bold">{plan?.planName}</h1>
+          {unifiedPricing?.isSeatBased && (
+            <Badge variant="secondary" className="text-xs">
+              <Users className="w-3 h-3 mr-1" />
+              Seat-based
+            </Badge>
+          )}
+          {unifiedPricing?.isFree && (
+            <Badge
+              variant="outline"
+              className="text-xs bg-emerald-50 border-emerald-200 text-emerald-700"
             >
-              Show in pricing table
-            </Label>
-            {togglePricingTableMutation.isPending && (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <span className="w-2 h-2 bg-emerald-500 rounded-full mr-1.5"></span>
+              Free Plan
+            </Badge>
+          )}
+          {unifiedPricing?.isUsageOnly && (
+            <Badge
+              variant="outline"
+              className="text-xs bg-orange-50 border-orange-200 text-orange-700"
+            >
+              <span className="w-2 h-2 bg-orange-500 rounded-full mr-1.5"></span>
+              Usage-Based
+            </Badge>
+          )}
+          {plan?.isEnterprisePlan && (
+            <Badge variant="secondary" className="text-xs">
+              Enterprise
+            </Badge>
+          )}
+          {trialPlan && (
+            <Badge
+              variant="outline"
+              className="text-xs bg-blue-50 border-blue-200 text-blue-700"
+            >
+              <span className="w-2 h-2 bg-blue-500 rounded-full mr-1.5"></span>
+              {trialPlan.trialDays}-day trial
+            </Badge>
+          )}
+          {plan?.pspPlanId && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <a
+                    href={`https://app.dodopayments.com/products/${plan.pspPlanId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <Badge
+                      variant="outline"
+                      className="text-xs bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100 cursor-pointer"
+                    >
+                      <ExternalLink className="w-3 h-3 mr-1" />
+                      Dodo: {plan.pspPlanId.substring(0, 12)}...
+                    </Badge>
+                  </a>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>View in Dodo Payments Dashboard</p>
+                  <p className="text-xs text-muted-foreground font-mono">
+                    {plan.pspPlanId}
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+        </div>
+        <p className="text-muted-foreground mb-4">
+          {plan?.planDescription || "No description provided"}
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <IdBadge value={selectedVersionId || ""} />
+          {allPlanVersions && allPlanVersions.length > 1 ? (
+            <Select
+              value={selectedVersionId}
+              onValueChange={setSelectedVersionId}
+            >
+              <SelectTrigger className="h-7 w-auto min-w-[120px] text-xs">
+                <SelectValue placeholder="Select version" />
+              </SelectTrigger>
+              <SelectContent>
+                {allPlanVersions.map((version) => (
+                  <SelectItem
+                    key={version.id}
+                    value={version.id}
+                    className="text-xs"
+                  >
+                    Version {version.versionNumber}
+                    {version.id === latestVersion?.id && " (Latest)"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : (
+            <Badge variant="outline" className="text-xs">
+              Version {plan?.versionNumber}
+            </Badge>
+          )}
+          <span className="text-xs text-muted-foreground">
+            Created{" "}
+            {plan?.createdAt ? (
+              <LocaleAwareDate
+                date={plan.createdAt}
+                style="medium"
+                className="inline font-normal"
+              />
+            ) : (
+              "-"
             )}
-          </div>
+          </span>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
-        {/* Left Column - Plan Details */}
-        <div className="xl:col-span-2 space-y-8">
-          {/* Enrollment Rules */}
-          {selectedVersionId ? (
-            <PlanEnrollmentRules planId={selectedVersionId} />
-          ) : null}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        {/* Left Column - Main Content */}
+        <div className="xl:col-span-2">
+          {/* Tab Navigation */}
+          <div className="flex space-x-1 bg-muted p-1 rounded-lg mb-6">
+            {[
+              { id: "overview" as const, label: "Overview", icon: TrendingUp },
+              { id: "customers" as const, label: "Customers", icon: Users },
+              { id: "settings" as const, label: "Settings", icon: Settings },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-all ${
+                  activeTab === tab.id
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <tab.icon className="h-4 w-4" />
+                {tab.label}
+              </button>
+            ))}
+          </div>
 
-          {/* Pricing & Features */}
-          <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
-            <div className="p-6 border-b border-slate-200 bg-slate-50/50">
-              <h2 className="text-xl font-bold text-slate-900 flex items-center gap-3">
-                <div className="bg-white p-2 rounded-md border border-slate-200">
-                  <CreditCard className="h-5 w-5 text-slate-600" />
-                </div>
-                Pricing & Features
-              </h2>
-            </div>
-            <div className="p-6 space-y-10">
+          {/* Overview Tab */}
+          {activeTab === "overview" && (
+            <div className="space-y-6">
               {/* Pricing Section */}
-              <div>
-                <h3 className="text-base font-medium text-gray-900 mb-4">
-                  Pricing Configuration
-                </h3>
-                {plan?.isEnterprisePlan ? (
-                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-6">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-4">
-                        <div className="bg-slate-100 p-3 rounded-lg border border-slate-200">
-                          <CreditCard className="h-6 w-6 text-slate-600" />
-                        </div>
-                        <div>
-                          <h4 className="font-semibold text-slate-900 text-lg">
-                            Enterprise Plan
-                          </h4>
-                          <p className="text-sm text-slate-600">
-                            Custom pricing - contact for details
-                          </p>
-                        </div>
+              <div className="bg-white rounded-lg border shadow-sm">
+                <div className="p-5 border-b bg-slate-50/50">
+                  <h2 className="text-lg font-semibold flex items-center gap-2">
+                    <CreditCard className="h-5 w-5 text-slate-600" />
+                    Pricing
+                  </h2>
+                </div>
+                <div className="p-5">
+                  {plan?.isEnterprisePlan ? (
+                    <div className="text-center py-8">
+                      <div className="bg-slate-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                        <CreditCard className="h-8 w-8 text-slate-600" />
                       </div>
-                      <div className="text-right">
-                        <div className="bg-white border border-slate-300 rounded-lg px-4 py-2 mb-2 shadow-sm">
-                          <span className="font-medium text-slate-900">
-                            {plan.buttonText || "Contact us"}
-                          </span>
-                        </div>
-                        {plan.enterpriseRedirectUrl && (
-                          <div>
-                            <a
-                              href={plan.enterpriseRedirectUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-xs text-slate-600 hover:text-slate-900 hover:underline font-medium"
-                            >
-                              View Contact Link →
-                            </a>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {/* Trial Price Section */}
-                    {trialPlan && (
-                      <div className="border border-blue-200 rounded-lg p-6 bg-blue-50/30 hover:bg-blue-50/50 transition-all duration-200">
-                        <div className="flex items-center justify-between mb-4">
-                          <div className="flex items-center gap-3">
-                            <div className="bg-blue-100 p-2 rounded-md border border-blue-200">
-                              <CreditCard className="h-5 w-5 text-blue-600" />
-                            </div>
-                            <div>
-                              <h4 className="font-semibold text-blue-900">
-                                Free Trial
-                              </h4>
-                              <p className="text-xs text-blue-600">
-                                {trialPlan.trialDays} days free access
-                              </p>
-                            </div>
-                          </div>
-                          <div className="bg-white border border-blue-200 rounded-md px-3 py-1 shadow-sm">
-                            <span className="text-xs font-medium text-blue-700">
-                              {planPrices?.[0]?.currency?.toUpperCase() ||
-                                "USD"}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="space-y-3">
-                          <div className="bg-white border border-blue-200 rounded-md p-4 shadow-sm">
-                            <div className="flex items-center justify-between">
-                              <div className="flex-1">
-                                <h5 className="text-sm font-semibold text-blue-900 mb-1">
-                                  Trial Period
-                                </h5>
-                                <div className="bg-blue-100 border border-blue-200 rounded-md px-3 py-1.5 inline-flex items-center justify-center min-w-[80px]">
-                                  <span className="text-xs font-medium text-blue-600">
-                                    {trialPlan.trialDays} days
-                                  </span>
-                                </div>
-                              </div>
-                              <div className="text-right ml-4">
-                                <div className="text-xl font-bold text-blue-900">
-                                  {formatCurrency(0, getCurrency())}
-                                </div>
-                                <div className="text-xs text-blue-600 font-medium">
-                                  Free trial
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {planPrices && planPrices.length > 0 ? (
-                      planPrices.map((price, index) => {
-                        // Check if this price has only zero-amount components
-                        const isFreePriceConfig = isTrulyFreePlan([price]);
-                        const isUsageOnlyConfig = isUsageOnlyPlan([price]);
-
-                        return (
-                          <div
-                            key={price.id}
-                            className={`border rounded-lg p-6 transition-all duration-200 ${
-                              isFreePriceConfig
-                                ? "border-emerald-200 bg-emerald-50/30 hover:bg-emerald-50/50"
-                                : isUsageOnlyConfig
-                                  ? "border-orange-200 bg-orange-50/30 hover:bg-orange-50/50"
-                                  : "border-slate-200 bg-slate-50/30 hover:bg-slate-50/50"
-                            }`}
+                      <h3 className="font-semibold text-lg mb-2">
+                        Enterprise Plan
+                      </h3>
+                      <p className="text-muted-foreground mb-4">
+                        Custom pricing - contact for details
+                      </p>
+                      {plan.enterpriseRedirectUrl && (
+                        <Button variant="outline" asChild>
+                          <a
+                            href={plan.enterpriseRedirectUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
                           >
-                            <div className="flex items-center justify-between mb-4">
-                              <div className="flex items-center gap-3">
-                                <div className="bg-slate-100 p-2 rounded-md border border-slate-200">
-                                  <CreditCard className="h-5 w-5 text-slate-600" />
-                                </div>
-                                <div>
-                                  <h4
-                                    className={`font-semibold ${
-                                      isFreePriceConfig
-                                        ? "text-emerald-700"
-                                        : isUsageOnlyConfig
-                                          ? "text-orange-700"
-                                          : "text-slate-900"
-                                    }`}
-                                  >
-                                    {isFreePriceConfig
-                                      ? "Free Plan"
-                                      : isUsageOnlyConfig
-                                        ? "Usage-Based Plan"
-                                        : `Price Configuration ${index + 1}`}
-                                  </h4>
-                                  <p
-                                    className={`text-xs ${
-                                      isFreePriceConfig
-                                        ? "text-emerald-600"
-                                        : isUsageOnlyConfig
-                                          ? "text-orange-600"
-                                          : "text-slate-500"
-                                    }`}
-                                  >
-                                    {price.pricingData.components.length}{" "}
-                                    component
-                                    {price.pricingData.components.length !== 1
-                                      ? "s"
-                                      : ""}
-                                    {isFreePriceConfig && " • No cost"}
-                                    {isUsageOnlyConfig && " • Pay-as-you-go"}
-                                  </p>
-                                </div>
+                            {plan.buttonText || "Contact us"}
+                          </a>
+                        </Button>
+                      )}
+                    </div>
+                  ) : unifiedPricing?.isFree ? (
+                    <div className="text-center py-8">
+                      <div className="bg-emerald-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                        <DollarSign className="h-8 w-8 text-emerald-600" />
+                      </div>
+                      <h3 className="font-semibold text-lg text-emerald-700 mb-2">
+                        Free Plan
+                      </h3>
+                      <p className="text-muted-foreground">
+                        No charges for this plan
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* Monthly Price Card */}
+                      {unifiedPricing?.monthlyPrice && (
+                        <div className="border rounded-lg p-5 hover:border-blue-300 transition-colors">
+                          <div className="text-sm text-muted-foreground mb-2">
+                            Monthly
+                          </div>
+                          <div className="text-3xl font-bold mb-1">
+                            {formatCurrency(
+                              unifiedPricing.monthlyPrice.amount,
+                              unifiedPricing.currency
+                            )}
+                          </div>
+                          <div className="text-sm text-muted-foreground">
+                            {unifiedPricing.isSeatBased
+                              ? "per seat / month"
+                              : "per month"}
+                          </div>
+                        </div>
+                      )}
+                      {/* Yearly Price Card */}
+                      {unifiedPricing?.hasYearly &&
+                      unifiedPricing?.yearlyPrice ? (
+                        <div className="border rounded-lg p-5 hover:border-blue-300 transition-colors relative">
+                          {unifiedPricing.monthlyPrice && (
+                            <div className="absolute -top-2 -right-2 bg-emerald-500 text-white text-xs px-2 py-0.5 rounded-full">
+                              Save{" "}
+                              {Math.round(
+                                (1 -
+                                  unifiedPricing.yearlyPrice.amount /
+                                    (unifiedPricing.monthlyPrice.amount * 12)) *
+                                  100
+                              )}
+                              %
+                            </div>
+                          )}
+                          <div className="text-sm text-muted-foreground mb-2">
+                            Yearly
+                          </div>
+                          <div className="text-3xl font-bold mb-1">
+                            {formatCurrency(
+                              unifiedPricing.yearlyPrice.amount,
+                              unifiedPricing.currency
+                            )}
+                          </div>
+                          <div className="text-sm text-muted-foreground">
+                            {unifiedPricing.isSeatBased
+                              ? "per seat / year"
+                              : "per year"}
+                          </div>
+                          <div className="text-xs text-muted-foreground mt-2">
+                            (
+                            {formatCurrency(
+                              Math.round(
+                                unifiedPricing.yearlyPrice.amount / 12
+                              ),
+                              unifiedPricing.currency
+                            )}
+                            /month when billed yearly)
+                          </div>
+                        </div>
+                      ) : unifiedPricing?.monthlyPrice ? (
+                        <div className="border rounded-lg p-5 border-dashed bg-slate-50">
+                          <div className="text-sm text-muted-foreground mb-2">
+                            Yearly
+                          </div>
+                          <div className="text-lg text-muted-foreground">
+                            Not configured
+                          </div>
+                          <Button
+                            variant="link"
+                            className="p-0 h-auto text-sm"
+                            onClick={() =>
+                              router.push(`/plans/${selectedVersionId}/edit`)
+                            }
+                          >
+                            Add yearly pricing
+                          </Button>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+
+                  {/* Usage Components */}
+                  {unifiedPricing?.hasUsageComponents &&
+                    usageComponents.length > 0 && (
+                      <div className="mt-8 pt-8 border-t border-dashed border-slate-200">
+                        <div className="flex items-center gap-2 mb-5">
+                          <div className="p-1.5 rounded-md bg-orange-50 border border-orange-100">
+                            <BarChart3 className="w-3.5 h-3.5 text-orange-600" />
+                          </div>
+                          <h4 className="text-sm font-semibold text-slate-900 tracking-tight">
+                            Usage-based pricing
+                          </h4>
+                        </div>
+                        <div className="grid gap-3">
+                          {usageComponents.map((component, idx) => (
+                            <div
+                              key={idx}
+                              className="group flex items-center justify-between p-4 rounded-xl border border-slate-200 bg-slate-50/30 hover:bg-white hover:border-orange-200 hover:shadow-sm transition-all duration-200"
+                            >
+                              <div className="flex flex-col gap-0.5">
+                                <span className="font-semibold text-slate-900 group-hover:text-orange-950 transition-colors">
+                                  {getUsageDisplayName(
+                                    component,
+                                    plan?.features
+                                  )}
+                                </span>
+                                <span className="text-xs text-slate-500 font-medium">
+                                  Pay per {component?.unit_label || "unit"} used
+                                </span>
                               </div>
-                              <div className="bg-white border border-slate-200 rounded-md px-3 py-1 shadow-sm">
-                                <span className="text-xs font-medium text-slate-700">
-                                  {price.currency.toUpperCase()}
+                              <div className="flex items-center bg-white px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm group-hover:border-orange-100 transition-colors">
+                                <span className="font-bold text-slate-900">
+                                  {formatCurrency(
+                                    component?.unit_cost_cents || 0,
+                                    unifiedPricing.currency
+                                  )}
+                                </span>
+                                <span className="text-xs text-muted-foreground font-medium ml-1.5 pl-1.5 border-l border-slate-200">
+                                  / {component?.unit_label || "unit"}
                                 </span>
                               </div>
                             </div>
-
-                            <div className="space-y-3">
-                              {price.pricingData.components.map(
-                                (component, compIndex) => (
-                                  <div
-                                    key={compIndex}
-                                    className="bg-white border border-slate-200 rounded-md p-4 shadow-sm"
-                                  >
-                                    <div className="flex items-center justify-between">
-                                      <div className="flex-1">
-                                        <h5 className="text-sm font-semibold text-slate-900 mb-1">
-                                          {component.type === "per_unit"
-                                            ? "Per Unit"
-                                            : component.type === "fixed"
-                                              ? "Fixed"
-                                              : "Usage"}
-                                        </h5>
-                                        <div className="bg-slate-100 border border-slate-200 rounded-md px-3 py-1.5 inline-flex items-center justify-center min-w-[80px]">
-                                          <span className="text-xs font-medium text-slate-600">
-                                            {formatRecurrence(
-                                              component.recurrence_rule
-                                            )}
-                                          </span>
-                                        </div>
-                                      </div>
-                                      <div className="text-right ml-4">
-                                        <div>
-                                          {getComponentAmount(component) ===
-                                          0 ? (
-                                            // Free plan styling
-                                            <div>
-                                              <div className="text-xl font-bold text-emerald-600">
-                                                Free
-                                              </div>
-                                              <div className="text-xs text-emerald-500 font-medium">
-                                                {component.type === "per_unit"
-                                                  ? `per ${component.unit_label || "seat"}`
-                                                  : formatRecurrence(
-                                                      component.recurrence_rule
-                                                    )}
-                                              </div>
-                                            </div>
-                                          ) : (
-                                            // Paid plan styling
-                                            <div>
-                                              <div className="text-xl font-bold text-slate-900">
-                                                {formatCurrency(
-                                                  getComponentAmount(component),
-                                                  price.currency
-                                                )}
-                                              </div>
-                                              {getComponentLabel(component) && (
-                                                <div className="text-xs text-slate-500 font-medium">
-                                                  {getComponentLabel(component)}
-                                                </div>
-                                              )}
-                                            </div>
-                                          )}
-
-                                          {/* Seat-based additional info */}
-                                          {component.type === "per_unit" &&
-                                            (() => {
-                                              const perUnitComp =
-                                                component as PricingComponent & {
-                                                  num_seats?: number;
-                                                };
-                                              const numSeats =
-                                                perUnitComp.num_seats;
-                                              return (
-                                                <>
-                                                  {typeof numSeats ===
-                                                    "number" &&
-                                                    numSeats > 0 && (
-                                                      <div className="text-xs text-slate-600 mt-1">
-                                                        Minimum {numSeats}{" "}
-                                                        {component.unit_label ||
-                                                          "seats"}
-                                                      </div>
-                                                    )}
-                                                  <div className="text-xs text-slate-600 mt-1">
-                                                    Overage billing:{" "}
-                                                    {component.bill_immediately ===
-                                                    false
-                                                      ? "End of cycle"
-                                                      : "Immediate"}
-                                                  </div>
-                                                </>
-                                              );
-                                            })()}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                )
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })
-                    ) : (
-                      <div className="text-center py-12 text-gray-500">
-                        <div className="bg-gray-50 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                          <CreditCard className="h-8 w-8 text-gray-400" />
+                          ))}
                         </div>
-                        <p className="text-sm font-medium">
-                          No pricing configured
-                        </p>
-                        <p className="text-xs text-gray-400 mt-1">
-                          Add pricing to your plan to see it here
-                        </p>
                       </div>
                     )}
-                  </div>
-                )}
+
+                  {/* On-Demand Credit Top-ups */}
+                  {dedupedCreditDefinitions?.some(
+                    (cd) => cd.enableTopups && cd.topupPricePerCreditCents
+                  ) && (
+                    <div className="mt-4 pt-4 border-t">
+                      <div className="text-sm font-medium mb-3">
+                        On-demand credit top-ups
+                      </div>
+                      <div className="space-y-2">
+                        {dedupedCreditDefinitions
+                          .filter(
+                            (cd) =>
+                              cd.enableTopups && cd.topupPricePerCreditCents
+                          )
+                          .map((creditDef, idx) => {
+                            const linkedFeature = plan?.features?.find(
+                              (f) => f.id === creditDef.featureId
+                            );
+                            return (
+                              <div
+                                key={idx}
+                                className="flex justify-between items-center py-3 px-4 bg-purple-50 rounded-lg border border-purple-200"
+                              >
+                                <div className="flex items-center gap-3">
+                                  <div className="p-1.5 rounded-md bg-purple-100">
+                                    <CreditCard className="h-4 w-4 text-purple-600" />
+                                  </div>
+                                  <div>
+                                    <div className="text-sm font-medium">
+                                      {linkedFeature?.displayName || "Credits"}
+                                    </div>
+                                    <div className="text-xs text-muted-foreground">
+                                      {creditDef.topupMinQuantity &&
+                                      creditDef.topupMaxQuantity
+                                        ? `Can purchase between ${creditDef.topupMinQuantity} and ${creditDef.topupMaxQuantity} credits per perchase`
+                                        : creditDef.topupMinQuantity
+                                          ? `Min ${creditDef.topupMinQuantity} credits per purchase`
+                                          : creditDef.topupMaxQuantity
+                                            ? `Max ${creditDef.topupMaxQuantity} credits per purchase`
+                                            : "No quantity limits per purchase"}
+                                    </div>
+                                  </div>
+                                </div>
+                                <div className="text-right">
+                                  <span className="font-semibold text-purple-700">
+                                    {formatCurrency(
+                                      creditDef.topupPricePerCreditCents || 0,
+                                      unifiedPricing?.currency || "USD"
+                                    )}
+                                    <span className="text-sm font-normal text-muted-foreground">
+                                      {" "}
+                                      per credit
+                                    </span>
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Trial Info */}
+                  {trialPlan && (
+                    <div className="mt-4 pt-4 border-t">
+                      <div className="flex items-center gap-2 px-4 py-3 bg-blue-50 border border-blue-200 rounded-lg">
+                        <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                        <span className="text-sm text-blue-700">
+                          <strong>{trialPlan.trialDays}-day free trial</strong>{" "}
+                          included
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Features Section */}
-              <div>
-                <h3 className="text-base font-medium text-gray-900 mb-4">
-                  Plan Features
-                </h3>
-                {plan?.features && plan.features.length > 0 ? (
-                  <div className="space-y-3">
-                    {plan.features.map((feature, featureIndex) => {
-                      const typeInfo = getFeatureTypeDisplay(feature);
+              <div className="bg-white rounded-lg border shadow-sm">
+                <div className="p-5 border-b bg-slate-50/50">
+                  <h2 className="text-lg font-semibold flex items-center gap-2">
+                    <Zap className="h-5 w-5 text-slate-600" />
+                    Features ({plan?.features?.length || 0})
+                  </h2>
+                </div>
+                <div className="p-5">
+                  {plan?.features && plan.features.length > 0 ? (
+                    <div className="space-y-2">
+                      {plan.features.map((feature) => {
+                        const isBoolean =
+                          typeof feature.featureValue === "boolean";
+                        const isNumeric =
+                          typeof feature.featureValue === "number";
 
-                      // Find all credit definitions associated with this feature (deduplicated)
-                      const featureCreditDefinitions =
-                        dedupedCreditDefinitions.filter(
-                          (cd) => cd.featureId === feature.id
-                        );
+                        // Find credit definitions for this feature
+                        const featureCreditDefs =
+                          dedupedCreditDefinitions.filter(
+                            (cd) => cd.featureId === feature.id
+                          );
 
-                      // Find trial credit definitions for this feature
-                      const trialFeatureCreditDefinitions =
-                        dedupedTrialCreditDefinitions.filter(
-                          (cd) => cd.featureId === feature.id
-                        );
-
-                      // Get the appropriate icon
-                      const IconComponent =
-                        typeInfo.icon === "toggle"
-                          ? typeof feature.featureValue === "boolean" &&
-                            feature.featureValue
-                            ? ToggleRight
-                            : ToggleLeft
-                          : typeInfo.icon === "meter"
-                            ? BarChart3
-                            : Settings;
-
-                      return (
-                        <div
-                          key={`${selectedVersionId}-${feature.id}-${featureIndex}`}
-                          className="border border-slate-200 rounded-lg p-4 bg-white hover:bg-slate-50/30 transition-all duration-200"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-3 flex-1 min-w-0">
+                        return (
+                          <div
+                            key={feature.id}
+                            className="flex items-center justify-between py-3 px-4 border rounded-lg hover:bg-slate-50 transition-colors"
+                          >
+                            <div className="flex items-center gap-3">
                               <div className="p-1.5 rounded-md bg-slate-100">
-                                <IconComponent
-                                  className={`h-3.5 w-3.5 ${typeInfo.color}`}
-                                />
+                                {isBoolean ? (
+                                  feature.featureValue ? (
+                                    <ToggleRight className="h-4 w-4 text-emerald-600" />
+                                  ) : (
+                                    <ToggleLeft className="h-4 w-4 text-slate-400" />
+                                  )
+                                ) : isNumeric ? (
+                                  <BarChart3 className="h-4 w-4 text-blue-600" />
+                                ) : (
+                                  <Settings className="h-4 w-4 text-slate-600" />
+                                )}
                               </div>
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 mb-1">
-                                  <h4 className="font-medium text-slate-900 text-sm">
-                                    {feature.displayName}
-                                  </h4>
-                                  <span className="text-xs font-medium text-slate-500 uppercase tracking-wide">
-                                    {typeInfo.type}
-                                  </span>
+                              <div>
+                                <div className="font-medium text-sm">
+                                  {feature.displayName}
                                 </div>
-                                <div className="flex items-center gap-3">
-                                  <code className="text-xs bg-slate-100 px-2 py-0.5 rounded font-mono text-slate-600">
-                                    {feature.slug}
-                                  </code>
-                                  {feature.metricIds &&
-                                    feature.metricIds.length > 0 && (
-                                      <div className="flex items-center gap-1">
-                                        <BarChart3 className="h-3 w-3 text-slate-400" />
-                                        <span className="text-xs text-slate-600">
-                                          {feature.metricIds.length} metric
-                                          {feature.metricIds.length !== 1
-                                            ? "s"
-                                            : ""}
-                                        </span>
-                                      </div>
-                                    )}
-                                </div>
+                                <code className="text-xs text-muted-foreground">
+                                  {feature.slug}
+                                </code>
                               </div>
                             </div>
-                            <div className="flex items-center">
-                              {featureCreditDefinitions.length > 0 ||
-                              trialFeatureCreditDefinitions.length > 0 ? (
-                                // Show credit information with better styling
-                                <div className="flex gap-2">
-                                  {/* Regular plan credit definitions */}
-                                  {featureCreditDefinitions.map(
-                                    (creditDef, creditIndex) => {
-                                      // Determine refresh schedule
-                                      const getRefreshLabel = () => {
-                                        if (creditDef.renewOnBilling) {
-                                          return "Per billing cycle";
-                                        }
-                                        if (creditDef.refillRrule) {
-                                          const rule =
-                                            creditDef.refillRrule.toLowerCase();
-                                          if (rule.includes("month"))
-                                            return "Monthly";
-                                          if (rule.includes("year"))
-                                            return "Yearly";
-                                          if (rule.includes("week"))
-                                            return "Weekly";
-                                          if (rule.includes("day"))
-                                            return "Daily";
-                                          return "Periodic";
-                                        }
-                                        if (
-                                          creditDef.refillAmount &&
-                                          creditDef.refillAmount > 0
-                                        ) {
-                                          return "Renewable";
-                                        }
-                                        return null;
-                                      };
-
-                                      const refreshLabel = getRefreshLabel();
-
-                                      return (
-                                        <div
-                                          key={`${creditDef.id}-${creditIndex}`}
-                                          className={`rounded-md px-3 py-2 text-center min-w-[100px] border ${
-                                            creditDef.applicationType ===
-                                            "usage"
-                                              ? "bg-blue-50 border-blue-200"
-                                              : creditDef.applicationType ===
-                                                  "monetary"
-                                                ? "bg-emerald-50 border-emerald-200"
-                                                : creditDef.applicationType ===
-                                                    "component"
-                                                  ? "bg-purple-50 border-purple-200"
-                                                  : "bg-slate-100 border-slate-200"
-                                          }`}
-                                        >
-                                          {creditDef.applicationType ===
-                                          "usage" ? (
-                                            <>
-                                              <div className="text-lg font-semibold text-blue-700">
-                                                {creditDef.defaultAmount.toLocaleString()}
-                                              </div>
-                                              <div className="text-xs text-blue-600">
-                                                credits
-                                                {refreshLabel && (
-                                                  <span className="block text-blue-500">
-                                                    {refreshLabel}
-                                                  </span>
-                                                )}
-                                              </div>
-                                            </>
-                                          ) : creditDef.applicationType ===
-                                            "monetary" ? (
-                                            <>
-                                              <div className="text-lg font-semibold text-emerald-700">
-                                                {creditDef.currency === "USD"
-                                                  ? "$"
-                                                  : "€"}
-                                                {(
-                                                  creditDef.defaultAmount / 100
-                                                ).toFixed(2)}
-                                              </div>
-                                              <div className="text-xs text-emerald-600">
-                                                discount
-                                                {refreshLabel && (
-                                                  <span className="block text-emerald-500">
-                                                    {refreshLabel}
-                                                  </span>
-                                                )}
-                                              </div>
-                                            </>
-                                          ) : creditDef.applicationType ===
-                                            "component" ? (
-                                            <>
-                                              <div className="text-lg font-semibold text-purple-700">
-                                                {creditDef.currency === "USD"
-                                                  ? "$"
-                                                  : "€"}
-                                                {(
-                                                  creditDef.defaultAmount / 100
-                                                ).toFixed(2)}
-                                              </div>
-                                              <div className="text-xs text-purple-600">
-                                                component
-                                                {refreshLabel && (
-                                                  <span className="block text-purple-500">
-                                                    {refreshLabel}
-                                                  </span>
-                                                )}
-                                              </div>
-                                            </>
-                                          ) : (
-                                            <div className="text-sm font-medium text-slate-700">
-                                              {creditDef.applicationType}
-                                            </div>
-                                          )}
-                                        </div>
-                                      );
-                                    }
-                                  )}
-
-                                  {/* Trial credit definitions */}
-                                  {trialFeatureCreditDefinitions.map(
-                                    (trialCreditDef, trialCreditIndex) => {
-                                      return (
-                                        <div
-                                          key={`trial-${trialCreditDef.id}-${trialCreditIndex}`}
-                                          className="rounded-md px-3 py-2 text-center min-w-[100px] border bg-yellow-50 border-yellow-200"
-                                        >
-                                          <div className="text-lg font-semibold text-yellow-700">
-                                            {trialCreditDef.defaultAmount.toLocaleString()}
-                                          </div>
-                                          <div className="text-xs text-yellow-600">
-                                            trial credits
-                                            <span className="block text-yellow-500 text-[10px]">
-                                              {trialPlan?.trialDays}-day trial
-                                            </span>
-                                          </div>
-                                        </div>
-                                      );
-                                    }
-                                  )}
+                            <div className="flex items-center gap-2">
+                              {featureCreditDefs.length > 0 ? (
+                                <div className="bg-blue-50 border border-blue-200 rounded-md px-3 py-1.5">
+                                  <span className="text-sm font-semibold text-blue-700">
+                                    {featureCreditDefs[0].defaultAmount.toLocaleString()}
+                                  </span>
+                                  <span className="text-xs text-blue-600 ml-1">
+                                    credits
+                                  </span>
                                 </div>
-                              ) : typeof feature.featureValue === "boolean" ? (
+                              ) : isBoolean ? (
                                 <div
-                                  className={`rounded-md px-3 py-2 text-center min-w-[80px] border ${
-                                    feature.featureValue
-                                      ? "bg-emerald-50 border-emerald-200"
-                                      : "bg-slate-100 border-slate-200"
-                                  }`}
+                                  className={`rounded-md px-3 py-1.5 ${feature.featureValue ? "bg-emerald-50 border border-emerald-200" : "bg-slate-100 border border-slate-200"}`}
                                 >
-                                  <div className="flex items-center justify-center gap-1.5">
-                                    <div
-                                      className={`w-2 h-2 rounded-full ${feature.featureValue ? "bg-emerald-500" : "bg-slate-300"}`}
-                                    ></div>
-                                    <span
-                                      className={`font-medium text-sm ${feature.featureValue ? "text-emerald-700" : "text-slate-600"}`}
-                                    >
-                                      {feature.featureValue ? "On" : "Off"}
-                                    </span>
-                                  </div>
-                                </div>
-                              ) : feature.featureValue === "usage_based" ? (
-                                <div className="bg-slate-100 border border-slate-200 rounded-md px-3 py-2 text-center min-w-[80px]">
-                                  <div className="text-sm font-medium text-slate-900">
-                                    Metered
-                                  </div>
+                                  <span
+                                    className={`text-sm font-medium ${feature.featureValue ? "text-emerald-700" : "text-slate-500"}`}
+                                  >
+                                    {feature.featureValue
+                                      ? "Enabled"
+                                      : "Disabled"}
+                                  </span>
                                 </div>
                               ) : (
-                                <div className="bg-slate-100 border border-slate-200 rounded-md px-3 py-2 text-center min-w-[80px]">
-                                  <div className="text-sm font-medium text-slate-900">
+                                <div className="bg-slate-100 border border-slate-200 rounded-md px-3 py-1.5">
+                                  <span className="text-sm font-medium">
                                     {String(feature.featureValue)}
-                                  </div>
+                                  </span>
                                 </div>
                               )}
                             </div>
                           </div>
-                        </div>
-                      );
-                    })}
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-muted-foreground">
+                      <Zap className="h-8 w-8 mx-auto mb-2 opacity-50" />
+                      <p className="text-sm">No features configured</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Customers Tab */}
+          {activeTab === "customers" && (
+            <div
+              className="bg-white rounded-lg border shadow-sm"
+              id="customers-section"
+            >
+              <div className="p-5 border-b bg-slate-50/50">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold flex items-center gap-2">
+                    <Users className="h-5 w-5 text-slate-600" />
+                    Customers ({planSubscriptions.length})
+                  </h2>
+                  <Button
+                    size="sm"
+                    onClick={() => router.push("/subscriptions/create")}
+                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                  >
+                    Add Customer
+                  </Button>
+                </div>
+              </div>
+              <div className="p-5">
+                {isSubscriptionsLoading ? (
+                  <div className="space-y-4">
+                    {Array.from({ length: 3 }).map((_, index) => (
+                      <Skeleton key={index} className="h-12 w-full" />
+                    ))}
                   </div>
                 ) : (
-                  <div className="text-center py-12 text-gray-500">
-                    <div className="bg-gray-50 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                      <Zap className="h-8 w-8 text-gray-400" />
-                    </div>
-                    <p className="text-sm font-medium">
-                      No features configured
-                    </p>
-                    <p className="text-xs text-gray-400 mt-1">
-                      Add features to your plan to see them here
-                    </p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Subscribed Customers Section */}
-          <div
-            className="bg-white rounded-lg border border-slate-200 shadow-sm"
-            id="customers-section"
-          >
-            <div className="p-6 border-b border-slate-200 bg-slate-50/50">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-slate-900 flex items-center gap-3">
-                  <div className="bg-white p-2 rounded-md border border-slate-200">
-                    <Users className="h-5 w-5 text-slate-600" />
-                  </div>
-                  Customers ({planSubscriptions.length})
-                </h2>
-                <Button
-                  size="sm"
-                  onClick={() => router.push("/subscriptions/create")}
-                  className="bg-blue-600 hover:bg-blue-700 text-white"
-                >
-                  Add Customer
-                </Button>
-              </div>
-            </div>
-            <div className="p-6">
-              {isSubscriptionsLoading ? (
-                <div className="space-y-4">
-                  {Array.from({ length: 3 }).map((_, index) => (
-                    <Skeleton key={index} className="h-12 w-full" />
-                  ))}
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  <div className="flex items-center space-x-4">
-                    <Input
-                      placeholder="Filter customers..."
-                      value={customerTable.getState().globalFilter ?? ""}
-                      onChange={(event) =>
-                        customerTable.setGlobalFilter(event.target.value)
-                      }
-                      className="max-w-sm"
-                    />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="outline" size="sm">
-                          Columns <ChevronDown className="ml-2 h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        {customerTable
-                          .getAllColumns()
-                          .filter((column) => column.getCanHide())
-                          .map((column) => {
-                            return (
+                  <div className="space-y-4">
+                    <div className="flex items-center space-x-4">
+                      <Input
+                        placeholder="Filter customers..."
+                        value={customerTable.getState().globalFilter ?? ""}
+                        onChange={(event) =>
+                          customerTable.setGlobalFilter(event.target.value)
+                        }
+                        className="max-w-sm"
+                      />
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="outline" size="sm">
+                            Columns <ChevronDown className="ml-2 h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {customerTable
+                            .getAllColumns()
+                            .filter((column) => column.getCanHide())
+                            .map((column) => (
                               <DropdownMenuCheckboxItem
                                 key={column.id}
                                 className="capitalize"
@@ -2054,115 +1856,167 @@ export default function PlanDetailsPage() {
                               >
                                 {column.id}
                               </DropdownMenuCheckboxItem>
-                            );
-                          })}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                  <div className="rounded-lg border border-gray-200 overflow-hidden">
-                    <Table>
-                      <TableHeader>
-                        {customerTable.getHeaderGroups().map((headerGroup) => (
-                          <TableRow key={headerGroup.id} className="bg-gray-50">
-                            {headerGroup.headers.map((header) => {
-                              return (
-                                <TableHead
-                                  key={header.id}
-                                  className="font-medium"
-                                >
-                                  {header.isPlaceholder
-                                    ? null
-                                    : flexRender(
-                                        header.column.columnDef.header,
-                                        header.getContext()
-                                      )}
-                                </TableHead>
-                              );
-                            })}
-                          </TableRow>
-                        ))}
-                      </TableHeader>
-                      <TableBody>
-                        {customerTable.getRowModel().rows?.length ? (
-                          customerTable.getRowModel().rows.map((row) => (
-                            <TableRow
-                              key={row.id}
-                              data-state={row.getIsSelected() && "selected"}
-                              className="hover:bg-gray-50"
-                            >
-                              {row.getVisibleCells().map((cell) => (
-                                <TableCell key={cell.id}>
-                                  {flexRender(
-                                    cell.column.columnDef.cell,
-                                    cell.getContext()
-                                  )}
-                                </TableCell>
-                              ))}
-                            </TableRow>
-                          ))
-                        ) : (
-                          <TableRow>
-                            <TableCell
-                              colSpan={customerColumns.length}
-                              className="h-24 text-center"
-                            >
-                              <div className="flex flex-col items-center justify-center text-gray-500">
-                                <Users className="h-8 w-8 mb-2 opacity-50" />
-                                <p className="text-sm">
-                                  No customers subscribed to this plan
-                                </p>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </div>
-                  {customerTable.getRowModel().rows?.length > 0 && (
-                    <div className="flex items-center justify-between">
-                      <div className="text-xs text-gray-500">
-                        {
-                          customerTable.getFilteredSelectedRowModel().rows
-                            .length
-                        }{" "}
-                        of {customerTable.getFilteredRowModel().rows.length}{" "}
-                        row(s) selected
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => customerTable.previousPage()}
-                          disabled={!customerTable.getCanPreviousPage()}
-                        >
-                          Previous
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => customerTable.nextPage()}
-                          disabled={!customerTable.getCanNextPage()}
-                        >
-                          Next
-                        </Button>
-                      </div>
+                            ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
+                    <div className="rounded-lg border overflow-hidden">
+                      <Table>
+                        <TableHeader>
+                          {customerTable
+                            .getHeaderGroups()
+                            .map((headerGroup) => (
+                              <TableRow
+                                key={headerGroup.id}
+                                className="bg-slate-50"
+                              >
+                                {headerGroup.headers.map((header) => (
+                                  <TableHead
+                                    key={header.id}
+                                    className="font-medium"
+                                  >
+                                    {header.isPlaceholder
+                                      ? null
+                                      : flexRender(
+                                          header.column.columnDef.header,
+                                          header.getContext()
+                                        )}
+                                  </TableHead>
+                                ))}
+                              </TableRow>
+                            ))}
+                        </TableHeader>
+                        <TableBody>
+                          {customerTable.getRowModel().rows?.length ? (
+                            customerTable.getRowModel().rows.map((row) => (
+                              <TableRow
+                                key={row.id}
+                                data-state={row.getIsSelected() && "selected"}
+                                className="hover:bg-slate-50 cursor-pointer"
+                                onClick={() => {
+                                  const sub =
+                                    row.original as SubscriptionWithCustomer & {
+                                      stableSubscriptionId?: string;
+                                    };
+                                  if (sub.stableSubscriptionId) {
+                                    router.push(
+                                      `/subscriptions/${sub.stableSubscriptionId}`
+                                    );
+                                  }
+                                }}
+                              >
+                                {row.getVisibleCells().map((cell) => (
+                                  <TableCell key={cell.id}>
+                                    {flexRender(
+                                      cell.column.columnDef.cell,
+                                      cell.getContext()
+                                    )}
+                                  </TableCell>
+                                ))}
+                              </TableRow>
+                            ))
+                          ) : (
+                            <TableRow>
+                              <TableCell
+                                colSpan={customerColumns.length}
+                                className="h-24 text-center"
+                              >
+                                <div className="flex flex-col items-center justify-center text-muted-foreground">
+                                  <Users className="h-8 w-8 mb-2 opacity-50" />
+                                  <p className="text-sm">
+                                    No customers subscribed to this plan
+                                  </p>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </TableBody>
+                      </Table>
+                    </div>
+                    {customerTable.getRowModel().rows?.length > 0 && (
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs text-muted-foreground">
+                          {
+                            customerTable.getFilteredSelectedRowModel().rows
+                              .length
+                          }{" "}
+                          of {customerTable.getFilteredRowModel().rows.length}{" "}
+                          row(s) selected
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => customerTable.previousPage()}
+                            disabled={!customerTable.getCanPreviousPage()}
+                          >
+                            Previous
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => customerTable.nextPage()}
+                            disabled={!customerTable.getCanNextPage()}
+                          >
+                            Next
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Settings Tab */}
+          {activeTab === "settings" && (
+            <div className="space-y-6">
+              {/* Visibility Toggle */}
+              <div className="bg-white rounded-lg border shadow-sm p-5">
+                <h3 className="text-lg font-semibold mb-4">
+                  Pricing Table Visibility
+                </h3>
+                <div className="flex items-center space-x-3">
+                  <Switch
+                    id="pricing-table-visibility"
+                    checked={plan?.isVisibleInPricingTable || false}
+                    onCheckedChange={(checked) => {
+                      togglePricingTableMutation.mutate(checked);
+                    }}
+                    disabled={togglePricingTableMutation.isPending}
+                  />
+                  <Label
+                    htmlFor="pricing-table-visibility"
+                    className="text-sm font-medium"
+                  >
+                    Show in pricing table
+                  </Label>
+                  {togglePricingTableMutation.isPending && (
+                    <Loader2 className="h-4 w-4 animate-spin" />
                   )}
                 </div>
+                <p className="text-sm text-muted-foreground mt-2">
+                  When enabled, this plan will appear in your public pricing
+                  tables.
+                </p>
+              </div>
+
+              {/* Enrollment Rules */}
+              {selectedVersionId && (
+                <PlanEnrollmentRules planId={selectedVersionId} />
               )}
             </div>
-          </div>
+          )}
         </div>
 
         {/* Right Column - Live Preview */}
         <div className="xl:col-span-1">
-          <div>
-            <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
-              <div className="p-6 border-b border-slate-200 bg-slate-50/50">
-                <h2 className="text-xl font-bold text-slate-900">
-                  Live Preview
-                </h2>
-                <p className="text-sm text-slate-600 mt-1">
+          <div className="sticky top-6">
+            <div className="bg-white rounded-lg border shadow-sm">
+              <div className="p-5 border-b bg-slate-50/50">
+                <h2 className="text-lg font-semibold">Live Preview</h2>
+                <p className="text-sm text-muted-foreground mt-1">
                   How this plan appears in pricing tables
                 </p>
                 <div className="mt-3">
@@ -2179,17 +2033,14 @@ export default function PlanDetailsPage() {
                   )}
                 </div>
               </div>
-              <div className="p-6">
-                <div className="w-full max-w-sm mx-auto xl:max-w-none">
-                  {pricingTablePlans.length > 0 &&
-                    (() => {
-                      return (
-                        <PricingTableCards
-                          plans={pricingTablePlans}
-                          setSelectedPlan={handlePlanSelection}
-                        />
-                      );
-                    })()}
+              <div className="p-5">
+                <div className="w-full">
+                  {pricingTablePlans.length > 0 && (
+                    <PricingTableCards
+                      plans={pricingTablePlans}
+                      setSelectedPlan={handlePlanSelection}
+                    />
+                  )}
                 </div>
               </div>
             </div>

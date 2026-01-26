@@ -101,6 +101,9 @@ export const getSecretOrEnvVar = async ({
   const secretName = secretNameTemplate.replace("*", env.NODE_ENV);
   const secret = await getSecret(secretName);
   if (!secret) {
+    console.log(
+      `${secretName} not found in Secrets Manager. Did you deploy infra/cdk? Check instructions at how_to_add_secrets.md`
+    );
     if (throwOnStagingOrProdError) {
       throw new Error(`${secretName} not found in Secrets Manager`);
     }

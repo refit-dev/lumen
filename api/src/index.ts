@@ -4,6 +4,10 @@ import { env } from "./env";
 import { bootstrapFeatureMetrics } from "./lib/featureMetrics";
 import { bootstrapMetricDefinitions } from "./lib/metricDefinitions";
 import { forceReconciliation } from "./lib/cacheSynchronizer";
+import {
+  initializeSSESubscriber,
+  shutdownSSESubscriber,
+} from "./lib/sse-manager";
 
 const port = env.PORT;
 console.log(`Starting server on port ${port}...`);
@@ -32,6 +36,19 @@ console.log("[STARTUP] Starting async bootstrap operations...");
   forceReconciliation().catch((err) => {
     console.error("Initial cache reconciliation failed:", err);
   });
+
+  // Initialize SSE Redis subscriber for cross-instance event broadcasting
+  console.log("Initializing SSE Redis subscriber...");
+  try {
+    await initializeSSESubscriber();
+    console.log("SSE Redis subscriber initialized");
+  } catch (error) {
+    console.error("Failed to initialize SSE subscriber:", error);
+    console.error(
+      "SSE events will only work on the same instance that handles the webhook"
+    );
+  }
+
   console.log("[STARTUP] Bootstrap function completed");
 })().catch((error) => {
   console.error("[STARTUP] Bootstrap function failed:", error);
@@ -48,8 +65,16 @@ const server = Bun.serve({
 console.log(`Server listening on http://${server.hostname}:${server.port}`);
 
 // Graceful shutdown handler to handle shutdown of ec2 containers
-const shutdown = (signal: string) => {
+const shutdown = async (signal: string) => {
   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  // Clean up SSE subscriber
+  try {
+    await shutdownSSESubscriber();
+  } catch (error) {
+    console.error("Error during SSE subscriber shutdown:", error);
+  }
+
   // The 'true' argument attempts to wait for active connections to finish
   server.stop(true);
   console.log("Server stopped.");

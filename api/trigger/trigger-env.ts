@@ -10,6 +10,7 @@ export const triggerEnv = createEnv({
     // Core variables needed by trigger jobs
     API_URL: z.string().url(),
     TRIGGER_API_ACCESS_KEY: z.string(),
+    INTERNAL_API_KEY: z.string(),
     NODE_ENV: z.enum(["development", "test", "staging", "production"]),
     CRON_PATTERN: z.string().default("0 * * * *"),
     RESEND_API_KEY: z.string().optional(),

@@ -1,0 +1,31 @@
+{
+  "name": "@getlumen/cli",
+  "version": "0.1.2",
+  "description": "CLI installer for Lumen Billing components",
+  "type": "module",
+  "bin": {
+    "lumen": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "prompts": "^2.4.2",
+    "chalk": "^5.3.0",
+    "ora": "^8.0.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/prompts": "^2.4.9",
+    "typescript": "^5.3.3",
+    "tsup": "^8.4.0"
+  },
+  "author": "",
+  "license": "ISC"
+}

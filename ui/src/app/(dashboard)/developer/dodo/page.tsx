@@ -30,7 +30,6 @@ export default function DodoPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [formData, setFormData] = useState({
     secretKey: "",
-    webhookSecret: "",
   });
   const [showForm, setShowForm] = useState(false);
 
@@ -42,8 +41,7 @@ export default function DodoPage() {
         const result = await response.json();
         setDodoConfig(result);
         setFormData({
-          secretKey: "", // Never pre-fill secret key for security
-          webhookSecret: "",
+          secretKey: "",
         });
       } else if (response.status === 404) {
         setDodoConfig(null);
@@ -91,16 +89,10 @@ export default function DodoPage() {
       }
 
       // If validation succeeds, proceed with saving
-      const requestData: { secretKey: string; webhookSecret?: string } = {
-        secretKey: formData.secretKey,
-      };
-
-      if (formData.webhookSecret.trim()) {
-        requestData.webhookSecret = formData.webhookSecret;
-      }
-
       const response = await apiClient.dodo.config.$post({
-        json: requestData,
+        json: {
+          secretKey: formData.secretKey,
+        },
       });
 
       if (response.ok) {
@@ -112,7 +104,7 @@ export default function DodoPage() {
         }
         await fetchDodoConfig();
         setShowForm(false);
-        setFormData({ secretKey: "", webhookSecret: "" });
+        setFormData({ secretKey: "" });
       } else {
         const error = await response.json();
         console.error("Error saving Dodo config:", error);
@@ -244,26 +236,6 @@ export default function DodoPage() {
                 </p>
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="webhookSecret">Webhook Secret</Label>
-                <Input
-                  id="webhookSecret"
-                  type="text"
-                  value={formData.webhookSecret}
-                  onChange={(e) =>
-                    handleInputChange("webhookSecret", e.target.value)
-                  }
-                  placeholder="Your webhook endpoint secret..."
-                  disabled={isSaving}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Used to verify webhook signatures from Dodo Payments for
-                  enhanced security.
-                </p>
-              </div>
-
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                 <h4 className="font-medium text-blue-900 mb-2">
                   Important Notes:
@@ -273,9 +245,6 @@ export default function DodoPage() {
                     • Your API key will be validated automatically when saving
                   </li>
                   <li>• Keys are encrypted and stored securely</li>
-                  <li>
-                    • Webhook secret is optional but recommended for security
-                  </li>
                   <li>• The system will try both test and live environments</li>
                 </ul>
               </div>
@@ -301,7 +270,6 @@ export default function DodoPage() {
                     setShowForm(false);
                     setFormData({
                       secretKey: "",
-                      webhookSecret: "",
                     });
                   }}
                   disabled={isSaving}

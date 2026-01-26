@@ -28,6 +28,7 @@ import {
 } from "@/lib/currencies";
 import { PageContent } from "@/components/dashboard/page-content";
 import { Label } from "@/components/ui/label";
+import { useSession } from "@/lib/auth-client";
 import {
   Select,
   SelectContent,
@@ -59,6 +60,7 @@ export default function MerchantSettingsPage() {
   const [dunningAction, setDunningAction] = useState<
     "pause_subscription" | "mark_as_unpaid" | "cancel_subscription"
   >("pause_subscription");
+  const { refetch } = useSession();
 
   const form = useAppForm({
     defaultValues: {
@@ -229,6 +231,12 @@ export default function MerchantSettingsPage() {
       }
 
       toast.success("Merchant information updated successfully");
+      // Refresh auth session so downstream pages see updated merchant currency
+      try {
+        await refetch();
+      } catch {
+        // noop: best-effort refresh
+      }
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to update merchant"

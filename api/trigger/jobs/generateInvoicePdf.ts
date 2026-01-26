@@ -116,26 +116,35 @@ export const generateInvoicePdfJob = task({
       const invoiceNumber =
         pdfResult.invoiceNumber || invoice.customerInvoiceNumber || invoice.id;
 
-      try {
-        const emailJobHandle = await sendInvoiceEmailJob.trigger({
-          invoice,
-          pdfBuffer: pdfResult.pdfBuffer!,
-          pdfUrl,
-          invoiceNumber,
-        });
+      if ((invoice.totalAmountCents ?? 0) === 0) {
+        logger.info(
+          `Skipping invoice email job for zero-amount invoice ${invoice.id}`
+        );
+      } else {
+        try {
+          const emailJobHandle = await sendInvoiceEmailJob.trigger({
+            invoice,
+            pdfBuffer: pdfResult.pdfBuffer!,
+            pdfUrl,
+            invoiceNumber,
+          });
 
-        logger.info(`Triggered email job for invoice ${invoice.id}`, {
-          invoiceId: invoice.id,
-          emailJobId: emailJobHandle.id,
-        });
-      } catch (emailJobError) {
-        logger.error(`Failed to trigger email job for invoice ${invoice.id}`, {
-          invoiceId: invoice.id,
-          error:
-            emailJobError instanceof Error
-              ? emailJobError.message
-              : String(emailJobError),
-        });
+          logger.info(`Triggered email job for invoice ${invoice.id}`, {
+            invoiceId: invoice.id,
+            emailJobId: emailJobHandle.id,
+          });
+        } catch (emailJobError) {
+          logger.error(
+            `Failed to trigger email job for invoice ${invoice.id}`,
+            {
+              invoiceId: invoice.id,
+              error:
+                emailJobError instanceof Error
+                  ? emailJobError.message
+                  : String(emailJobError),
+            }
+          );
+        }
       }
 
       return {

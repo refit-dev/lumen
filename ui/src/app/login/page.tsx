@@ -10,14 +10,16 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, Suspense } from "react";
 import { Loader2 } from "lucide-react";
 import { signIn, signUp, authClient } from "@/lib/auth-client";
 import { cn } from "@/lib/utils";
 import { useSession } from "@/lib/auth-client";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Turnstile } from "@marsidev/react-turnstile";
+import { TURNSTILE_SITE_KEY } from "@/lib/utils";
 
-export default function SignIn() {
+function LoginContent() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -27,14 +29,110 @@ export default function SignIn() {
   const [success, setSuccess] = useState<string | null>(null);
   const [isResetMode, setIsResetMode] = useState(false);
   const [resetEmail, setResetEmail] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState("");
   const { data: session, isPending } = useSession();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const invitationId = useMemo(() => {
+    const fromTopLevel = searchParams.get("invitationId");
+    if (fromTopLevel) return fromTopLevel;
+    const rawReturnTo = searchParams.get("returnTo");
+    if (!rawReturnTo) return null;
+    try {
+      const base =
+        typeof window !== "undefined"
+          ? window.location.origin
+          : "http://localhost";
+      const url = new URL(rawReturnTo, base);
+      return url.searchParams.get("invitationId");
+    } catch {
+      return null;
+    }
+  }, [searchParams]);
+  type InvitationBanner = {
+    organizationName?: string;
+    role?: string;
+    inviterName?: string;
+    email?: string;
+  } | null;
+  const [invitationDetails, setInvitationDetails] =
+    useState<InvitationBanner>(null);
+
+  const returnTo = useMemo(() => {
+    const raw = searchParams.get("returnTo");
+    if (!raw) return null;
+
+    // Allow relative internal paths starting with '/'
+    if (raw.startsWith("/")) {
+      return raw;
+    }
+
+    // In browser, validate absolute URLs are same-origin
+    if (typeof window !== "undefined") {
+      try {
+        const url = new URL(raw, window.location.origin);
+        if (url.origin === window.location.origin) {
+          return url.pathname + url.search;
+        }
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }, [searchParams]);
+
+  // Prefill the email from invite link immediately to avoid flicker
+  useEffect(() => {
+    const fromQuery = searchParams.get("invitee");
+    if (fromQuery && fromQuery !== email) {
+      setEmail(fromQuery);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    const fetchInvitationInfo = async () => {
+      if (!invitationId) return;
+      try {
+        // Hono client types may not include this route signature yet; fall back to fetch
+        const API_URL = process.env.NEXT_PUBLIC_API_URL;
+        const res = await fetch(
+          `${API_URL}/v1/public/invitation/${invitationId}`,
+          {
+            credentials: "include",
+          }
+        );
+        if (res.ok) {
+          const data = (await res.json()) as {
+            organizationName?: string;
+            role?: string;
+            inviterName?: string;
+            email?: string;
+          };
+          setInvitationDetails({
+            organizationName: data.organizationName,
+            role: data.role,
+            inviterName: data.inviterName,
+            email: data.email,
+          });
+          // If server returned email, set it
+          if (data.email) {
+            setEmail(data.email);
+          }
+        }
+      } catch {
+        // Silently fail - invitation context is optional
+      }
+    };
+    fetchInvitationInfo();
+  }, [invitationId]);
 
   useEffect(() => {
     if (!isPending && session?.user) {
-      router.replace("/dashboard");
+      router.replace(returnTo || "/dashboard");
     }
-  }, [session, isPending, router]);
+  }, [session, isPending, router, returnTo]);
 
   // UseEffect for generate mock user. Hold Cmd/Ctrol key to render the mock button in the login page
   useEffect(() => {
@@ -75,6 +173,11 @@ export default function SignIn() {
       const response = await authClient.forgetPassword({
         email: resetEmail,
         redirectTo: window.location.origin + "/reset-password",
+        fetchOptions: {
+          headers: {
+            "x-captcha-response": turnstileToken,
+          },
+        },
       });
 
       if (response.error) {
@@ -107,6 +210,11 @@ export default function SignIn() {
         password: randomPassword,
         name: randomEmail,
         callbackURL: window.location.origin + "/onboarding",
+        fetchOptions: {
+          headers: {
+            "x-captcha-response": turnstileToken,
+          },
+        },
       });
 
       if (signUpResponse.error) {
@@ -118,6 +226,11 @@ export default function SignIn() {
             email: randomEmail,
             password: randomPassword,
             callbackURL: window.location.origin + "/onboarding",
+            fetchOptions: {
+              headers: {
+                "x-captcha-response": turnstileToken,
+              },
+            },
           });
           setSuccess("Mock user created and signed in!");
         } catch (signInError) {
@@ -146,10 +259,52 @@ export default function SignIn() {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <Card className="w-full max-w-md">
+        {invitationDetails && (
+          <div className="bg-blue-50 border-b border-blue-200 p-4">
+            <div className="flex items-start gap-3">
+              <div className="h-10 w-10 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  className="h-5 w-5 text-blue-600"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                >
+                  <path d="M8 9a3 3 0 100-6 3 3 0 000 6zM8 11a6 6 0 016 6H2a6 6 0 016-6zM16 7a1 1 0 10-2 0v1h-1a1 1 0 100 2h1v1a1 1 0 102 0v-1h1a1 1 0 100-2h-1V7z" />
+                </svg>
+              </div>
+              <div className="flex-1">
+                <p className="text-sm font-semibold text-blue-900 mb-1">
+                  Team Invitation
+                </p>
+                <p className="text-sm text-blue-800">
+                  You&apos;ve been invited to join{" "}
+                  <span className="font-bold">
+                    {invitationDetails.organizationName}
+                  </span>{" "}
+                  as a{" "}
+                  <span className="font-bold">{invitationDetails.role}</span>
+                  {invitationDetails.inviterName && (
+                    <>
+                      {" "}
+                      by{" "}
+                      <span className="font-semibold">
+                        {invitationDetails.inviterName}
+                      </span>
+                    </>
+                  )}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
         <CardHeader>
-          <CardTitle className="text-lg md:text-xl">Welcome</CardTitle>
+          <CardTitle className="text-lg md:text-xl">
+            {invitationDetails ? "Sign in to Continue" : "Welcome"}
+          </CardTitle>
           <CardDescription className="text-xs md:text-sm">
-            Sign in to your account or create a new one
+            {invitationDetails
+              ? "Sign in or create an account to accept the invitation"
+              : "Sign in to your account or create a new one"}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -181,7 +336,17 @@ export default function SignIn() {
                   </div>
                 )}
 
-                <Button type="submit" className="w-full" disabled={loading}>
+                <Turnstile
+                  siteKey={TURNSTILE_SITE_KEY}
+                  onSuccess={setTurnstileToken}
+                  onExpire={() => setTurnstileToken("")}
+                />
+
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={loading || !turnstileToken}
+                >
                   {loading ? (
                     <Loader2 size={16} className="animate-spin" />
                   ) : (
@@ -217,7 +382,13 @@ export default function SignIn() {
                   const signInResponse = await signIn.email({
                     email,
                     password,
-                    callbackURL: window.location.origin + "/dashboard",
+                    callbackURL:
+                      window.location.origin + (returnTo || "/dashboard"),
+                    fetchOptions: {
+                      headers: {
+                        "x-captcha-response": turnstileToken,
+                      },
+                    },
                   });
                   console.log("signInResponse: ", signInResponse);
 
@@ -241,7 +412,14 @@ export default function SignIn() {
                           email,
                           password,
                           name: email,
-                          callbackURL: window.location.origin + "/onboarding",
+                          callbackURL:
+                            window.location.origin +
+                            (returnTo || "/onboarding"),
+                          fetchOptions: {
+                            headers: {
+                              "x-captcha-response": turnstileToken,
+                            },
+                          },
                         });
 
                         if (signUpResponse.error) {
@@ -283,7 +461,7 @@ export default function SignIn() {
                   } else {
                     // Sign in successful
                     setSuccess("Signed in successfully! Redirecting...");
-                    router.replace("/dashboard"); // Explicit redirect on success
+                    router.replace(returnTo || "/dashboard");
                   }
                 } catch (e: unknown) {
                   console.error("Authentication process error:", e);
@@ -306,10 +484,28 @@ export default function SignIn() {
                     placeholder="m@example.com"
                     required
                     onChange={(e) => {
-                      setEmail(e.target.value);
+                      if (!invitationDetails) setEmail(e.target.value);
                     }}
-                    value={email}
+                    value={
+                      invitationDetails?.email ||
+                      searchParams.get("invitee") ||
+                      email
+                    }
+                    disabled={!!invitationDetails}
+                    readOnly={!!invitationDetails}
                   />
+                  {invitationDetails && (
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      You are accepting an invitation. Your account will be
+                      created for
+                      <span className="font-medium">
+                        {" "}
+                        {invitationDetails?.email ||
+                          searchParams.get("invitee")}
+                      </span>
+                      .
+                    </p>
+                  )}
                 </div>
 
                 <div className="grid gap-2">
@@ -347,7 +543,7 @@ export default function SignIn() {
                   </div>
                 )}
 
-                {isCommandPressed && (
+                {isCommandPressed && !invitationDetails && (
                   <Button
                     type="button"
                     variant="secondary"
@@ -363,7 +559,17 @@ export default function SignIn() {
                   </Button>
                 )}
 
-                <Button type="submit" className="w-full" disabled={loading}>
+                <Turnstile
+                  siteKey={TURNSTILE_SITE_KEY}
+                  onSuccess={setTurnstileToken}
+                  onExpire={() => setTurnstileToken("")}
+                />
+
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={loading || !turnstileToken}
+                >
                   {loading ? (
                     <Loader2 size={16} className="animate-spin" />
                   ) : (
@@ -384,10 +590,16 @@ export default function SignIn() {
                       setGoogleLoading(true);
                       await signIn.social({
                         provider: "google",
-                        callbackURL: window.location.origin + "/dashboard",
+                        callbackURL:
+                          window.location.origin + (returnTo || "/dashboard"),
+                        fetchOptions: {
+                          headers: {
+                            "x-captcha-response": turnstileToken,
+                          },
+                        },
                       });
                     }}
-                    disabled={googleLoading}
+                    disabled={googleLoading || !turnstileToken}
                   >
                     {googleLoading ? (
                       <Loader2 size={16} className="animate-spin" />
@@ -425,5 +637,25 @@ export default function SignIn() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+export default function SignIn() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center min-h-screen">
+          <Card className="w-[480px]">
+            <CardContent className="pt-6">
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      }
+    >
+      <LoginContent />
+    </Suspense>
   );
 }

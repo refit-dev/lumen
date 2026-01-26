@@ -49,6 +49,9 @@ export async function createAuthenticatedClient(
       password,
     },
     asResponse: true,
+    headers: {
+      "x-captcha-response": "test-captcha-response",
+    },
   });
 
   if (response.status !== 200) {

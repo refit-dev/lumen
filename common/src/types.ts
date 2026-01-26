@@ -24,4 +24,5 @@ export type EnhancedSession = {
     legalName?: string | null;
     displayName?: string | null;
   } | null;
+  memberRole?: string | null;
 };

@@ -717,7 +717,16 @@ export async function generateImmediateInvoice({
       dueDate: firstBillingPeriodStart,
       issueDate: firstBillingPeriodStart,
       billingPeriodStart: subscription.startTimestamp,
-      billingPeriodEnd: null,
+      billingPeriodEnd: (() => {
+        const immediateIds = new Set(
+          immediateComponents.map((c) => c.component_id)
+        );
+        const ends = subscriptionDetailsRecords
+          .filter((sd) => immediateIds.has(sd.componentId))
+          .map((sd) => new Date(sd.nextBillingDate).getTime());
+        if (ends.length === 0) return null;
+        return new Date(Math.max(...ends));
+      })(),
     })
     .returning();
 
@@ -2811,7 +2820,16 @@ export async function createSubscriptionWithInvoiceAndPayment({
           dueDate: startTimestamp, // Due immediately
           issueDate: new Date(),
           billingPeriodStart: startTimestamp,
-          billingPeriodEnd: null, // Will be updated later if needed
+          billingPeriodEnd: (() => {
+            const immediateIds = new Set(
+              immediateComponents.map((c) => c.component_id)
+            );
+            const ends = subscriptionDetailsRecords
+              .filter((sd) => immediateIds.has(sd.componentId))
+              .map((sd) => new Date(sd.nextBillingDate).getTime());
+            if (ends.length === 0) return null;
+            return new Date(Math.max(...ends));
+          })(),
         })
         .returning();
 
@@ -3297,7 +3315,7 @@ export async function createOrMergeIntoInvoice({
     priceId?: string;
     metricId?: string;
     billingPeriodStart: Date;
-    billingPeriodEnd: Date;
+    billingPeriodEnd?: Date | null;
   }>;
   currency?: string;
   description?: string;
@@ -3394,7 +3412,11 @@ export async function createOrMergeIntoInvoice({
           subtotalCents: item.subtotalCents,
           componentId: item.componentId || undefined,
           billingPeriodStart: item.billingPeriodStart || new Date(),
-          billingPeriodEnd: item.billingPeriodEnd || new Date(),
+          billingPeriodEnd:
+            item.billingPeriodEnd ||
+            item.billingPeriodStart ||
+            item.createdAt ||
+            new Date(),
         })),
         // New line items
         ...lineItems.map((item) => ({
@@ -3404,7 +3426,7 @@ export async function createOrMergeIntoInvoice({
           componentId: item.componentId,
           priceId: item.priceId,
           billingPeriodStart: item.billingPeriodStart,
-          billingPeriodEnd: item.billingPeriodEnd,
+          billingPeriodEnd: item.billingPeriodEnd ?? item.billingPeriodStart,
         })),
       ];
 
@@ -3443,7 +3465,7 @@ export async function createOrMergeIntoInvoice({
         unitAmountCents: item.unitAmountCents,
         subtotalCents: item.subtotalCents,
         billingPeriodStart: item.billingPeriodStart,
-        billingPeriodEnd: item.billingPeriodEnd,
+        billingPeriodEnd: item.billingPeriodEnd ?? null,
         metricId: item.metricId || null,
       }));
 
@@ -3535,7 +3557,7 @@ export async function createInvoice({
     priceId?: string;
     metricId?: string;
     billingPeriodStart: Date;
-    billingPeriodEnd: Date;
+    billingPeriodEnd?: Date | null;
   }>;
   currency?: string;
   description?: string;
@@ -3566,19 +3588,21 @@ export async function createInvoice({
       );
 
       // Apply taxes
+      const taxableLineItems = lineItems.map((item) => ({
+        type: item.type,
+        description: item.description,
+        subtotalCents: item.subtotalCents,
+        componentId: item.componentId,
+        priceId: item.priceId,
+        billingPeriodStart: item.billingPeriodStart,
+        billingPeriodEnd: item.billingPeriodEnd ?? item.billingPeriodStart,
+      }));
+
       const taxData = await calculateTaxes({
         merchantId,
         customerId,
         subtotalAfterCredits: subtotalCents,
-        lineItems: lineItems.map((item) => ({
-          type: item.type,
-          description: item.description,
-          subtotalCents: item.subtotalCents,
-          componentId: item.componentId,
-          priceId: item.priceId,
-          billingPeriodStart: item.billingPeriodStart,
-          billingPeriodEnd: item.billingPeriodEnd,
-        })),
+        lineItems: taxableLineItems,
         currency,
         billingDate: new Date(),
       });
@@ -3619,7 +3643,7 @@ export async function createInvoice({
           dueDate: status === "issued" ? new Date() : null,
           issueDate: status === "issued" ? new Date() : null,
           billingPeriodStart: lineItems[0]?.billingPeriodStart || new Date(),
-          billingPeriodEnd: lineItems[0]?.billingPeriodEnd || new Date(),
+          billingPeriodEnd: lineItems[0]?.billingPeriodEnd ?? null,
           notes: description,
         })
         .returning();
@@ -3650,7 +3674,7 @@ export async function createInvoice({
           unitAmountCents: item.unitAmountCents,
           subtotalCents: item.subtotalCents,
           billingPeriodStart: item.billingPeriodStart,
-          billingPeriodEnd: item.billingPeriodEnd,
+          billingPeriodEnd: item.billingPeriodEnd ?? null,
           metricId: item.metricId || null,
           taxMetadata:
             index >= lineItems.length

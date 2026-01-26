@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { useSession, signOut, admin } from "@/lib/auth-client";
 import { useRouter } from "next/navigation";
 import { CommandPalette } from "./command-palette";
-import { LogOut, Settings, Shield, UserX } from "lucide-react";
+import { LogOut, Settings, Shield, UserX, Wallet } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { YC_ENROLLMENT_FEATURE_SLUG } from "@lumen/common/utils";
@@ -127,9 +127,22 @@ export function UserNav() {
                 <DropdownMenuSeparator />
               </>
             )}
+            <DropdownMenuItem
+              onClick={() => router.push("/billing")}
+              className="flex flex-col items-start gap-1 py-2"
+            >
+              <span className="flex items-center text-sm font-medium text-foreground">
+                <Wallet className="mr-2 h-4 w-4" />
+                My Lumen Subscription
+              </span>
+              <span className="text-xs text-muted-foreground ml-6">
+                Manage your plan, payment method, and Lumen invoices.
+              </span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuItem onClick={() => router.push("/merchant")}>
               <Settings className="mr-2 h-4 w-4" />
-              <span>Settings</span>
+              <span>Workspace Settings</span>
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem

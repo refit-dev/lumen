@@ -30,6 +30,9 @@ export async function createTestUser({
       email,
       password,
     },
+    headers: {
+      "x-captcha-response": "test-captcha-response",
+    },
   });
 
   // Return the user with password for test purposes
@@ -54,6 +57,9 @@ export async function authenticateTestUser(email: string, password: string) {
       password,
     },
     asResponse: true,
+    headers: {
+      "x-captcha-response": "test-captcha-response",
+    },
   });
 
   // Check for cookies

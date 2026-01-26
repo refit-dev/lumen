@@ -34,6 +34,7 @@
     "@aws-sdk/client-ssm": "^3.515.0",
     "@aws-sdk/s3-request-presigner": "^3.779.0",
     "@getlumen/better-auth": "^0.1.5",
+    "@getlumen/server": "^0.1.12",
     "@hono/zod-openapi": "^0.19.2",
     "@hono/zod-validator": "^0.4.3",
     "@lumen/common": "*",

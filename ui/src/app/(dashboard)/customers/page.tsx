@@ -249,12 +249,18 @@ export default function CustomersPage() {
   }, [router]);
 
   const deleteCustomersMutation = useMutation({
-    mutationFn: async (customerIds: string[]) => {
-      const deletePromises = customerIds.map((id) =>
-        apiClient.customers[":id"].$delete({
+    mutationFn: async (items: Array<{ id: string; cascade: boolean }>) => {
+      const deletePromises = items.map(({ id, cascade }) => {
+        if (cascade) {
+          return apiClient.customers[":id"].$delete({
+            param: { id },
+            query: { cascade: "true" },
+          });
+        }
+        return apiClient.customers[":id"].$delete({
           param: { id },
-        })
-      );
+        });
+      });
       await Promise.all(deletePromises);
     },
     onSuccess: () => {
@@ -821,8 +827,29 @@ export default function CustomersPage() {
 
   const handleDeleteSelected = () => {
     const selectedRows = table.getSelectedRowModel().rows;
-    const customerIds = selectedRows.map((row) => row.original.id);
-    deleteCustomersMutation.mutate(customerIds);
+    const customersToDelete = selectedRows.map(
+      (row) => row.original as CustomerWithSubscriptions
+    );
+
+    const needingCascade = customersToDelete.filter(
+      (c) => c.activeSubscriptionCount > 0
+    );
+
+    if (needingCascade.length > 0) {
+      const proceed = window.confirm(
+        `${needingCascade.length} selected customer${
+          needingCascade.length > 1 ? "s" : ""
+        } have active subscriptions. Deleting will also cancel their subscriptions and delete the customers. Continue?`
+      );
+      if (!proceed) return;
+    }
+
+    deleteCustomersMutation.mutate(
+      customersToDelete.map((c) => ({
+        id: c.id,
+        cascade: c.activeSubscriptionCount > 0,
+      }))
+    );
   };
 
   // Calculate summary statistics

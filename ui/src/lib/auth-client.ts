@@ -1,5 +1,12 @@
 import { createAuthClient } from "better-auth/react";
 import { organizationClient, adminClient } from "better-auth/client/plugins";
+import {
+  ac,
+  ownerRole,
+  adminRole,
+  memberRole,
+  developerRole,
+} from "@lumen/common";
 import { EnhancedSession } from "@lumen/common";
 import { fetchWithAuthInterceptor } from "./api-interceptor";
 
@@ -10,7 +17,19 @@ if (!API_URL) {
 
 const authClient = createAuthClient({
   baseURL: API_URL,
-  plugins: [organizationClient(), adminClient()],
+  plugins: [
+    organizationClient({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ac: ac as any,
+      roles: {
+        owner: ownerRole,
+        admin: adminRole,
+        member: memberRole,
+        developer: developerRole,
+      },
+    }),
+    adminClient(),
+  ],
 });
 
 export const {

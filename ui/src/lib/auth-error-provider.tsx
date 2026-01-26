@@ -31,6 +31,7 @@ const PUBLIC_ROUTES = new Set([
   "/terms",
   "/impressum",
   "/login",
+  "/accept-invite",
   "/demo",
   // /blog routes handled later in code with startsWith
 ]);

@@ -22,6 +22,7 @@ import {
   createPspCustomer,
   createPspPaymentAuthorization,
 } from "../helpers/paymentprovider";
+import { deleteSubscription } from "./subscriptions";
 
 const customerUpdateSchema = customersInsertSchemaReq.partial();
 
@@ -783,9 +784,18 @@ export const customersRouter = new Hono()
         )(z.string()),
       })
     ),
+    zValidator(
+      "query",
+      z
+        .object({
+          cascade: z.string().optional(), // "true" to cascade delete subscriptions
+        })
+        .optional()
+    ),
     async (c) => {
       const merchantId = c.get("merchant")!.id;
       const customerId = c.req.valid("param").id;
+      const cascade = c.req.valid("query")?.cascade === "true";
 
       let existingCustomer;
       try {
@@ -805,7 +815,39 @@ export const customersRouter = new Hono()
         return c.json({ error: "Customer not found or access denied" }, 404);
       }
 
+      // Find any active subscriptions for this customer
+      const activeSubscriptions = await db.query.subscriptions.findMany({
+        where: and(
+          eq(subscriptions.customerId, customerId),
+          eq(subscriptions.merchantId, merchantId),
+          isNull(subscriptions.deletedAt),
+          isNull(subscriptions.endTimestamp)
+        ),
+      });
+
+      if (activeSubscriptions.length > 0 && !cascade) {
+        return c.json(
+          {
+            error:
+              "Customer has active subscriptions. Confirm cascade to delete customer and cancel subscriptions.",
+            requiresCascade: true,
+            activeSubscriptionCount: activeSubscriptions.length,
+            subscriptionIds: activeSubscriptions.map(
+              (s) => s.stableSubscriptionId
+            ),
+          },
+          409
+        );
+      }
+
       try {
+        // If cascade requested, end all active subscriptions first
+        if (activeSubscriptions.length > 0 && cascade) {
+          for (const sub of activeSubscriptions) {
+            await deleteSubscription(merchantId, sub.stableSubscriptionId);
+          }
+        }
+
         const result = await db
           .update(customers)
           .set({ deletedAt: new Date() })
@@ -824,9 +866,15 @@ export const customersRouter = new Hono()
           );
         }
 
-        return c.json({ success: true });
+        return c.json({
+          success: true,
+          cascaded: activeSubscriptions.length > 0,
+          canceledSubscriptions: activeSubscriptions.map(
+            (s) => s.stableSubscriptionId
+          ),
+        });
       } catch (error) {
-        console.error("Error deleting customer:", error);
+        console.error("Error deleting customer (with cascade):", error);
         return c.json({ error: "Failed to delete customer" }, 500);
       }
     }

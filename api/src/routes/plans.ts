@@ -248,6 +248,15 @@ const planApiSchema = plansInsertSchema
           creditAllowanceRenewal: z
             .enum(["monthly", "yearly", "none"])
             .optional(),
+          // Top-up configuration
+          enableTopups: z.boolean().optional(),
+          topupPricePerCreditCents: z.number().int().min(1).optional(),
+          topupMinQuantity: z.number().int().min(1).optional(),
+          topupMaxQuantity: z.number().int().min(1).optional(),
+          topupExpiryBehavior: z
+            .enum(["billing_cycle", "custom_days", "never"])
+            .optional(),
+          topupCustomExpiryDays: z.number().int().min(1).optional(),
           // Field for identifying existing features
           existingFeatureId: z.string().optional(),
         })
@@ -301,6 +310,67 @@ const planApiSchema = plansInsertSchema
           path: ["minSeats"],
         });
       }
+    }
+
+    if (data.newFeatures) {
+      data.newFeatures.forEach((feature, index) => {
+        const hasUsagePrice =
+          feature.usagePricePerUnit !== undefined &&
+          feature.usagePricePerUnit > 0;
+        const hasTopups = feature.enableTopups === true;
+
+        if (hasTopups) {
+          if (!feature.isUsageBased || !feature.hasCreditAllowance) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message:
+                "Top-ups require a usage-based feature with a credit allowance",
+              path: ["newFeatures", index, "enableTopups"],
+            });
+          }
+
+          if (
+            feature.topupPricePerCreditCents == null ||
+            feature.topupPricePerCreditCents <= 0
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Top-up price per credit is required",
+              path: ["newFeatures", index, "topupPricePerCreditCents"],
+            });
+          }
+
+          if (
+            feature.topupMinQuantity != null &&
+            feature.topupMinQuantity < 1
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Top-up minimum quantity must be at least 1",
+              path: ["newFeatures", index, "topupMinQuantity"],
+            });
+          }
+
+          if (
+            feature.topupExpiryBehavior === "custom_days" &&
+            !feature.topupCustomExpiryDays
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Custom expiry requires a number of days",
+              path: ["newFeatures", index, "topupCustomExpiryDays"],
+            });
+          }
+
+          if (hasUsagePrice) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Choose either usage overage or top-ups, not both",
+              path: ["newFeatures", index, "usagePricePerUnit"],
+            });
+          }
+        }
+      });
     }
   });
 
@@ -600,6 +670,7 @@ async function createPlan(
   } = data;
 
   console.log("createPlan called with data", data);
+  console.log("newFeatures:", JSON.stringify(data.newFeatures, null, 2));
 
   // Get merchant's default currency
   const merchant = await dbInstance.query.merchants.findFirst({
@@ -818,7 +889,25 @@ async function createPlan(
             billingVisible: willBePriceLinked, // true if linked to pricing, false if just a feature counter
             priority: 100,
             ...renewalConfig,
+            // Top-up configuration
+            enableTopups: feature.enableTopups ?? false,
+            topupPricePerCreditCents: feature.topupPricePerCreditCents,
+            topupMinQuantity: feature.topupMinQuantity,
+            topupMaxQuantity: feature.topupMaxQuantity,
+            topupExpiryBehavior: feature.topupExpiryBehavior,
+            topupCustomExpiryDays: feature.topupCustomExpiryDays,
           };
+
+          console.log(
+            `Creating credit definition for feature ${feature.slug}:`,
+            {
+              enableTopups: feature.enableTopups,
+              topupPricePerCreditCents: feature.topupPricePerCreditCents,
+              topupMinQuantity: feature.topupMinQuantity,
+              topupMaxQuantity: feature.topupMaxQuantity,
+              topupExpiryBehavior: feature.topupExpiryBehavior,
+            }
+          );
 
           // If the feature has a usage price, we need to link credit definition to price/component after price creation
           if (willBePriceLinked) {
@@ -1393,6 +1482,9 @@ export const plansRoute = new Hono()
               stablePlanId,
               versionNumber: newVersionNumber,
               commitMessage,
+              // Preserve PSP plan ID across versions - this links the plan to the
+              // external payment provider's product (e.g., Dodo Payments product ID)
+              pspPlanId: latestPlan.pspPlanId,
             })
             .returning();
 
@@ -1519,61 +1611,141 @@ export const plansRoute = new Hono()
     zValidator("param", z.object({ id: z.string() })),
     zValidator(
       "json",
-      z.object({
-        planName: z.string().optional(),
-        planDescription: z.string().optional(),
-        features: z
-          .array(
-            z.object({
-              featureName: z.string(),
-              slug: z.string(),
-              eventName: z.string().optional(),
-              isUsageBased: z.boolean(),
-              usagePricePerUnit: z.number().optional(),
-              hasCreditAllowance: z.boolean().optional(),
-              creditAllowanceAmount: z.number().optional(),
-              creditAllowanceRenewal: z
-                .enum(["monthly", "yearly", "none"])
-                .optional(),
-              existingFeatureId: z.string().optional(),
-            })
-          )
-          .optional(),
-        currency: z.string().optional(),
-        monthlyPrice: z.number().optional(),
-        yearlyPrice: z.number().optional(),
-        hasYearlyPrice: z.boolean().optional(),
-        isEnterprisePlan: z.boolean().optional(),
-        enterpriseButtonText: z.string().optional(),
-        enterpriseRedirectUrl: z.string().optional(),
-        showInPricingTable: z.boolean().optional(),
-        // Seat-based pricing fields
-        isSeatBased: z.boolean().optional(),
-        minSeats: z.number().optional(),
-        billImmediately: z.boolean().optional(),
-        // Trial configuration
-        trial: z
-          .union([
-            // Trial enabled - requires days and optional creditOverrides
-            z.object({
-              enabled: z.literal(true),
-              days: z.number().int().min(1).max(365),
-              creditOverrides: z
-                .array(
-                  z.object({
-                    featureSlug: z.string(),
-                    allowance: z.number().int().min(0),
-                  })
-                )
-                .optional(),
-            }),
-            // Trial disabled - only enabled field needed
-            z.object({
-              enabled: z.literal(false),
-            }),
-          ])
-          .optional(),
-      })
+      z
+        .object({
+          planName: z.string().optional(),
+          planDescription: z.string().optional(),
+          features: z
+            .array(
+              z.object({
+                featureName: z.string(),
+                slug: z.string(),
+                eventName: z.string().optional(),
+                isUsageBased: z.boolean(),
+                usagePricePerUnit: z.number().optional(),
+                hasCreditAllowance: z.boolean().optional(),
+                creditAllowanceAmount: z.number().optional(),
+                creditAllowanceRenewal: z
+                  .enum(["monthly", "yearly", "none"])
+                  .optional(),
+                // Top-up configuration
+                enableTopups: z.boolean().optional(),
+                topupPricePerCreditCents: z.number().int().min(1).optional(),
+                topupMinQuantity: z.number().int().min(1).optional(),
+                topupMaxQuantity: z.number().int().min(1).optional(),
+                topupExpiryBehavior: z
+                  .enum(["billing_cycle", "custom_days", "never"])
+                  .optional(),
+                topupCustomExpiryDays: z.number().int().min(1).optional(),
+                existingFeatureId: z.string().optional(),
+              })
+            )
+            .optional(),
+          currency: z.string().optional(),
+          monthlyPrice: z.number().optional(),
+          yearlyPrice: z.number().optional(),
+          hasYearlyPrice: z.boolean().optional(),
+          isEnterprisePlan: z.boolean().optional(),
+          enterpriseButtonText: z.string().optional(),
+          enterpriseRedirectUrl: z.string().optional(),
+          showInPricingTable: z.boolean().optional(),
+          // Seat-based pricing fields
+          isSeatBased: z.boolean().optional(),
+          minSeats: z.number().optional(),
+          billImmediately: z.boolean().optional(),
+          // Trial configuration
+          trial: z
+            .union([
+              // Trial enabled - requires days and optional creditOverrides
+              z.object({
+                enabled: z.literal(true),
+                days: z.number().int().min(1).max(365),
+                creditOverrides: z
+                  .array(
+                    z.object({
+                      featureSlug: z.string(),
+                      allowance: z.number().int().min(0),
+                    })
+                  )
+                  .optional(),
+              }),
+              // Trial disabled - only enabled field needed
+              z.object({
+                enabled: z.literal(false),
+              }),
+            ])
+            .optional(),
+        })
+        .superRefine((data, ctx) => {
+          if (data.features) {
+            data.features.forEach((feature, index) => {
+              const hasUsagePrice =
+                feature.usagePricePerUnit !== undefined &&
+                feature.usagePricePerUnit > 0;
+              const hasTopups = feature.enableTopups === true;
+
+              if (hasTopups) {
+                if (!feature.isUsageBased || !feature.hasCreditAllowance) {
+                  ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message:
+                      "Top-ups require a usage-based feature with a credit allowance",
+                    path: ["features", index, "enableTopups"],
+                  });
+                }
+
+                if (
+                  feature.topupPricePerCreditCents == null ||
+                  feature.topupPricePerCreditCents <= 0
+                ) {
+                  ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Top-up price per credit is required",
+                    path: ["features", index, "topupPricePerCreditCents"],
+                  });
+                }
+
+                if (
+                  feature.topupMinQuantity != null &&
+                  feature.topupMinQuantity < 1
+                ) {
+                  ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Top-up minimum quantity must be at least 1",
+                    path: ["features", index, "topupMinQuantity"],
+                  });
+                }
+
+                if (
+                  feature.topupExpiryBehavior === "custom_days" &&
+                  !feature.topupCustomExpiryDays
+                ) {
+                  ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Custom expiry requires a number of days",
+                    path: ["features", index, "topupCustomExpiryDays"],
+                  });
+                }
+
+                if (hasUsagePrice) {
+                  ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Choose either usage overage or top-ups, not both",
+                    path: ["features", index, "usagePricePerUnit"],
+                  });
+                }
+              }
+
+              if (hasUsagePrice && hasTopups) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  message: "Usage overage and top-ups cannot be combined",
+                  path: ["features", index, "enableTopups"],
+                });
+              }
+            });
+          }
+        })
     ),
     async (c) => {
       const merchantId = c.get("merchant")!.id;

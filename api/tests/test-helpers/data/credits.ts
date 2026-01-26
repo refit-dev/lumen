@@ -6,6 +6,7 @@ import {
   CreditApplicationType,
   CreditScope,
   CreditGrantSource,
+  TopupExpiryBehavior,
 } from "@lumen/common/schema";
 
 /**
@@ -31,6 +32,13 @@ export async function createTestCreditDefinition(params: {
   priority?: number;
   billingVisible?: boolean;
   billingDescription?: string;
+  // Top-up configuration fields
+  enableTopups?: boolean;
+  topupPricePerCreditCents?: number;
+  topupMinQuantity?: number;
+  topupMaxQuantity?: number;
+  topupExpiryBehavior?: TopupExpiryBehavior;
+  topupCustomExpiryDays?: number;
 }) {
   return await createCreditDefinition(params);
 }

@@ -14,7 +14,6 @@ import {
   Percent,
   DollarSign,
   Shield,
-  Wallet,
 } from "lucide-react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
@@ -123,22 +122,17 @@ const data = {
           icon: CreditCard,
         },
         {
+          title: "Team",
+          url: "/settings/team",
+          icon: Users,
+        },
+        {
           title: "Merchant Settings",
           url: "/merchant",
           icon: Settings,
         },
       ],
-    },
-    {
-      title: "Lumen Account & Billing",
-      items: [
-        {
-          title: "Account & Billing",
-          url: "/billing",
-          icon: Wallet,
-        },
-      ],
-    },
+    }
   ],
 };
 
@@ -150,9 +144,25 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   // Check if user is admin
   const isAdmin = session?.user?.role === "admin";
 
-  // Create navigation data with conditional admin section
+  // Check if user is owner
+  const myRole = session?.memberRole ?? "member";
+  const myRoles = React.useMemo(() => (myRole || "").split(","), [myRole]);
+  const isOwner = myRoles.includes("owner");
+
+  // Create navigation data with conditional admin section and owner-only filters
   const navigationData = React.useMemo(() => {
-    const nav = [...data.navMain];
+    const nav = data.navMain.map((section) => {
+      // Filter owner-only items from Settings if user is not owner
+      if (section.title === "Settings" && !isOwner) {
+        return {
+          ...section,
+          items: section.items.filter(
+            (item) => item.title !== "Team" && item.title !== "Payment Provider"
+          ),
+        };
+      }
+      return section;
+    });
 
     // Add admin section if user is admin
     if (isAdmin) {
@@ -174,7 +184,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     }
 
     return nav;
-  }, [isAdmin]);
+  }, [isAdmin, isOwner]);
 
   return (
     <Sidebar collapsible="icon" className="font-sans" {...props}>

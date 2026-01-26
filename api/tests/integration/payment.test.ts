@@ -39,7 +39,9 @@ import {
   user,
   plans,
   pricingTablePlans,
+  pricingTables,
 } from "@lumen/common/schema";
+import { createTestPricingTable } from "../test-helpers/data/pricing-table";
 import { eq, and, isNull, ne, sql } from "drizzle-orm";
 import { FeatureValue } from "../test-helpers/data/feature";
 import { spawn, ChildProcess } from "child_process";
@@ -1122,5 +1124,152 @@ describe("Payment SSE Events", () => {
     const pingEvent = mockStream.events[0];
     expect(pingEvent.event).toBe("ping");
     expect(pingEvent.data).toBe("ping");
+  });
+});
+
+/**
+ * Free Plan Selection Tests
+ *
+ * Tests that payment-init correctly uses the explicitly requested planId/priceId
+ * for free plans instead of auto-selecting a different free plan.
+ *
+ * Bug context: When multiple free plans exist, payment-init was ignoring the
+ * requested planId/priceId and auto-selecting a different free plan.
+ */
+describe("Free Plan Selection in payment-init", () => {
+  let merchantId: string;
+  let publishableApiKey: string;
+  let baseApiClient: ReturnType<typeof createTestApiClient>;
+  const ts = Date.now();
+
+  beforeAll(async () => {
+    // Clean up any existing test data
+    await cleanupDataFull();
+
+    // Create test environment
+    const { merchant, user } = await createFullTestEnvironment();
+    merchantId = merchant.id;
+
+    // Get auth
+    const authResponse = await authenticateTestUser(user.email, user.password);
+    const sessionToken = authResponse.cookies.sessionToken;
+
+    // Create API keys
+    const apiKeys = await createTestApiKeys({ merchantId });
+    publishableApiKey = apiKeys.publishableKey.keyValue;
+
+    // Create API client
+    baseApiClient = createTestApiClient(sessionToken);
+  });
+
+  afterAll(async () => {
+    await cleanupDataFull();
+  });
+
+  it("should use explicitly requested free plan when multiple free plans exist", async () => {
+    // Create two free plans with different names/credits
+    const freePlan1Result = await createTestPlanWithFeatures(merchantId, [], {
+      planName: "Free Trial",
+      planDescription: "Limited free trial plan",
+    });
+    const freePlan1 = freePlan1Result.plan;
+
+    const freePlan2Result = await createTestPlanWithFeatures(merchantId, [], {
+      planName: "Internal User Plan",
+      planDescription: "Internal user plan with more credits",
+    });
+    const freePlan2 = freePlan2Result.plan;
+
+    // Create free prices for both plans (all components $0)
+    const freePrice1 = await createTestPrice({
+      merchantId,
+      planId: freePlan1.id,
+      currency: "USD",
+      pricingData: {
+        dsl_version: 1,
+        components: [
+          {
+            component_name: "free_component",
+            type: "fixed",
+            label: "Free Trial Component",
+            amount_cents: 0,
+            recurrence_rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=1;INTERVAL=1",
+            bill_immediately: true,
+          },
+        ],
+      },
+    });
+
+    const freePrice2 = await createTestPrice({
+      merchantId,
+      planId: freePlan2.id,
+      currency: "USD",
+      pricingData: {
+        dsl_version: 1,
+        components: [
+          {
+            component_name: "internal_component",
+            type: "fixed",
+            label: "Internal User Component",
+            amount_cents: 0,
+            recurrence_rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=1;INTERVAL=1",
+            bill_immediately: true,
+          },
+        ],
+      },
+    });
+
+    // Create pricing tables for both plans (required for free plan discovery)
+    await createTestPricingTable({
+      merchantId,
+      name: "Free Trial Table",
+      slug: `free-trial-table-${ts}`,
+      description: "Pricing table for free trial",
+      isActive: true,
+      planIds: [freePlan1.id],
+    });
+
+    await createTestPricingTable({
+      merchantId,
+      name: "Internal User Table",
+      slug: `internal-user-table-${ts}`,
+      description: "Pricing table for internal users",
+      isActive: true,
+      planIds: [freePlan2.id],
+    });
+
+    // Call payment-init explicitly requesting the second plan (Internal User Plan)
+    const response = await baseApiClient.public["payment-init"].$post({
+      json: {
+        lumenPublishableKey: publishableApiKey,
+        planId: freePlan2.id,
+        priceId: freePrice2.id,
+        customerEmail: `test-${ts}@example.com`,
+        customerName: "Test User",
+        userId: `user-${ts}`,
+      },
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+
+    // Verify subscription was created
+    expect("subscription_id" in data).toBe(true);
+    expect("plan" in data).toBe(true);
+
+    // Verify the CORRECT plan was used (the one we explicitly requested)
+    const planData = (data as { plan: { id: string; name: string } }).plan;
+    expect(planData.id).toBe(freePlan2.id);
+    expect(planData.name).toBe("Internal User Plan");
+
+    // Double-check by querying the subscription directly
+    const subscriptionId = (data as { subscription_id: string }).subscription_id;
+    const subscription = await db.query.subscriptions.findFirst({
+      where: eq(subscriptions.id, subscriptionId),
+    });
+
+    expect(subscription).toBeDefined();
+    expect(subscription!.planId).toBe(freePlan2.id);
+    expect(subscription!.effectivePriceId).toBe(freePrice2.id);
   });
 });

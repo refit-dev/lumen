@@ -27,6 +27,7 @@ export const env = createEnv({
     GOOGLE_CLIENT_SECRET: z.string(),
     DEV_SKIP_EMAIL_CHECK: z.coerce.boolean().default(true), // Skip email verification in dev mode by default
     FIELD_ENCRYPTION_KEY: z.string().optional(), // Base64 encoded 256-bit key for field-level encryption
+    TURNSTILE_SECRET_KEY: z.string().optional(), // Cloudflare Turnstile secret key
 
     // Database - Credentials sourced differently based on NODE_ENV
     // In dev/test: use these env vars directly
@@ -71,6 +72,10 @@ export const env = createEnv({
 
     // Dogfooding create free subscription
     LUMEN_API_KEY: z.string().optional(),
+    INTERNAL_API_KEY: z.string().optional(),
+    // **** IF YOU ARE ADDING A NEW SECRET, CHECK INSTRUCTIONS BELOW ****
+    //          development_docs/api/how_to_add_secrets.md
+    // ******************************************************************
   },
   clientPrefix: "",
   client: {},

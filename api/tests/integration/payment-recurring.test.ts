@@ -15,6 +15,7 @@ import {
   createTestPlanWithFeatures,
   createTestPrice,
   createTestCustomer,
+  createTestApiKeys,
   cleanupDataFull,
 } from "../test-helpers";
 import { testEnv } from "../test-env";
@@ -26,6 +27,7 @@ import {
   payments,
   paymentMethods,
   invoiceLineItems,
+  subscriptions,
   subscriptionDetails,
 } from "@lumen/common/schema";
 import { eq, and, ne } from "drizzle-orm";
@@ -434,6 +436,250 @@ describe("Recurring Payment Flow", () => {
       updatedSubDetail!.previousBillingDate!.toISOString().slice(0, 10)
     ).toBe(dueDate.toISOString().slice(0, 10));
   }, 30000);
+
+  it("should create immediate invoice for pre-pay and next renewal uses [next,next+1] without collision", async () => {
+    // 1) Create a pre-pay price (bill_immediately=true)
+    const planResult = await createTestPlanWithFeatures(merchantId, [], {
+      planName: "Prepay Plan",
+    });
+    const prepayPlanId = planResult.plan.id;
+    const prepayPrice = await createTestPrice({
+      planId: prepayPlanId,
+      merchantId,
+      currency: "USD",
+      pricingData: {
+        dsl_version: 1,
+        components: [
+          {
+            type: "fixed",
+            label: "Immediate Monthly Fee",
+            amount_cents: 2000,
+            recurrence_rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=1",
+            bill_immediately: true,
+          },
+        ],
+      },
+    });
+
+    // 2) Initialize payment via public/payment-init (like refunds tests)
+    const { publishableKey } = await createTestApiKeys({
+      merchantId,
+      environment: "test",
+    });
+
+    const ts = Date.now();
+    const email = `prepay-${ts}@example.com`;
+    const name = "Prepay Customer";
+    const userId = `user-prepay-${ts}`;
+
+    const initResp = await fetch(`${apiUrl}/public/payment-init`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        lumenPublishableKey: publishableKey.keyValue,
+        priceId: prepayPrice.id,
+        planId: prepayPlanId,
+        customerEmail: email,
+        customerName: name,
+        userId,
+      }),
+    });
+    if (!initResp.ok) {
+      throw new Error(`payment-init failed (${initResp.status})`);
+    }
+    const initData = await initResp.json();
+
+    await paymentProvider.completePaymentInit(initData);
+    await paymentProvider.waitForWebhooks(3000);
+
+    // 3) Fetch subscription and first invoice
+    const customer = await db.query.customers.findFirst({
+      where: and(
+        eq(customers.merchantId, merchantId),
+        eq(customers.email, email)
+      ),
+    });
+    if (!customer) throw new Error("Customer not found after payment-init");
+
+    const subscription = await db.query.subscriptions.findFirst({
+      where: and(
+        eq(subscriptions.customerId, customer.id),
+        eq(subscriptions.planId, prepayPlanId)
+      ),
+    });
+    if (!subscription) throw new Error("Subscription not created by webhook");
+
+    const firstInvoice = await db.query.invoices.findFirst({
+      where: and(
+        eq(invoices.customerId, customer.id),
+        eq(invoices.subscriptionId, subscription.id),
+        ne(invoices.status, "deleted")
+      ),
+    });
+    expect(firstInvoice).toBeDefined();
+    expect(firstInvoice!.status).toBe("paid");
+
+    const subDetailsAtCreation = await db.query.subscriptionDetails.findMany({
+      where: eq(subscriptionDetails.subscriptionId, subscription.id),
+    });
+    expect(subDetailsAtCreation.length).toBeGreaterThan(0);
+
+    // Assert the first invoice period == [start, next]
+    const firstStartISO = firstInvoice!.billingPeriodStart
+      ?.toISOString()
+      .slice(0, 10);
+    const subStartISO = subscription.startTimestamp!.toISOString().slice(0, 10);
+    expect(firstStartISO).toBe(subStartISO);
+
+    const expectedFirstEnd = new Date(
+      Math.max(
+        ...subDetailsAtCreation.map((sd) =>
+          new Date(sd.nextBillingDate).getTime()
+        )
+      )
+    );
+    const firstEndISO = firstInvoice!.billingPeriodEnd
+      ?.toISOString()
+      .slice(0, 10);
+    const expectedFirstEndISO = expectedFirstEnd.toISOString().slice(0, 10);
+    expect(firstEndISO).toBe(expectedFirstEndISO);
+
+    // 4) Prepare renewal: set nextBillingDate to "yesterday" for all details
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    for (const d of subDetailsAtCreation) {
+      await db
+        .update(subscriptionDetails)
+        .set({ nextBillingDate: yesterday })
+        .where(eq(subscriptionDetails.id, d.id));
+    }
+
+    // 5) Mock collectPaymentJob to call /trigger/billing/collect-payment
+    collectPaymentJobTriggerSpy.mockImplementation(
+      async (batchItems: { payload: CollectPaymentJobPayload }[]) => {
+        const itemPayload = batchItems[0].payload;
+        const { customerId: currentCustomerId, subDetails: currentSubDetails } =
+          itemPayload;
+
+        const idempotencyKey = `payment-customer-${currentCustomerId}-date-${currentSubDetails[0].nextBillingDate.split("T")[0]}`;
+
+        const response = await fetch(
+          `${apiUrl}/trigger/billing/collect-payment`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${triggerApiAccessKey}`,
+              "Idempotency-Key": idempotencyKey,
+            },
+            body: JSON.stringify({
+              customerId: currentCustomerId,
+              subDetails: currentSubDetails,
+            }),
+          }
+        );
+        const responseData = await response.json();
+        const result = z
+          .object({
+            success: z.boolean(),
+            paymentIntentId: z.string().optional(),
+            invoiceId: z.string().optional(),
+            paymentId: z.string().optional(),
+            status: z.string(),
+            message: z.string(),
+          })
+          .parse(responseData);
+
+        if (response.ok && result.success) {
+          return {
+            batchId: `mock-batch-prepay-${Date.now()}`,
+            runs: [
+              {
+                id: `mock-run-prepay-${Date.now()}`,
+                status: "SUCCESS" as const,
+                output: result,
+                payload: itemPayload,
+              } satisfies MockRunResult,
+            ],
+          };
+        }
+        return {
+          batchId: `mock-batch-prepay-${Date.now()}`,
+          runs: [
+            {
+              id: `mock-run-prepay-${Date.now()}`,
+              status: "FAILURE" as const,
+              error: `API Error: ${response.status}, Message: ${result.message}`,
+              payload: itemPayload,
+            } satisfies MockRunResult,
+          ],
+        };
+      }
+    );
+
+    // 6) Trigger billing cycle and wait
+    const cycleResult = await processBillingCycle(
+      apiUrl,
+      triggerApiAccessKey,
+      new Date()
+    );
+    expect(cycleResult.subscriptionsProcessed).toBeGreaterThan(0);
+    await sleep(3000);
+
+    // 7) Assertions after renewal
+    const allInvoices = await db.query.invoices.findMany({
+      where: and(
+        eq(invoices.customerId, customer.id),
+        eq(invoices.subscriptionId, subscription.id),
+        ne(invoices.status, "deleted")
+      ),
+      with: { lineItems: true },
+    });
+    expect(allInvoices.length).toBeGreaterThanOrEqual(2);
+
+    // Find the latest invoice that is not the initial one
+    const secondInvoice = allInvoices.find(
+      (inv) => inv.id !== firstInvoice!.id
+    )!;
+    expect(secondInvoice).toBeDefined();
+
+    // New invoice start should match the due date we set (yesterday)
+    const secondStartISO = secondInvoice.billingPeriodStart
+      ?.toISOString()
+      .slice(0, 10);
+    const yesterdayISO = yesterday.toISOString().slice(0, 10);
+    expect(secondStartISO).toBe(yesterdayISO);
+
+    // After cycle, nextBillingDate moved forward; end should equal updated nextBillingDate
+    const subDetailsAfter = await db.query.subscriptionDetails.findMany({
+      where: eq(subscriptionDetails.subscriptionId, subscription.id),
+    });
+    // With one immediate component, use its new nextBillingDate for comparison
+    const expectedSecondEndISO = subDetailsAfter[0].nextBillingDate
+      .toISOString()
+      .slice(0, 10);
+    const secondEndISO = secondInvoice.billingPeriodEnd
+      ?.toISOString()
+      .slice(0, 10);
+    expect(secondEndISO).toBe(expectedSecondEndISO);
+
+    // Ensure payment was created/succeeded
+    const paymentForSecond = await db.query.payments.findFirst({
+      where: eq(payments.invoiceId, secondInvoice.id),
+    });
+    expect(paymentForSecond).toBeDefined();
+    expect(["succeeded", "pending", "processing"]).toContain(
+      paymentForSecond!.status
+    );
+
+    // previousBillingDate should be set to yesterday now
+    const subDetailAfter = await db.query.subscriptionDetails.findFirst({
+      where: eq(subscriptionDetails.subscriptionId, subscription.id),
+    });
+    expect(
+      subDetailAfter!.previousBillingDate!.toISOString().slice(0, 10)
+    ).toBe(yesterdayISO);
+  }, 40000);
 
   it("should process a recurring payment for multiple price components (fixed, per-unit, usage)", async () => {
     // 1. Create Plan with a Price having 3 components (fixed, per_unit, usage)

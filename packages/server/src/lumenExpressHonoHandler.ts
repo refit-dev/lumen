@@ -5,7 +5,10 @@ type SupportedPath =
   | "customers/portal/create-setup-intent"
   | "customers/portal/set-subscription-payment-method"
   | "customers/portal/payment-methods/{id}"
-  | "invoices/{id}/pdf";
+  | "invoices/{id}/pdf"
+  // Credit top-up endpoints
+  | "credits/available-topups"
+  | "credits/topup";
 
 const DEFAULT_SUPPORTED_PATHS: SupportedPath[] = [
   "customers/subscription-status",
@@ -15,6 +18,9 @@ const DEFAULT_SUPPORTED_PATHS: SupportedPath[] = [
   "customers/portal/set-subscription-payment-method",
   "customers/portal/payment-methods/{id}",
   "invoices/{id}/pdf",
+  // Credit top-up endpoints
+  "credits/available-topups",
+  "credits/topup",
 ];
 
 interface CommonOptions {

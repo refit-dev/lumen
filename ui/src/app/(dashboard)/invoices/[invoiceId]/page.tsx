@@ -74,6 +74,7 @@ import {
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import Link from "next/link";
 import { toast } from "sonner";
+import { getPaymentLinkFromNotes } from "@lumen/common/pdf";
 
 const removeFalsyValuesFromObject = (obj: Record<string, unknown>) => {
   return Object.fromEntries(Object.entries(obj).filter(([, value]) => !!value));
@@ -238,6 +239,7 @@ type Invoice = {
     stableSubscriptionId: string;
     plan?: {
       planName: string;
+      stablePlanId: string;
     } | null;
   } | null;
   payment?: {
@@ -315,20 +317,16 @@ const calculateInvoiceTotal = (lineItems: InvoiceItem[]) => {
 
 // Component to render notes with special handling for checkout links
 function NotesRenderer({ notes }: { notes: string }) {
-  // Check if notes contain a checkout link
-  const checkoutLinkMatch = notes.match(
-    /https:\/\/checkout\.stripe\.com\/[^\s]+/
-  );
-
-  if (checkoutLinkMatch) {
-    const checkoutLink = checkoutLinkMatch[0];
-    const beforeLink = notes.substring(0, checkoutLinkMatch.index);
+  // Check if notes contain a payment link (Stripe checkout or dynamic payment link)
+  const paymentLink = getPaymentLinkFromNotes(notes);
+  if (paymentLink) {
+    const beforeLink = notes.substring(0, notes.indexOf(paymentLink));
     const afterLink = notes.substring(
-      checkoutLinkMatch.index! + checkoutLink.length
+      notes.indexOf(paymentLink) + paymentLink.length
     );
 
     // Check if this is a payment completion note vs payment required note
-    const isPaid = notes.includes("Paid online via checkout session");
+    const isPaid = notes.includes("Paid online");
     const isPaymentRequired = notes.includes("Payment required:");
 
     if (isPaid) {
@@ -342,7 +340,7 @@ function NotesRenderer({ notes }: { notes: string }) {
             </span>
           </div>
           <p className="text-muted-foreground text-xs">
-            This invoice was paid online via Stripe checkout.
+            This invoice was paid online.
           </p>
         </div>
       );
@@ -363,11 +361,11 @@ function NotesRenderer({ notes }: { notes: string }) {
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground font-mono">
-                Stripe Checkout Link
+                Payment Link
               </span>
               <Button size="sm" variant="outline" asChild className="text-xs">
                 <a
-                  href={checkoutLink}
+                  href={paymentLink}
                   target="_blank"
                   rel="noopener noreferrer"
                 >
@@ -385,7 +383,7 @@ function NotesRenderer({ notes }: { notes: string }) {
         <p className="text-sm font-medium">
           {beforeLink}
           <a
-            href={checkoutLink}
+            href={paymentLink}
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-600 hover:text-blue-800 underline font-medium inline-flex items-center gap-1"
@@ -1155,6 +1153,73 @@ export default function InvoiceDetailsPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left Column - Invoice & Customer Info */}
         <div className="space-y-6">
+          {/* Quick Navigation */}
+          {(invoice.customer || invoice.subscription) && (
+            <Card className="bg-gradient-to-br from-slate-50 to-slate-100 border-slate-200">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm font-medium text-slate-600">
+                  Quick Navigation
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-0">
+                <div className="flex flex-wrap gap-2">
+                  {invoice.customer && (
+                    <Link href={`/customers/${invoice.customer.id}`}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-white hover:bg-blue-50 hover:border-blue-300 hover:text-blue-700"
+                      >
+                        <User className="h-3.5 w-3.5 mr-1.5" />
+                        {invoice.customer.name || "Customer"}
+                      </Button>
+                    </Link>
+                  )}
+                  {invoice.subscription && (
+                    <Link
+                      href={`/subscriptions/${invoice.subscription.stableSubscriptionId}`}
+                    >
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-white hover:bg-purple-50 hover:border-purple-300 hover:text-purple-700"
+                      >
+                        <CreditCard className="h-3.5 w-3.5 mr-1.5" />
+                        Subscription
+                      </Button>
+                    </Link>
+                  )}
+                  {invoice.subscription?.plan && (
+                    <Link
+                      href={`/plans/${invoice.subscription.plan.stablePlanId}`}
+                    >
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-white hover:bg-green-50 hover:border-green-300 hover:text-green-700"
+                      >
+                        <FileText className="h-3.5 w-3.5 mr-1.5" />
+                        {invoice.subscription.plan.planName}
+                      </Button>
+                    </Link>
+                  )}
+                  {invoice.payment && (
+                    <Link href={`/payments/${invoice.payment.id}`}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-white hover:bg-emerald-50 hover:border-emerald-300 hover:text-emerald-700"
+                      >
+                        <DollarSign className="h-3.5 w-3.5 mr-1.5" />
+                        Payment
+                      </Button>
+                    </Link>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Invoice Details */}
           <Card>
             <CardHeader>
@@ -1272,24 +1337,37 @@ export default function InvoiceDetailsPage() {
                   <Separator />
                   <div className="space-y-5">
                     {invoice.subscription && (
-                      <div>
-                        <Label className="text-sm font-semibold text-muted-foreground">
-                          Subscription
-                        </Label>
-                        <div className="mt-2 text-sm">
-                          <Link
-                            href={`/subscriptions/${invoice.subscription.stableSubscriptionId}`}
-                            target="_blank"
-                            className="text-primary hover:underline font-semibold inline-flex items-center gap-1"
-                          >
-                            {invoice.subscription.plan?.planName ? (
-                              <>Plan: {invoice.subscription.plan.planName}</>
-                            ) : (
-                              "Subscription"
-                            )}
-                            <ExternalLink className="h-3 w-3" />
-                          </Link>
+                      <div className="space-y-3">
+                        <div>
+                          <Label className="text-sm font-semibold text-muted-foreground">
+                            Subscription
+                          </Label>
+                          <div className="mt-2 text-sm">
+                            <Link
+                              href={`/subscriptions/${invoice.subscription.stableSubscriptionId}`}
+                              className="text-blue-600 hover:text-blue-800 hover:underline font-semibold inline-flex items-center gap-1"
+                            >
+                              View Subscription
+                              <ExternalLink className="h-3 w-3" />
+                            </Link>
+                          </div>
                         </div>
+                        {invoice.subscription.plan && (
+                          <div>
+                            <Label className="text-sm font-semibold text-muted-foreground">
+                              Plan
+                            </Label>
+                            <div className="mt-2 text-sm">
+                              <Link
+                                href={`/plans/${invoice.subscription.plan.stablePlanId}`}
+                                className="text-blue-600 hover:text-blue-800 hover:underline font-semibold inline-flex items-center gap-1"
+                              >
+                                {invoice.subscription.plan.planName}
+                                <ExternalLink className="h-3 w-3" />
+                              </Link>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -1396,17 +1474,32 @@ export default function InvoiceDetailsPage() {
           {invoice.customer && (
             <Card>
               <CardHeader>
-                <CardTitle className="flex items-center">
-                  <User className="mr-2 h-5 w-5 text-muted-foreground" />
-                  Customer Information
-                </CardTitle>
+                <div className="flex items-center justify-between">
+                  <CardTitle className="flex items-center">
+                    <User className="mr-2 h-5 w-5 text-muted-foreground" />
+                    Customer Information
+                  </CardTitle>
+                  <Link href={`/customers/${invoice.customer.id}`}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex items-center gap-1"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      View Customer
+                    </Button>
+                  </Link>
+                </div>
               </CardHeader>
               <CardContent>
                 {/* Header with name and email */}
                 <div className="mb-6">
-                  <p className="text-lg font-semibold">
+                  <Link
+                    href={`/customers/${invoice.customer.id}`}
+                    className="text-lg font-semibold text-blue-600 hover:text-blue-800 hover:underline"
+                  >
                     {invoice.customer.name || "Unknown Customer"}
-                  </p>
+                  </Link>
                   <div className="flex items-center text-sm text-muted-foreground mt-1">
                     <Mail className="mr-1 h-4 w-4" />
                     {invoice.customer.email || "No email"}

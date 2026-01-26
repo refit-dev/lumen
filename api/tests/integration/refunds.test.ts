@@ -224,6 +224,8 @@ describe("Refunds API integration", () => {
           orderBy: desc(invoices.createdAt),
         }),
       validate: (r) => !!r,
+      maxAttempts: 6,
+      sleepMs: 2000,
     });
 
     // Assert tax on original invoice (provider-aware)
@@ -246,6 +248,8 @@ describe("Refunds API integration", () => {
           where: eq(payments.invoiceId, firstInvoice!.id),
         }),
       validate: (r) => !!r && !!r.externalPaymentId,
+      maxAttempts: 6,
+      sleepMs: 2000,
     });
 
     // Call refunds API for partial amount

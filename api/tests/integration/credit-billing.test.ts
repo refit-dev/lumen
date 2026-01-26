@@ -2271,21 +2271,26 @@ describe("Credit Billing Integration (E2E Payment Flow)", () => {
     });
     expect(event3Response.status).toBe(202);
 
-    // Wait for events to be processed
+    // Wait for events to be processed and verify metric shows 125 total usage (50 + 40 + 35)
+    // Use retryWithSleep to handle QuestDB eventual consistency
     console.log("Waiting for API usage events to be processed...");
-    await sleep(3000);
-
-    // Verify metric shows 125 total usage (50 + 40 + 35)
-    const metricValueResponse = await authedApiClient.metrics[":id"].value.$get(
-      {
-        param: { id: apiCallMetricData.id },
-        query: { customerId: customerId },
-      }
+    const metricValue = await retryWithSleep(
+      async () => {
+        const response = await authedApiClient.metrics[":id"].value.$get({
+          param: { id: apiCallMetricData.id },
+          query: { customerId: customerId },
+        });
+        if (response.status !== 200) return null;
+        const data = await response.json();
+        if ("error" in data) return null;
+        return data;
+      },
+      (result) => result !== null && result.value === 125,
+      10, // more attempts for CI
+      2000 // 2 second intervals
     );
-    expect(metricValueResponse.status).toBe(200);
-    const metricValue = await metricValueResponse.json();
-    if ("error" in metricValue) throw new Error(metricValue.error);
-    expect(metricValue.value).toBe(125);
+    expect(metricValue).not.toBeNull();
+    expect(metricValue!.value).toBe(125);
 
     // 8. Mock payment for billing cycle
     collectPaymentJobTriggerSpy.mockImplementation(

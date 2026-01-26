@@ -125,6 +125,13 @@ export interface EditPlanFeature {
   hasCreditAllowance?: boolean;
   creditAllowanceAmount?: number;
   creditAllowanceRenewal?: "monthly" | "yearly" | "none";
+  // Top-up configuration
+  enableTopups?: boolean;
+  topupPricePerCreditCents?: number;
+  topupMinQuantity?: number;
+  topupMaxQuantity?: number;
+  topupExpiryBehavior?: "billing_cycle" | "custom_days" | "never";
+  topupCustomExpiryDays?: number;
   existingFeatureId?: string;
 }
 
@@ -1243,6 +1250,9 @@ export async function editPlan(
           stablePlanId: currentPlan.stablePlanId,
           versionNumber: currentPlan.versionNumber + 1,
           commitMessage: `Plan edited: ${input.planName || currentPlan.planName}, version ${currentPlan.versionNumber + 1}`,
+          // Preserve PSP plan ID across versions - this links the plan to the
+          // external payment provider's product (e.g., Dodo Payments product ID)
+          pspPlanId: currentPlan.pspPlanId,
         })
         .returning();
       console.log("[editPlan] New plan version created", {
@@ -1508,6 +1518,13 @@ export async function editPlan(
                 inputFeature.usagePricePerUnit > 0,
               priority: 100,
               ...renewalConfig,
+              // Top-up configuration
+              enableTopups: inputFeature.enableTopups ?? false,
+              topupPricePerCreditCents: inputFeature.topupPricePerCreditCents,
+              topupMinQuantity: inputFeature.topupMinQuantity,
+              topupMaxQuantity: inputFeature.topupMaxQuantity,
+              topupExpiryBehavior: inputFeature.topupExpiryBehavior,
+              topupCustomExpiryDays: inputFeature.topupCustomExpiryDays,
             };
 
             if (
@@ -2191,7 +2208,36 @@ export async function editPlanInPlace(
                   ? "monthly"
                   : "none";
 
-            return sameAmt && renewalFromCd === inferredRenewal;
+            const sameRenewal = renewalFromCd === inferredRenewal;
+
+            // Top-up configuration checks
+            const sameTopupEnabled =
+              (cd.enableTopups ?? false) === (inputFeat.enableTopups ?? false);
+            const sameTopupPrice =
+              (cd.topupPricePerCreditCents ?? null) ===
+              (inputFeat.topupPricePerCreditCents ?? null);
+            const sameTopupMin =
+              (cd.topupMinQuantity ?? 1) === (inputFeat.topupMinQuantity ?? 1);
+            const sameTopupMax =
+              (cd.topupMaxQuantity ?? null) ===
+              (inputFeat.topupMaxQuantity ?? null);
+            const sameTopupExpiryBehavior =
+              (cd.topupExpiryBehavior ?? "billing_cycle") ===
+              (inputFeat.topupExpiryBehavior ?? "billing_cycle");
+            const sameTopupCustomExpiry =
+              (cd.topupCustomExpiryDays ?? null) ===
+              (inputFeat.topupCustomExpiryDays ?? null);
+
+            return (
+              sameAmt &&
+              sameRenewal &&
+              sameTopupEnabled &&
+              sameTopupPrice &&
+              sameTopupMin &&
+              sameTopupMax &&
+              sameTopupExpiryBehavior &&
+              sameTopupCustomExpiry
+            );
           });
         };
 
@@ -2500,6 +2546,13 @@ export async function editPlanInPlace(
                 inputFeature.usagePricePerUnit > 0,
               priority: 100,
               ...renewalConfig,
+              // Top-up configuration
+              enableTopups: inputFeature.enableTopups ?? false,
+              topupPricePerCreditCents: inputFeature.topupPricePerCreditCents,
+              topupMinQuantity: inputFeature.topupMinQuantity,
+              topupMaxQuantity: inputFeature.topupMaxQuantity,
+              topupExpiryBehavior: inputFeature.topupExpiryBehavior,
+              topupCustomExpiryDays: inputFeature.topupCustomExpiryDays,
             };
             if (
               inputFeature.isUsageBased &&
@@ -2537,6 +2590,15 @@ export async function editPlanInPlace(
                         defaultAmount: inputFeature.creditAllowanceAmount,
                         refillAmount: renewalConfig.refillAmount,
                         refillRrule: renewalConfig.refillRrule,
+                        // Top-up configuration updates
+                        enableTopups: inputFeature.enableTopups ?? false,
+                        topupPricePerCreditCents:
+                          inputFeature.topupPricePerCreditCents,
+                        topupMinQuantity: inputFeature.topupMinQuantity,
+                        topupMaxQuantity: inputFeature.topupMaxQuantity,
+                        topupExpiryBehavior: inputFeature.topupExpiryBehavior,
+                        topupCustomExpiryDays:
+                          inputFeature.topupCustomExpiryDays,
                       })
                       .where(eq(creditDefinitions.id, cd.id));
                   }

@@ -23,6 +23,8 @@ import { signIn, signUp, authClient } from "@/lib/auth-client";
 import { cn } from "@/lib/utils";
 import { useSession } from "@/lib/auth-client";
 import { useRouter } from "next/navigation";
+import { Turnstile } from "@marsidev/react-turnstile";
+import { TURNSTILE_SITE_KEY } from "@/lib/utils";
 
 export default function Demo() {
   const [email, setEmail] = useState("");
@@ -34,6 +36,7 @@ export default function Demo() {
   const [success, setSuccess] = useState<string | null>(null);
   const [isResetMode, setIsResetMode] = useState(false);
   const [resetEmail, setResetEmail] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState("");
   const { data: session, isPending } = useSession();
   const router = useRouter();
 
@@ -82,6 +85,11 @@ export default function Demo() {
       const response = await authClient.forgetPassword({
         email: resetEmail,
         redirectTo: window.location.origin + "/reset-password",
+        fetchOptions: {
+          headers: {
+            "x-captcha-response": turnstileToken,
+          },
+        },
       });
 
       if (response.error) {
@@ -114,6 +122,11 @@ export default function Demo() {
         password: randomPassword,
         name: randomEmail,
         callbackURL: window.location.origin + REDIRECT_AFTER_LOGIN,
+        fetchOptions: {
+          headers: {
+            "x-captcha-response": turnstileToken,
+          },
+        },
       });
 
       if (signUpResponse.error) {
@@ -125,6 +138,11 @@ export default function Demo() {
             email: randomEmail,
             password: randomPassword,
             callbackURL: window.location.origin + REDIRECT_AFTER_LOGIN,
+            fetchOptions: {
+              headers: {
+                "x-captcha-response": turnstileToken,
+              },
+            },
           });
           setSuccess("Mock user created and signed in!");
         } catch (signInError) {
@@ -188,7 +206,17 @@ export default function Demo() {
                   </div>
                 )}
 
-                <Button type="submit" className="w-full" disabled={loading}>
+                <Turnstile
+                  siteKey={TURNSTILE_SITE_KEY}
+                  onSuccess={setTurnstileToken}
+                  onExpire={() => setTurnstileToken("")}
+                />
+
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={loading || !turnstileToken}
+                >
                   {loading ? (
                     <Loader2 size={16} className="animate-spin" />
                   ) : (
@@ -225,6 +253,11 @@ export default function Demo() {
                     email,
                     password,
                     callbackURL: window.location.origin + REDIRECT_AFTER_LOGIN,
+                    fetchOptions: {
+                      headers: {
+                        "x-captcha-response": turnstileToken,
+                      },
+                    },
                   });
                   console.log("signInResponse: ", signInResponse);
 
@@ -250,6 +283,11 @@ export default function Demo() {
                           name: email,
                           callbackURL:
                             window.location.origin + REDIRECT_AFTER_LOGIN,
+                          fetchOptions: {
+                            headers: {
+                              "x-captcha-response": turnstileToken,
+                            },
+                          },
                         });
 
                         if (signUpResponse.error) {
@@ -364,7 +402,17 @@ export default function Demo() {
                   </Button>
                 )}
 
-                <Button type="submit" className="w-full" disabled={loading}>
+                <Turnstile
+                  siteKey={TURNSTILE_SITE_KEY}
+                  onSuccess={setTurnstileToken}
+                  onExpire={() => setTurnstileToken("")}
+                />
+
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={loading || !turnstileToken}
+                >
                   {loading ? (
                     <Loader2 size={16} className="animate-spin" />
                   ) : (
@@ -387,9 +435,14 @@ export default function Demo() {
                         provider: "google",
                         callbackURL:
                           window.location.origin + REDIRECT_AFTER_LOGIN,
+                        fetchOptions: {
+                          headers: {
+                            "x-captcha-response": turnstileToken,
+                          },
+                        },
                       });
                     }}
-                    disabled={googleLoading}
+                    disabled={googleLoading || !turnstileToken}
                   >
                     {googleLoading ? (
                       <Loader2 size={16} className="animate-spin" />

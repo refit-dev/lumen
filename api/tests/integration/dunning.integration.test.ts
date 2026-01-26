@@ -49,6 +49,7 @@ import {
   createPaymentProvider,
   PaymentProviderAdapter,
   expectDateWithinMargin,
+  createTestCustomer,
 } from "../test-helpers";
 import { processBillingCycle } from "../../trigger/helpers/billing";
 import { z } from "zod";
@@ -2223,4 +2224,175 @@ describe("Dunning flows - recurring payment failures and recovery", () => {
     expect(newestGrant).toBeDefined();
     expect(newestGrant!.status).toBe("ACTIVE");
   }, 70000);
+
+  it("manual billing flow: should mark subscription as past_due with grace period when payment link is created (no payment method)", async () => {
+    // 1. Create a paid plan with bill_immediately=true
+    const paidPlanResult = await createTestPlanWithFeatures(merchantId, [], {
+      planName: "Manual Billing Test Plan",
+    });
+    const paidPlanId = paidPlanResult.plan.id;
+    const paidPrice = await createTestPrice({
+      planId: paidPlanId,
+      merchantId,
+      currency: "USD",
+      pricingData: {
+        dsl_version: 1,
+        components: [
+          {
+            type: "fixed",
+            label: "Manual Billing Monthly",
+            amount_cents: 5000, // $50.00
+            recurrence_rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=1",
+            bill_immediately: true, // Key: This triggers immediate billing
+          },
+        ],
+      },
+    });
+    const paidPriceId = paidPrice.id;
+
+    // 2. Create Customer WITHOUT Payment Method (manual flow - admin creates subscription)
+    const manualCustomerEmail = `manual-billing-${Date.now()}@example.com`;
+    const manualLocalCustomer = await createTestCustomer({
+      merchantId,
+      email: manualCustomerEmail,
+      name: "Manual Billing Customer",
+    });
+    const manualCustomerId = manualLocalCustomer.id;
+
+    // 3. Create dunning config for this merchant (7 day grace period)
+    await db.insert(dunningConfigs).values({
+      merchantId,
+      planId: null, // Merchant-level default
+      gracePeriodDays: 7,
+      retrySchedule: [1, 3, 7],
+      endOfDunningAction: "pause_subscription",
+    });
+
+    // 4. Create Subscription with bill_immediately=true
+    // This should trigger immediate billing via triggerImmediateBillingIfNeeded
+    const createSubResponse = await apiClient.subscriptions.$post({
+      json: {
+        customerId: manualCustomerId,
+        planId: paidPlanId,
+        effectivePriceId: paidPriceId,
+        startTimestamp: new Date().toISOString(),
+        triggerImmediateBilling: true, // Key: Must be true to trigger immediate billing
+      },
+    });
+
+    const createSubBody = await createSubResponse.json();
+    if ("error" in createSubBody) {
+      throw new Error(`Subscription creation failed: ${createSubBody.error}`);
+    }
+    if (!createSubBody.subscription) {
+      throw new Error("No subscription returned");
+    }
+
+    const manualSubscriptionId = createSubBody.subscription.id;
+
+    // Give it a moment to process the immediate billing
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    // 5. Verify subscription was marked as past_due with grace period
+    const subscription = await db.query.subscriptions.findFirst({
+      where: eq(subscriptions.id, manualSubscriptionId),
+    });
+
+    expect(subscription).toBeDefined();
+    expect(subscription!.status).toBe("past_due");
+    expect(subscription!.gracePeriodEndsAt).toBeDefined();
+
+    // Grace period should be ~7 days from now
+    const expectedGraceEnd = new Date();
+    expectedGraceEnd.setDate(expectedGraceEnd.getDate() + 7);
+    expectDateWithinMargin(subscription!.gracePeriodEndsAt!, expectedGraceEnd);
+
+    console.log(
+      `Subscription ${manualSubscriptionId} marked as past_due with grace period until ${subscription!.gracePeriodEndsAt!.toISOString()}`
+    );
+
+    // 6. Verify invoice was created with payment link
+    const invoice = await db.query.invoices.findFirst({
+      where: and(
+        eq(invoices.subscriptionId, manualSubscriptionId),
+        eq(invoices.customerId, manualCustomerId)
+      ),
+    });
+
+    expect(invoice).toBeDefined();
+    expect(invoice!.status).toBe("issued");
+    expect(invoice!.totalAmountCents).toBe(5000); // $50.00
+    expect(invoice!.notes).toContain("Payment required");
+
+    // 7. Verify payment record was created with dynamic payment link in metadata
+    const payment = await db.query.payments.findFirst({
+      where: eq(payments.invoiceId, invoice!.id),
+    });
+
+    expect(payment).toBeDefined();
+    expect(payment!.status).toBe("pending");
+    expect(payment!.metadata).toBeDefined();
+    expect(payment!.metadata).toHaveProperty("dynamicPaymentLink");
+
+    console.log(
+      `Payment link created: ${(payment!.metadata as any)?.dynamicPaymentLink}`
+    );
+
+    // 8. Verify the grace-ending-soon notification would find this subscription
+    // at T+6 days (24h before grace expires)
+    const sixDaysFromNow = new Date();
+    sixDaysFromNow.setDate(sixDaysFromNow.getDate() + 6);
+
+    const notifySoonResp = await fetch(
+      `${apiUrl}/trigger/billing/dunning/notify-grace-ending-soon`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${triggerApiAccessKey}`,
+        },
+        body: JSON.stringify({ timestamp: sixDaysFromNow.toISOString() }),
+      }
+    );
+
+    expect(notifySoonResp.ok).toBe(true);
+    const notifySoonResult = await notifySoonResp.json();
+    console.log("Grace ending soon notification result:", notifySoonResult);
+    expect(notifySoonResult.notified).toBe(1); // Should notify for our subscription
+
+    // 9. Verify enforcement would trigger after grace expires
+    const eightDaysFromNow = new Date();
+    eightDaysFromNow.setDate(eightDaysFromNow.getDate() + 8);
+
+    const enforceResp = await fetch(
+      `${apiUrl}/trigger/billing/dunning/enforce-grace-periods`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${triggerApiAccessKey}`,
+        },
+        body: JSON.stringify({ timestamp: eightDaysFromNow.toISOString() }),
+      }
+    );
+
+    expect(enforceResp.ok).toBe(true);
+    const enforceResult = await enforceResp.json();
+    console.log("Grace enforcement result:", enforceResult);
+    expect(enforceResult.processed).toBe(1); // Should process our subscription
+
+    // 10. Verify subscription was paused after enforcement
+    const subscriptionAfterEnforcement = await db.query.subscriptions.findFirst(
+      {
+        where: eq(subscriptions.id, manualSubscriptionId),
+      }
+    );
+
+    expect(subscriptionAfterEnforcement!.status).toBe("paused");
+    expect(subscriptionAfterEnforcement!.gracePeriodEndsAt).toBeNull(); // Grace period cleared after enforcement
+
+    console.log(
+      `Subscription ${manualSubscriptionId} successfully paused after grace period expired`
+    );
+  }, 30000);
 });

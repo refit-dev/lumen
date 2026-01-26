@@ -3,6 +3,9 @@ import { twMerge } from "tailwind-merge";
 import Dinero, { Currency } from "dinero.js";
 import { apiClient } from "./hono-client";
 
+export const TURNSTILE_SITE_KEY =
+  process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "1x00000000000000000000AA";
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }

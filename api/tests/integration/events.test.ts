@@ -920,12 +920,13 @@ describe("Events and Metrics Integration (Post-QuestDB)", () => {
 
   describe("GET /events (Query History from QuestDB)", () => {
     const eventBaseName = `history-test-${createId()}`;
-    const customer1Id = testCustomerId; // Reuse existing test customer
+    let customer1Id: string; // Assign after outer beforeAll has set testCustomerId
     let customer2Id: string;
     let eventsToIngest: EventInput[] = []; // Define eventsToIngest here for beforeEach scope
 
     // Keep customer creation in beforeAll
     beforeAll(async () => {
+      customer1Id = testCustomerId;
       const cust2 = await createTestCustomer({
         merchantId: testMerchantId,
         name: "History Test Customer 2",

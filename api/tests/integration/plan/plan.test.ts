@@ -983,7 +983,7 @@ describe("Plans API", () => {
 
     expect(editResponse.status).toBe(200);
     expect(editBody.success).toBe(true);
-    expect(editBody.changeAnalysis.hasFeatureChanges).toBe(true);
+    expect(editBody.changeAnalysis.hasFeatureChanges).toBe(true); // Features ARE changing (removing some, adding new one)
     expect(editBody.changeAnalysis.hasPriceChanges).toBe(false);
 
     // Verify features changed correctly
@@ -1234,6 +1234,308 @@ describe("Plans API", () => {
     expect(creditFeature).toBeDefined();
     expect(creditFeature?.displayName).toBe("Storage with Credits");
     expect(creditFeature?.featureType).toBe("boolean");
+  });
+
+  it("should retrofit credit topups onto an existing plan without creating a new version", async () => {
+    const client = createTestApiClient(sessionToken);
+    const uniqueSuffix = Date.now();
+    const creditFeatureSlug = `retrofit-api-credits-${uniqueSuffix}`;
+    const stablePlanId = `retrofit-plan-${uniqueSuffix}`;
+    const eventName = `retrofit_api_call_${uniqueSuffix}`;
+
+    const createResponse = await client.plans.$post({
+      json: {
+        planName: "Retrofit Credits Plan",
+        planDescription: "Starts without prepaid credits",
+        stablePlanId,
+        newFeatures: [
+          {
+            featureName: "Retrofit API Credits",
+            slug: creditFeatureSlug,
+            eventName,
+            isUsageBased: true,
+          },
+        ],
+        currency: "USD",
+        monthlyPrice: 2500,
+        hasYearlyPrice: false,
+        showInPricingTable: true,
+        isSeatBased: false,
+        billImmediately: true,
+      },
+    });
+    const createBody = await createResponse.json();
+    if ("error" in createBody) {
+      throw new Error(`Failed to create retrofit plan: ${createBody.error}`);
+    }
+    expect(createResponse.status).toBe(200);
+    const createdPlan = createBody.plans[0] as APIPlanWithFeatures;
+    const newPlanId = createdPlan.id;
+    expect(createdPlan.versionNumber).toBe(1);
+
+    const { creditDefinitions } = await import("@lumen/common/schema");
+    const { db } = await import("../../../src/db/client");
+    const { and, eq, isNull } = await import("drizzle-orm");
+
+    const initialDefinitions = await db.query.creditDefinitions.findMany({
+      where: and(
+        eq(creditDefinitions.planId, newPlanId),
+        isNull(creditDefinitions.deletedAt)
+      ),
+    });
+    expect(initialDefinitions).toHaveLength(0);
+
+    const getPlanResponse = await client.plans[":id"].$get({
+      param: { id: newPlanId },
+      query: { includeFeatures: "true" },
+    });
+    const getPlanBody = await getPlanResponse.json();
+    if ("error" in getPlanBody) {
+      throw new Error(`Failed to fetch retrofit plan: ${getPlanBody.error}`);
+    }
+    const planWithFeatures = getPlanBody.plans[0] as APIPlanWithFeatures;
+    const retrofitFeature = planWithFeatures.features.find(
+      (f) => f.slug === creditFeatureSlug
+    );
+    if (!retrofitFeature) {
+      throw new Error("Retrofit feature not found after creation");
+    }
+    const retrofitFeatureName =
+      retrofitFeature.displayName || "Retrofit API Credits";
+
+    const editPayload: EditPlanInput = {
+      planDescription: "Now supports prepaid credits with on-demand topups",
+      features: [
+        {
+          existingFeatureId: retrofitFeature.id,
+          featureName: retrofitFeatureName,
+          slug: retrofitFeature.slug,
+          eventName,
+          isUsageBased: true,
+          hasCreditAllowance: true,
+          creditAllowanceAmount: 5000,
+          creditAllowanceRenewal: "monthly",
+          enableTopups: true,
+          topupPricePerCreditCents: 75,
+          topupMinQuantity: 25,
+          topupMaxQuantity: 2500,
+          topupExpiryBehavior: "custom_days",
+          topupCustomExpiryDays: 60,
+        },
+      ],
+    };
+
+    const editResponse = await client.plans[":id"]["edit"].$post({
+      param: { id: newPlanId },
+      json: editPayload,
+    });
+    const editBody = await editResponse.json();
+    if ("error" in editBody) {
+      throw new Error(`Failed to retrofit plan: ${editBody.error}`);
+    }
+
+    expect(editResponse.status).toBe(200);
+    expect(editBody.success).toBe(true);
+    expect(editBody.plan.id).toBe(newPlanId);
+    expect(editBody.plan.versionNumber).toBe(1);
+    expect(editBody.changeAnalysis.isNewVersion).toBe(false);
+    expect(editBody.changeAnalysis.hasFeatureChanges).toBe(false);
+    expect(editBody.resourceActions.featuresCreated.length).toBe(0);
+    expect(editBody.resourceActions.creditsCreated.length).toBeGreaterThan(0);
+
+    const postEditResponse = await client.plans[":id"].$get({
+      param: { id: newPlanId },
+      query: { includeFeatures: "true" },
+    });
+    const postEditBody = await postEditResponse.json();
+    if ("error" in postEditBody) {
+      throw new Error(`Failed to fetch updated plan: ${postEditBody.error}`);
+    }
+    const updatedPlan = postEditBody.plans[0] as APIPlanWithFeatures;
+    expect(updatedPlan.versionNumber).toBe(1);
+    expect(updatedPlan.planDescription).toBe(
+      "Now supports prepaid credits with on-demand topups"
+    );
+    expect(updatedPlan.features).toHaveLength(1);
+    expect(updatedPlan.features[0].id).toBe(retrofitFeature.id);
+
+    const updatedDefinitions = await db.query.creditDefinitions.findMany({
+      where: and(
+        eq(creditDefinitions.planId, newPlanId),
+        eq(creditDefinitions.featureSlug, creditFeatureSlug),
+        isNull(creditDefinitions.deletedAt)
+      ),
+    });
+    expect(updatedDefinitions).toHaveLength(1);
+    const creditDefinition = updatedDefinitions[0];
+    expect(creditDefinition.defaultAmount).toBe(5000);
+    expect(creditDefinition.enableTopups).toBe(true);
+    expect(creditDefinition.topupPricePerCreditCents).toBe(75);
+    expect(creditDefinition.topupMinQuantity).toBe(25);
+    expect(creditDefinition.topupMaxQuantity).toBe(2500);
+    expect(creditDefinition.topupExpiryBehavior).toBe("custom_days");
+    expect(creditDefinition.topupCustomExpiryDays).toBe(60);
+    expect(creditDefinition.refillRrule).toBe("RRULE:FREQ=MONTHLY;INTERVAL=1");
+    expect(creditDefinition.renewOnBilling).toBe(false);
+  });
+
+  it("should edit plans that already have credit topups enabled", async () => {
+    const client = createTestApiClient(sessionToken);
+    const uniqueSuffix = Date.now();
+    const creditFeatureSlug = `existing-credit-topup-${uniqueSuffix}`;
+    const eventName = `existing_credit_event_${uniqueSuffix}`;
+    const stablePlanId = `existing-credit-plan-${uniqueSuffix}`;
+
+    const createResponse = await client.plans.$post({
+      json: {
+        planName: "Existing Credits Plan",
+        planDescription: "Original credit/topup configuration",
+        stablePlanId,
+        newFeatures: [
+          {
+            featureName: "Existing Credit Feature",
+            slug: creditFeatureSlug,
+            eventName,
+            isUsageBased: true,
+            hasCreditAllowance: true,
+            creditAllowanceAmount: 1500,
+            creditAllowanceRenewal: "monthly",
+            enableTopups: true,
+            topupPricePerCreditCents: 60,
+            topupMinQuantity: 20,
+            topupMaxQuantity: 2000,
+            topupExpiryBehavior: "billing_cycle",
+          },
+        ],
+        currency: "USD",
+        monthlyPrice: 3500,
+        hasYearlyPrice: false,
+        showInPricingTable: true,
+        isSeatBased: false,
+        billImmediately: true,
+      },
+    });
+    const createBody = await createResponse.json();
+    if ("error" in createBody) {
+      throw new Error(
+        `Failed to create existing credit plan: ${createBody.error}`
+      );
+    }
+    expect(createResponse.status).toBe(200);
+    const createdPlan = createBody.plans[0] as APIPlanWithFeatures;
+    const planId = createdPlan.id;
+    expect(createdPlan.versionNumber).toBe(1);
+
+    const { creditDefinitions } = await import("@lumen/common/schema");
+    const { db } = await import("../../../src/db/client");
+    const { and, eq, isNull } = await import("drizzle-orm");
+
+    const initialCreditDefinition = await db.query.creditDefinitions.findFirst({
+      where: and(
+        eq(creditDefinitions.planId, planId),
+        eq(creditDefinitions.featureSlug, creditFeatureSlug),
+        isNull(creditDefinitions.deletedAt)
+      ),
+    });
+    if (!initialCreditDefinition) {
+      throw new Error("Expected initial credit definition to exist");
+    }
+
+    const planResponse = await client.plans[":id"].$get({
+      param: { id: planId },
+      query: { includeFeatures: "true" },
+    });
+    const planBody = await planResponse.json();
+    if ("error" in planBody) {
+      throw new Error(`Failed to fetch plan for editing: ${planBody.error}`);
+    }
+    const planWithFeatures = planBody.plans[0] as APIPlanWithFeatures;
+    const existingFeature = planWithFeatures.features.find(
+      (f) => f.slug === creditFeatureSlug
+    );
+    if (!existingFeature) {
+      throw new Error("Existing credit feature not found on plan");
+    }
+    const existingFeatureName =
+      existingFeature.displayName || "Existing Credit Feature";
+
+    const editPayload: EditPlanInput = {
+      planDescription: "Updated credit/topup configuration",
+      features: [
+        {
+          existingFeatureId: existingFeature.id,
+          featureName: existingFeatureName,
+          slug: creditFeatureSlug,
+          eventName,
+          isUsageBased: true,
+          hasCreditAllowance: true,
+          creditAllowanceAmount: 3000,
+          creditAllowanceRenewal: "yearly",
+          enableTopups: true,
+          topupPricePerCreditCents: 90,
+          topupMinQuantity: 40,
+          topupMaxQuantity: 4000,
+          topupExpiryBehavior: "never",
+        },
+      ],
+    };
+
+    const editResponse = await client.plans[":id"]["edit"].$post({
+      param: { id: planId },
+      json: editPayload,
+    });
+    const editBody = await editResponse.json();
+    if ("error" in editBody) {
+      throw new Error(
+        `Edit failed for existing credit plan: ${editBody.error}`
+      );
+    }
+
+    expect(editResponse.status).toBe(200);
+    expect(editBody.success).toBe(true);
+    expect(editBody.plan.id).toBe(planId);
+    expect(editBody.plan.versionNumber).toBe(1);
+    expect(editBody.changeAnalysis.isNewVersion).toBe(false);
+    expect(editBody.changeAnalysis.hasFeatureChanges).toBe(false);
+    expect(editBody.resourceActions.featuresCreated.length).toBe(0);
+
+    const refreshedPlanResponse = await client.plans[":id"].$get({
+      param: { id: planId },
+      query: { includeFeatures: "true" },
+    });
+    const refreshedPlanBody = await refreshedPlanResponse.json();
+    if ("error" in refreshedPlanBody) {
+      throw new Error(
+        `Failed to fetch updated plan: ${refreshedPlanBody.error}`
+      );
+    }
+    const refreshedPlan = refreshedPlanBody.plans[0] as APIPlanWithFeatures;
+    expect(refreshedPlan.versionNumber).toBe(1);
+    expect(refreshedPlan.planDescription).toBe(
+      "Updated credit/topup configuration"
+    );
+    expect(refreshedPlan.features).toHaveLength(1);
+    expect(refreshedPlan.features[0].id).toBe(existingFeature.id);
+
+    const updatedCreditDefinitions = await db.query.creditDefinitions.findMany({
+      where: and(
+        eq(creditDefinitions.planId, planId),
+        eq(creditDefinitions.featureSlug, creditFeatureSlug),
+        isNull(creditDefinitions.deletedAt)
+      ),
+    });
+    expect(updatedCreditDefinitions).toHaveLength(1);
+    const updatedDefinition = updatedCreditDefinitions[0];
+    expect(updatedDefinition.id).toBe(initialCreditDefinition.id);
+    expect(updatedDefinition.defaultAmount).toBe(3000);
+    expect(updatedDefinition.enableTopups).toBe(true);
+    expect(updatedDefinition.topupPricePerCreditCents).toBe(90);
+    expect(updatedDefinition.topupMinQuantity).toBe(40);
+    expect(updatedDefinition.topupMaxQuantity).toBe(4000);
+    expect(updatedDefinition.topupExpiryBehavior).toBe("never");
+    expect(updatedDefinition.topupCustomExpiryDays).toBeNull();
+    expect(updatedDefinition.refillRrule).toBe("RRULE:FREQ=YEARLY;INTERVAL=1");
+    expect(updatedDefinition.renewOnBilling).toBe(false);
   });
 
   it("should handle empty features array correctly when no subscribers are present", async () => {

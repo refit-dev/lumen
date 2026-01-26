@@ -12,12 +12,16 @@ Before deploying, ensure you have:
 
 ## Environment Setup
 
-Our infrastructure deploys a secure random key to SSM Parameter Store for each environment:
+Our infrastructure deploys secure random keys to SSM Parameter Store for each environment:
 
 - Staging: `/lumen/staging/TRIGGER_API_ACCESS_KEY`
 - Production: `/lumen/production/TRIGGER_API_ACCESS_KEY`
+- Staging: `/lumen/staging/internal-api-key`
+- Production: `/lumen/production/internal-api-key`
 
-These keys are used for authenticating Trigger.dev API calls to our API endpoints.
+These keys are used for:
+- **TRIGGER_API_ACCESS_KEY**: Authenticating Trigger.dev API calls to our API endpoints
+- **INTERNAL_API_KEY**: Authenticating internal service-to-service calls (e.g., email denylist checks)
 
 ## Configuring Trigger.dev Environments
 
@@ -37,22 +41,34 @@ Set the following environment variables in the Trigger.dev dashboard for each en
 ```
 API_URL=https://lumen-staging.pretzelai.app
 TRIGGER_API_ACCESS_KEY=<value from /lumen/staging/TRIGGER_API_ACCESS_KEY in SSM>
+INTERNAL_API_KEY=<value from /lumen/staging/internal-api-key in SSM>
+NODE_ENV=staging
+IS_TRIGGER_ENV=true
+RESEND_API_KEY=<optional: for sending emails>
+SLACK_WEBHOOK=<optional: for Slack notifications>
 ```
 
 **Production:**
 ```
 API_URL=https://lumen-prod.pretzelai.app
 TRIGGER_API_ACCESS_KEY=<value from /lumen/production/TRIGGER_API_ACCESS_KEY in SSM>
+INTERNAL_API_KEY=<value from /lumen/production/internal-api-key in SSM>
+NODE_ENV=production
+IS_TRIGGER_ENV=true
+RESEND_API_KEY=<optional: for sending emails>
+SLACK_WEBHOOK=<optional: for Slack notifications>
 ```
 
-To retrieve the TRIGGER_API_ACCESS_KEY value from SSM:
+To retrieve values from SSM:
 
 ```bash
 # For staging
 aws ssm get-parameter --name "/lumen/staging/TRIGGER_API_ACCESS_KEY" --with-decryption --query Parameter.Value --output text
+aws ssm get-parameter --name "/lumen/staging/internal-api-key" --with-decryption --query Parameter.Value --output text
 
 # For production
 aws ssm get-parameter --name "/lumen/production/TRIGGER_API_ACCESS_KEY" --with-decryption --query Parameter.Value --output text
+aws ssm get-parameter --name "/lumen/production/internal-api-key" --with-decryption --query Parameter.Value --output text
 ```
 
 ## Deploying Jobs

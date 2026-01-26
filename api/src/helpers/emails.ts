@@ -21,14 +21,6 @@ export async function sendEmailWithResend({
   attachment,
   resendApiKey,
 }: SendEmailParams) {
-  const SKIP_SENDING_EMAIL_DOMAINS = ["getlumen.dev", "example.com"];
-  const skipSendingEmail = SKIP_SENDING_EMAIL_DOMAINS.some((domain) =>
-    to.includes(domain)
-  );
-  if (skipSendingEmail) {
-    console.log(`Skipping sending email to ${to}`);
-    return { success: true, message: `Skipping sending email to ${to}` };
-  }
   // Implementation with Resend. You can modify this function to use any other provider
   try {
     if (!resendApiKey) {

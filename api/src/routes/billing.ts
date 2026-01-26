@@ -56,12 +56,13 @@ import { calculateTaxes, TaxCalculationResult } from "../helpers/tax-engine";
 import {
   getPaymentProvider,
   processPayment,
-  createOneTimePaymentLink,
-  chargeInvoice,
   retryInvoicePayment,
+  getDynamicPaymentLink,
 } from "../helpers/paymentprovider";
 import { enforceDunningEndAction } from "../helpers/dunning";
 import { createNotificationProvider } from "../helpers/notificationProvider";
+import { calculateNextBillingDate } from "../helpers/billing-dates";
+import { deleteSubscription as deleteSubscriptionByStable } from "./subscriptions";
 
 type Invoice = typeof invoices.$inferSelect;
 type Payment = typeof payments.$inferSelect;
@@ -163,6 +164,10 @@ interface ProcessedSubscriptionDetail {
   component: PriceComponentSchemaType;
   billingPeriodStart: Date;
   billingPeriodEnd: Date;
+  // The boundary date used to advance the cycle (always the current nextBillingDate)
+  cycleAnchor: Date;
+  // Whether the component is billed up-front (pre-pay)
+  isPrepay?: boolean;
 }
 
 interface PaymentContext {
@@ -293,17 +298,47 @@ async function processSubscriptionDetails(
     }
 
     // Calculate billing period
-    const billingPeriodStart =
-      subDetailDbRecord.previousBillingDate ||
-      subDetailDbRecord.subscriptionStartDate;
-    const billingPeriodEnd = new Date(detail.nextBillingDate);
+    // For pre-pay (bill_immediately !== false): the renewal period is [next, next+1)
+    // For post-pay: the renewal period is [prev||start, next)
+    const isPrepay = component.bill_immediately !== false;
+    const currentNext = new Date(detail.nextBillingDate);
 
-    processedDetails.push({
-      subDetail: subDetailDbRecord,
-      component,
-      billingPeriodStart,
-      billingPeriodEnd,
-    });
+    if (isPrepay) {
+      // Compute next+1 using the RRULE engine with proper timezone
+      const effectiveTz = await getEffectiveTimezone(
+        subDetailDbRecord.subscription.customerId,
+        subDetailDbRecord.subscription.merchantId
+      );
+      const nextNext = calculateNextBillingDate(
+        component,
+        currentNext,
+        subDetailDbRecord.subscription.startTimestamp,
+        effectiveTz
+      );
+
+      processedDetails.push({
+        subDetail: subDetailDbRecord,
+        component,
+        billingPeriodStart: currentNext,
+        billingPeriodEnd: nextNext,
+        cycleAnchor: currentNext,
+        isPrepay: true,
+      });
+    } else {
+      const billingPeriodStart =
+        subDetailDbRecord.previousBillingDate ||
+        subDetailDbRecord.subscriptionStartDate;
+      const billingPeriodEnd = currentNext;
+
+      processedDetails.push({
+        subDetail: subDetailDbRecord,
+        component,
+        billingPeriodStart,
+        billingPeriodEnd,
+        cycleAnchor: currentNext,
+        isPrepay: false,
+      });
+    }
   }
 
   if (processedDetails.length === 0) {
@@ -420,6 +455,7 @@ async function processPaymentTransaction(
   // First transaction: Create invoice and optionally payment records
   const dbResult = await db.transaction(async (tx) => {
     // Check for existing invoice (idempotency)
+    // Match on both start and end to avoid collisions with immediate invoices
     const existingInvoice = await tx.query.invoices.findFirst({
       where: and(
         eq(invoices.subscriptionId, subscriptionId),
@@ -427,6 +463,10 @@ async function processPaymentTransaction(
         eq(
           invoices.billingPeriodStart,
           context.processedDetails[0].billingPeriodStart
+        ),
+        eq(
+          invoices.billingPeriodEnd,
+          context.processedDetails[0].billingPeriodEnd
         ),
         ne(invoices.status, "deleted")
       ),
@@ -533,50 +573,61 @@ async function processPaymentTransaction(
           throw new Error("Failed to create payment link payment");
         }
 
-        // Use the refactored payment provider function to create checkout session
-        // for Dodo,checkoutSessionId is the Dodo subscription ID, checkoutSessionUrl is the Dodo payment link URL
-        const { checkoutSessionId, checkoutSessionUrl } =
-          await createOneTimePaymentLink({
-            invoice: {
-              ...invoice,
-              subscription: subscriptionWithPlan!,
-            },
-            currency: context.currency,
-            merchantId: context.merchantId,
-            customerId: context.customer.id,
-            lumenPaymentId: paymentLinkPayment.id,
-          });
+        const dynamicPaymentLink = getDynamicPaymentLink({
+          paymentId: paymentLinkPayment.id,
+        });
 
-        // update the payment record with the checkout session ID and checkout session URL in metadata
+        // Update the payment record with the dynamic payment link
         await tx
           .update(payments)
           .set({
-            externalPaymentId: checkoutSessionId,
             metadata: {
               ...paymentLinkPayment.metadata,
-              checkoutSessionId,
-              checkoutSessionUrl,
+              dynamicPaymentLink,
             },
           })
           .where(eq(payments.id, paymentLinkPayment.id));
 
-        // Update invoice with checkout session URL in notes and set status to awaiting payment
+        // Update invoice with dynamic payment link in notes and set status to awaiting payment
         await tx
           .update(invoices)
           .set({
             status: "issued",
-            notes: `Payment required: Please complete your payment online at ${checkoutSessionUrl}`,
+            notes: `Payment required: Please complete your payment online at ${dynamicPaymentLink}`,
           })
           .where(eq(invoices.id, invoiceId));
 
-        // Now that the invoice has the checkout link, generate the PDF so the link appears in the document
-        // Won't be generated for Dodo but we already send the email in createOneTimePaymentLink function
+        // Now that the invoice has the payment link, generate the PDF so the link appears in the document
         await triggerPdfGeneration(tx, invoiceId);
 
-        // Create a pending payment record for tracking and webhook reconciliation
+        // Mark subscription as past_due with grace period since payment is required
+        // This integrates the manual billing flow with the dunning system
+        if (subscriptionWithPlan) {
+          const dunningConfig = await getOrCreateDunningConfig(
+            context.merchantId,
+            subscriptionWithPlan.planId
+          );
+
+          const gracePeriodEndsAt = new Date();
+          gracePeriodEndsAt.setDate(
+            gracePeriodEndsAt.getDate() + dunningConfig.gracePeriodDays
+          );
+
+          await tx
+            .update(subscriptions)
+            .set({
+              status: "past_due",
+              gracePeriodEndsAt,
+            })
+            .where(eq(subscriptions.id, subscriptionWithPlan.id));
+
+          console.log(
+            `Subscription ${subscriptionWithPlan.id} marked as past_due with grace period until ${gracePeriodEndsAt.toISOString()} (payment link flow)`
+          );
+        }
 
         console.info(
-          `Created checkout session for invoice ${invoiceId}: ${checkoutSessionUrl}`
+          `Created dynamic payment link for invoice ${invoiceId}: ${dynamicPaymentLink}`
         );
 
         return {
@@ -584,11 +635,11 @@ async function processPaymentTransaction(
           invoice: {
             ...invoice,
             status: "issued",
-            notes: `Payment required: Please complete your payment online at ${checkoutSessionUrl}`,
+            notes: `Payment required: Please complete your payment online at ${dynamicPaymentLink}`,
           },
           invoiceId,
           payment: paymentLinkPayment,
-          paymentLinkUrl: checkoutSessionUrl,
+          paymentLinkUrl: dynamicPaymentLink,
         };
       } catch (paymentLinkError) {
         console.error(
@@ -1117,7 +1168,7 @@ async function processPostInvoiceOperations(
     for (const data of context.processedDetails) {
       await updateSubscriptionBillingCycle(
         data.subDetail.id,
-        data.billingPeriodEnd,
+        data.cycleAnchor,
         data.component,
         effectiveTimezone
       );
@@ -2074,10 +2125,19 @@ async function createInvoiceAndLineItemsInDb(
     tx
   );
 
-  // Trigger PDF generation only if the customer already has a payment method
-  if (context.paymentMethod) {
+  // Trigger PDF generation immediately when possible so PDF links stay up to date.
+  // Only defer when we still need to add a payment link (non-zero total without a saved payment method).
+  const shouldGeneratePdfImmediately =
+    Boolean(context.paymentMethod) || totalAmountCents === 0;
+
+  if (shouldGeneratePdfImmediately) {
     console.log(
-      `[createInvoiceAndLineItemsInDb] Triggering PDF generation for invoice ${newInvoice.id}`
+      `[createInvoiceAndLineItemsInDb] Triggering PDF generation for invoice ${newInvoice.id}`,
+      {
+        reason: context.paymentMethod
+          ? "payment_method_on_file"
+          : "zero_amount_invoice",
+      }
     );
     await triggerPdfGeneration(tx, newInvoice.id);
   } else {
@@ -2513,14 +2573,51 @@ export const billingRouter = new Hono()
         // Step 2: Fetch customer
         const customer = await fetchCustomer(customerId);
         if (!customer) {
-          return c.json(
-            {
-              success: false,
-              status: "failed",
-              message: `Customer not found: ${customerId}`,
-            },
-            404
+          // If customer is missing but the referenced subscription exists, clean it up and return 200
+          const subscription = await db.query.subscriptions.findFirst({
+            where: and(
+              eq(subscriptions.id, subscriptionId),
+              isNull(subscriptions.deletedAt)
+            ),
+          });
+
+          if (subscription) {
+            try {
+              const stableId = subscription.stableSubscriptionId;
+              await deleteSubscriptionByStable(subscription.merchantId, stableId);
+              console.warn(
+                `[collect-payment] Customer ${customerId} missing; canceled subscription ${stableId}`
+              );
+              return c.json({
+                success: true,
+                status: "subscription_deleted",
+                message: `Customer missing; subscription ${stableId} canceled`,
+              });
+            } catch (cleanupError) {
+              console.error(
+                `[collect-payment] Failed to cleanup orphaned subscription ${subscriptionId} after missing customer ${customerId}:`,
+                cleanupError
+              );
+              // Fall through to a safe 200 to avoid retries, but indicate error status
+              return c.json({
+                success: true,
+                status: "cleanup_failed",
+                message:
+                  "Customer missing; attempted subscription cleanup but failed",
+              });
+            }
+          }
+
+          // No subscription found either; nothing to do
+          console.warn(
+            `[collect-payment] Customer ${customerId} missing and subscription ${subscriptionId} not found — skipping`
           );
+          return c.json({
+            success: true,
+            status: "no_op",
+            message:
+              "Customer missing and no active subscription found; skipping billing",
+          });
         }
 
         // Step 3: Process subscription details

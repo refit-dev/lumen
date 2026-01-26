@@ -67,6 +67,7 @@ export const onboardingCountries = [
   { value: "BG", label: "Bulgaria" },
   { value: "CA", label: "Canada" },
   { value: "CH", label: "Switzerland" },
+  { value: "CL", label: "Chile" },
   { value: "CY", label: "Cyprus" },
   { value: "CZ", label: "Czech Republic" },
   { value: "DE", label: "Germany" },

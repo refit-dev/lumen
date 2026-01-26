@@ -10,10 +10,12 @@
  * Add a user to a seat-based subscription.
  *
  * @param params - The parameters for adding a seat
- * @param params.organisationUserId - User ID (on your backend) of the organization who owns
- *   the subscription. This must match the User ID you used in the PricingTable component
- *   when the user first paid for the subscription (fallback if organizationId not provided)
- * @param params.organizationId - Organization ID (preferred) - the internal Lumen organization ID
+ * @param params.organisationUserId - User ID (on your backend) of the organization owner.
+ *   This must match the User ID you used in the PricingTable component when the user first
+ *   paid for the subscription. Used as a fallback if organizationId is not provided.
+ * @param params.organizationId - Your organization/team/workspace ID (on your backend).
+ *   This must match the organizationId you passed to PricingTable when the subscription
+ *   was created. This is the preferred way to identify the subscription.
  * @param params.newUserId - User ID (on your backend) of the new user being added to
  *   the seat
  * @param params.metadata - Optional metadata to attach to the seat addition event
@@ -98,10 +100,12 @@ export const addSeat = async (params: {
  * Remove a user from a seat-based subscription.
  *
  * @param params - The parameters for removing a seat
- * @param params.organisationUserId - User ID (on your backend) of the organization who owns
- *   the subscription. This must match the User ID you used in the PricingTable component
- *   when the user first paid for the subscription (fallback if organizationId not provided)
- * @param params.organizationId - Organization ID (preferred) - the internal Lumen organization ID
+ * @param params.organisationUserId - User ID (on your backend) of the organization owner.
+ *   This must match the User ID you used in the PricingTable component when the user first
+ *   paid for the subscription. Used as a fallback if organizationId is not provided.
+ * @param params.organizationId - Your organization/team/workspace ID (on your backend).
+ *   This must match the organizationId you passed to PricingTable when the subscription
+ *   was created. This is the preferred way to identify the subscription.
  * @param params.removedUserId - User ID (on your backend) of the user being removed from the seat
  * @param params.metadata - Optional metadata to attach to the seat removal event
  * @param params.idempotencyKey - Optional idempotency key to prevent duplicate operations

@@ -1,71 +1,219 @@
+/**
+ * Core types for Lumen React SDK
+ */
+
+// ============================================================================
+// Subscription Types
+// ============================================================================
+
+export interface Customer {
+  id: string;
+  name: string | null;
+  email: string | null;
+  externalCustomerId: string | null;
+}
+
+export interface Subscription {
+  id: string;
+  planId: string;
+  planName: string;
+  status: "active" | "trialing" | "past_due" | "canceled" | "paused";
+  currentPeriodEnd: string | null;
+  currentPeriodStart: string | null;
+  cancelAtPeriodEnd: boolean;
+  trialEnd: string | null;
+}
+
+export interface SubscriptionStatus {
+  hasActiveSubscription: boolean;
+  customer: Customer;
+  subscription: Subscription;
+}
+
+// ============================================================================
+// Entitlements Types
+// ============================================================================
+
+export type EntitlementSource = "plan" | "override" | "default" | "credits";
+
 export interface Feature {
-  text: string;
+  slug: string;
+  value: boolean | string | number | null;
 }
 
-export interface Plan {
-  title: string;
-  description?: string;
-  price: number;
-  priceMonthly?: number;
-  priceYearly?: number;
-  interval: string;
-  // Optional: minimum number of seats billed up-front for seat-based plans
-  minSeats?: number;
-  features?: Feature[];
-  buttonText: string;
-  buttonOutline?: boolean;
-  isPopular?: boolean;
-  popularText?: string;
-  currency?: string;
-  planId?: string;
-  priceId?: string;
-  priceIdMonthly?: string;
-  priceIdYearly?: string;
-  isEnterprisePlan?: boolean;
-  enterpriseRedirectUrl?: string;
-  selectedBillingInterval?: "monthly" | "yearly";
-  selectedPrice?: number;
-  // Trial information
-  trial?: {
-    available: boolean;
-    days: number;
-    trialPlanId: string;
+export interface CreditInfo {
+  creditAllowance: number;
+  creditsRemaining: number;
+  nextExpiryDate: Date | null;
+}
+
+export interface Usage {
+  metricId: string;
+  usage: number;
+}
+
+export interface FeatureEntitlement {
+  entitled: boolean | null;
+  feature: Feature | null;
+  source: EntitlementSource | null;
+  usages?: Usage[];
+  creditInfo?: CreditInfo;
+}
+
+export interface EntitlementsResponse {
+  entitlements: FeatureEntitlement[];
+}
+
+// ============================================================================
+// Customer Portal Types
+// ============================================================================
+
+export interface PaymentMethod {
+  id: string;
+  type: string;
+  last4?: string;
+  brand?: string;
+  expiryMonth?: number;
+  expiryYear?: number;
+  isDefault: boolean;
+}
+
+export interface Invoice {
+  id: string;
+  invoiceNumber: string;
+  status: string;
+  amountDue: number;
+  amountPaid: number;
+  currency: string;
+  dueDate: string | null;
+  paidAt: string | null;
+  invoiceDate: string;
+  pdfUrl?: string;
+}
+
+export interface CustomerOverview {
+  customer: Customer;
+  subscription: Subscription | null;
+  paymentMethods: PaymentMethod[];
+  upcomingInvoice: Invoice | null;
+  recentInvoices: Invoice[];
+}
+
+// ============================================================================
+// Hook Configuration Types
+// ============================================================================
+
+export interface LumenConfig {
+  /**
+   * Base URL for the Lumen API proxy
+   * Should point to your backend's Lumen handler endpoint
+   * @example "/api/lumen"
+   */
+  apiProxyUrl: string;
+
+  /**
+   * Disable automatic retries on failed requests
+   * @default false
+   */
+  disableRetry?: boolean;
+
+  /**
+   * Number of retries for failed requests
+   * @default 2
+   */
+  retryCount?: number;
+
+  /**
+   * Delay between retries in milliseconds
+   * @default 1000
+   */
+  retryDelay?: number;
+}
+
+export interface UseQueryOptions {
+  /**
+   * Enable automatic refetching
+   * @default false
+   */
+  enabled?: boolean;
+
+  /**
+   * Refetch interval in milliseconds
+   * @default undefined (no automatic refetching)
+   */
+  refetchInterval?: number;
+
+  /**
+   * Refetch on window focus
+   * @default false
+   */
+  refetchOnWindowFocus?: boolean;
+
+  /**
+   * Callback when data is fetched successfully
+   */
+  onSuccess?: (data: any) => void;
+
+  /**
+   * Callback when an error occurs
+   */
+  onError?: (error: Error) => void;
+}
+
+// ============================================================================
+// Utility Types
+// ============================================================================
+
+export interface FormattedUsage {
+  used: number;
+  limit: number | null;
+  percentage: number | null;
+  formatted: string;
+  isUnlimited: boolean;
+}
+
+export interface UpgradeReason {
+  reason: string;
+  severity: "warning" | "critical" | "info";
+  percentage?: number;
+}
+
+// ============================================================================
+// Credit Top-Up Types
+// ============================================================================
+
+export type TopupExpiryBehavior = "billing_cycle" | "custom_days" | "never";
+
+export interface AvailableTopup {
+  creditDefinitionId: string;
+  featureName: string;
+  featureSlug: string;
+  currentUsage: number;
+  creditsRemaining: number;
+  creditAllowance: number;
+  topupPricePerCreditCents: number;
+  minQuantity: number;
+  maxQuantity: number | null;
+  currency: string;
+  expiryBehavior: TopupExpiryBehavior;
+  estimatedExpiryDate: string | null;
+}
+
+export interface AvailableTopupsResponse {
+  availableTopups: AvailableTopup[];
+}
+
+export interface TopupPurchaseResult {
+  success: boolean;
+  payment: {
+    id: string;
+    status: string;
   };
-  // Pricing data with components for detailed pricing information
-  pricingData?: {
-    components: Array<{
-      type: "fixed" | "per_unit" | "usage";
-      label?: string;
-      amount_cents?: number; // for fixed/per_unit components
-      unit_cost_cents?: number; // for usage components
-      component_name?: string;
-      unit_label?: string;
-      metric_id?: string;
-      [key: string]: unknown;
-    }>;
-    dsl_version?: number;
+  // Credits are pending until webhook confirms payment
+  expectedCredits: {
+    quantity: number;
+    expiryDate: string | null;
   };
-  pspPlanId?: string;
-}
-
-export interface PricingTableProps {
-  heading?: string;
-  description?: string;
-  plans: Plan[];
-}
-
-// Optional customer information that can be provided upfront to prefill the
-// checkout/customer details form when the modal opens.
-export interface InitialCustomer {
-  email?: string;
-  name?: string;
-  businessName?: string;
-  address?: string;
-  addressLine2?: string;
-  zip?: string;
-  city?: string;
-  country?: string; // ISO 2 code (e.g., "US", "DE")
-  stateProvince?: string; // e.g., "CA" or state/province name
-  taxId?: string;
-  isBusiness?: boolean;
+  totalAmountCents: number;
+  currency: string;
 }

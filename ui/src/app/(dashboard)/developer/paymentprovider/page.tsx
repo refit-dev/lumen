@@ -1,18 +1,35 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { apiClient } from "@/lib/hono-client";
 import { PaymentProviders } from "@/components/paymentproviders";
 import { PageContent } from "@/components/dashboard/page-content";
 import { toast } from "sonner";
+import { useSession } from "@/lib/auth-client";
 
 export default function PaymentProviderPage() {
+  const { data: session } = useSession();
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(true);
   const [showProviders, setShowProviders] = useState(false);
 
+  const myRole = session?.memberRole ?? "member";
+  const myRoles = useMemo(() => (myRole || "").split(","), [myRole]);
+  const isOwner = myRoles.includes("owner");
+
   useEffect(() => {
+    if (session && !isOwner) {
+      toast.error("Only organization owners can manage payment providers");
+      router.replace("/dashboard");
+    }
+  }, [isOwner, session, router]);
+
+  useEffect(() => {
+    if (!isOwner || !session) {
+      return;
+    }
+
     const checkPaymentProvider = async () => {
       try {
         const response = await apiClient.merchants["payment-provider"].$get();
@@ -46,7 +63,11 @@ export default function PaymentProviderPage() {
     };
 
     checkPaymentProvider();
-  }, [router]);
+  }, [router, isOwner, session]);
+
+  if (!isOwner && session) {
+    return null;
+  }
 
   const handleStripeClick = () => {
     router.push("/developer/stripe");

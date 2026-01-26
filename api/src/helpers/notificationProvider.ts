@@ -6,6 +6,7 @@ import {
   type SendEmailOptions,
   type SendSlackOptions,
 } from "./notificationCore";
+import { db } from "../db/client";
 
 type NodeEnv = "development" | "test" | "staging" | "production";
 
@@ -86,6 +87,7 @@ export function createNotificationProvider(
         nodeEnv,
         resendApiKey: resendKey,
         slackWebhook: slackWebhook,
+        db,
       });
     }
     return coreProvider;

@@ -1,7 +1,7 @@
 import { db } from "../db/client";
 import { eq, and, isNull } from "drizzle-orm";
 import { customers, stripe, dodo, plans } from "@lumen/common/schema";
-import { decryptField, EncryptedField } from "./encryption";
+import { decryptField, EncryptedField, encryptField } from "./encryption";
 import Stripe from "stripe";
 import DodoPayments from "dodopayments";
 import { logger } from "./logging";
@@ -15,14 +15,13 @@ import { invoices, invoiceLineItems } from "@lumen/common/schema";
 import { env } from "../env";
 import fs from "fs";
 import { Webhook } from "standardwebhooks";
-import { getSecretOrEnvVar } from "./secrets";
 import { createNotificationProvider } from "./notificationProvider";
 import { merchants } from "@lumen/common/schema";
 import { getObjectStorageUrl, uploadFile, generatePresignedUrl } from "./s3";
-import type { TransactionType } from "./";
 import type { InvoiceCompleteAPI } from "./invoices";
 import { formatInvoiceWithDetailsToCompleteAPI } from "./invoices";
 import { sendInvoiceEmail } from "./invoiceEmail";
+import { getRedisClient } from "../lib/redis";
 
 const notify = createNotificationProvider({ NODE_ENV: env.NODE_ENV });
 
@@ -864,6 +863,9 @@ export const createOneTimePaymentLink = async ({
 
       console.log("Creating Dodo subscription");
       // Create Dodo subscription with customer information
+      // Dodo links expire after 24 hours, so we will end up with multiple subscriptions in dodo
+      // if the user clicks the link multiple times. That's fine. We only have ONE lumen subscription.
+      // Dodo subscriptions aren't billed automatically since they are on-demand so it works.
       const subscription = await client.subscriptions.create({
         payment_link: true,
         on_demand:
@@ -975,6 +977,122 @@ export const createOneTimePaymentLink = async ({
       "One time payment links error: " + NO_PAYMENT_PROVIDER_CONFIGURED_ERROR
     );
   }
+};
+
+/**
+ * Creates a fresh checkout session for an existing payment
+ * This function is used by the dynamic payment link endpoint to generate on-demand checkout sessions
+ * that don't expire, solving the 24-hour Stripe checkout session expiration issue
+ */
+export const createCheckoutSessionForPayment = async ({
+  paymentId,
+}: {
+  paymentId: string;
+}): Promise<{
+  checkoutSessionUrl: string;
+  checkoutSessionId: string;
+}> => {
+  // Fetch the payment record
+  const payment = await db.query.payments.findFirst({
+    where: eq(payments.id, paymentId),
+  });
+
+  if (!payment) {
+    throw new Error("Payment not found");
+  }
+
+  if (!payment.invoiceId) {
+    throw new Error("Payment has no associated invoice");
+  }
+
+  // Validate payment is still pending or requires action
+  if (!["pending", "requires_action"].includes(payment.status)) {
+    throw new Error(
+      `Payment is not in a valid state for checkout (status: ${payment.status})`
+    );
+  }
+
+  // Fetch the invoice with all necessary relations
+  const invoice = await db.query.invoices.findFirst({
+    where: eq(invoices.id, payment.invoiceId),
+    with: {
+      customer: true,
+      merchant: true,
+      subscription: {
+        with: {
+          plan: true,
+        },
+      },
+    },
+  });
+
+  if (!invoice) {
+    throw new Error("Invoice not found");
+  }
+
+  if (!invoice.customer) {
+    throw new Error("Invoice has no associated customer");
+  }
+
+  if (!invoice.merchant) {
+    throw new Error("Invoice has no associated merchant");
+  }
+
+  if (!invoice.subscription) {
+    throw new Error("Invoice has no associated subscription");
+  }
+
+  // Create a new checkout session using the existing function
+  const { checkoutSessionId, checkoutSessionUrl } =
+    await createOneTimePaymentLink({
+      invoice: {
+        ...invoice,
+        subscription: invoice.subscription,
+      },
+      currency: payment.currency,
+      merchantId: payment.merchantId,
+      customerId: invoice.customer.id,
+      lumenPaymentId: payment.id,
+    });
+
+  if (!checkoutSessionId || !checkoutSessionUrl) {
+    throw new Error("Failed to create checkout session");
+  }
+
+  // Update the payment record with the new checkout session details
+  await db
+    .update(payments)
+    .set({
+      externalPaymentId: checkoutSessionId,
+      metadata: {
+        ...payment.metadata,
+        checkoutSessionId,
+        checkoutSessionUrl,
+        lastCheckoutSessionCreatedAt: new Date().toISOString(),
+      },
+      updatedAt: new Date(),
+    })
+    .where(eq(payments.id, payment.id));
+
+  logger.info(
+    `Created fresh checkout session for payment ${paymentId}: ${checkoutSessionUrl}`
+  );
+
+  return {
+    checkoutSessionUrl,
+    checkoutSessionId,
+  };
+};
+
+// Create a dynamic payment link that won't expire
+// Instead of creating a checkout session immediately (24h expiration), we'll use a dynamic link
+// that creates a fresh checkout session each time it's accessed (no expiration)
+export const getDynamicPaymentLink = ({
+  paymentId,
+}: {
+  paymentId: string;
+}): string => {
+  return `${env.API_URL}/public/payment-link/${paymentId}`;
 };
 
 /**
@@ -1100,46 +1218,35 @@ export const chargeInvoice = async ({
         })
         .returning();
 
-      // Create payment link for customers without payment methods
-      const { checkoutSessionId, checkoutSessionUrl } =
-        await createOneTimePaymentLink({
-          invoice: {
-            // TS can't infer that invoice.subscription is not null
-            ...invoice,
-            subscription: invoice.subscription!,
-          },
-          currency: invoice.currency,
-          merchantId: invoice.merchantId,
-          customerId: invoice.customerId,
-          lumenPaymentId: payment.id,
-        });
+      // Create a dynamic payment link that won't expire
+      const dynamicPaymentLink = getDynamicPaymentLink({
+        paymentId: payment.id,
+      });
 
-      // Update payment record with checkout session ID and URL
+      // Update payment record with the dynamic payment link
       await db
         .update(payments)
         .set({
-          externalPaymentId: checkoutSessionId,
           metadata: {
             ...payment.metadata,
-            checkoutSessionId,
-            checkoutSessionUrl,
+            dynamicPaymentLink,
           },
         })
         .where(eq(payments.id, payment.id));
 
-      // Update invoice with payment link
+      // Update invoice with dynamic payment link
       await db
         .update(invoices)
         .set({
           notes: invoice.notes
-            ? `${invoice.notes}. Payment required: Please complete your payment online at ${checkoutSessionUrl}`
-            : `Payment required: Please complete your payment online at ${checkoutSessionUrl}`,
+            ? `${invoice.notes}. Payment required: Please complete your payment online at ${dynamicPaymentLink}`
+            : `Payment required: Please complete your payment online at ${dynamicPaymentLink}`,
         })
         .where(eq(invoices.id, invoiceId));
 
       return {
         success: true,
-        message: `Payment link created: ${checkoutSessionUrl}`,
+        message: `Payment link created: ${dynamicPaymentLink}`,
         paymentId: payment.id,
         status: "payment_link_created",
       };
@@ -1595,6 +1702,139 @@ export const verifyPaymentProviderWebhook = async ({
     }
   } else {
     return false;
+  }
+};
+
+/**
+ * Attempts to auto-heal Stripe webhook configuration after a signature verification failure.
+ * Strategy:
+ * - Acquire a short lock in Redis to avoid concurrent recreations
+ * - Delete any existing webhook endpoints for this merchant's URL
+ * - Create a fresh endpoint and persist the new signing secret
+ */
+export const attemptAutoRecreateStripeWebhook = async ({
+  merchantId,
+  paymentProvider,
+  stripeClient,
+}: {
+  merchantId: string;
+  paymentProvider: PaymentProvider;
+  stripeClient?: Stripe;
+}): Promise<{ attempted: boolean; recreated: boolean; message?: string }> => {
+  try {
+    if (env.NODE_ENV === "development") {
+      // Local dev uses Stripe CLI dynamic secrets; skip auto-heal in dev
+      return { attempted: false, recreated: false, message: "skip_dev_env" };
+    }
+    if (paymentProvider.name !== "stripe") {
+      return { attempted: false, recreated: false, message: "not_stripe" };
+    }
+    if (!paymentProvider.isPaymentProviderReady) {
+      return {
+        attempted: false,
+        recreated: false,
+        message: "provider_not_ready",
+      };
+    }
+
+    // Ensure merchant is active (not soft-deleted)
+    const merchant = await db.query.merchants.findFirst({
+      where: and(eq(merchants.id, merchantId), isNull(merchants.deletedAt)),
+    });
+    if (!merchant) {
+      return {
+        attempted: false,
+        recreated: false,
+        message: "merchant_inactive",
+      };
+    }
+
+    const redis = await getRedisClient();
+    const lockKey = `webhook:stripe:heal_lock:${merchantId}`;
+    const lock = await redis.set(lockKey, "1", { NX: true, EX: 300 });
+    if (!lock) {
+      return { attempted: true, recreated: false, message: "locked" };
+    }
+
+    // Create client if not provided
+    const client = stripeClient ?? (await createStripeClient(paymentProvider));
+
+    // Compute expected webhook URL
+    const webhookBaseUrl = `${env.API_URL}/public/webhook`;
+    const expectedUrl = !webhookBaseUrl.includes("localhost")
+      ? `${webhookBaseUrl}/${merchantId}`
+      : `https://api.getlumen.dev/v1/public/webhook-test/${merchantId}`;
+
+    // Delete existing endpoints for this URL (if any)
+    try {
+      const list = await client.webhookEndpoints.list({ limit: 100 });
+      const matches = list.data.filter((ep) => ep.url === expectedUrl);
+      for (const ep of matches) {
+        try {
+          await client.webhookEndpoints.del(ep.id);
+        } catch (delErr) {
+          logger.warn(
+            `Failed to delete Stripe webhook endpoint ${ep.id} for merchant ${merchantId}: ${
+              delErr instanceof Error ? delErr.message : String(delErr)
+            }`
+          );
+        }
+      }
+    } catch (listErr) {
+      logger.warn(
+        `Failed to list Stripe webhook endpoints for merchant ${merchantId}: ${
+          listErr instanceof Error ? listErr.message : String(listErr)
+        }`
+      );
+      // Continue; creation may still succeed
+    }
+
+    // Create fresh endpoint with supported events
+    const enabledEvents: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
+      "payment_intent.succeeded",
+      "payment_intent.payment_failed",
+      "setup_intent.succeeded",
+      "setup_intent.setup_failed",
+      "checkout.session.completed",
+    ];
+
+    const newEndpoint = await client.webhookEndpoints.create({
+      enabled_events: enabledEvents,
+      url: expectedUrl,
+    });
+
+    if (!newEndpoint.secret) {
+      logger.error(
+        `Stripe returned no secret when creating webhook for merchant ${merchantId}`
+      );
+      return {
+        attempted: true,
+        recreated: false,
+        message: "no_secret_from_stripe",
+      };
+    }
+
+    // Persist the new signing secret
+    const encryptedWebhookSecret = await encryptField(newEndpoint.secret);
+    await db
+      .update(stripe)
+      .set({ webhookSecret: encryptedWebhookSecret })
+      .where(and(eq(stripe.merchantId, merchantId), isNull(stripe.deletedAt)));
+
+    // Small cooldown before allowing next recreation
+    await redis.set(lockKey, "1", { XX: true, EX: 900 }); // extend lock to 15m
+
+    logger.info(
+      `Auto-healed Stripe webhook for merchant ${merchantId}: endpoint recreated`
+    );
+    return { attempted: true, recreated: true };
+  } catch (err) {
+    logger.error(
+      `Failed to auto-heal Stripe webhook for merchant ${merchantId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return { attempted: true, recreated: false, message: "exception" };
   }
 };
 
@@ -2191,6 +2431,7 @@ export const postProcessDodoPayment = async ({
         pdfBuffer: emailPayload.pdfBuffer,
         pdfUrl: emailPayload.pdfUrl,
         invoiceNumber: emailPayload.invoiceNumber,
+        db,
       });
     }
   } catch (emailSendError) {

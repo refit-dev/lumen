@@ -134,6 +134,27 @@ export default function OnboardingPage() {
 
   const isStripeOnboardingComplete = !!secretKey && !!publicKey;
 
+  const inferStripeEnvironment = (key: string) => {
+    if (!key) return null;
+    if (key.includes("_test_")) return "test";
+    if (key.includes("_live_")) return "live";
+    return "unknown";
+  };
+
+  const stripeSecretEnvironment = inferStripeEnvironment(secretKey);
+  const stripePublishableEnvironment = inferStripeEnvironment(publicKey);
+  const detectedStripeEnvironment =
+    selectedProvider === "stripe"
+      ? stripeSecretEnvironment || stripePublishableEnvironment
+      : null;
+  const stripeEnvironmentMismatch =
+    selectedProvider === "stripe" &&
+    stripeSecretEnvironment &&
+    stripePublishableEnvironment &&
+    stripeSecretEnvironment !== "unknown" &&
+    stripePublishableEnvironment !== "unknown" &&
+    stripeSecretEnvironment !== stripePublishableEnvironment;
+
   const form = useAppForm({
     defaultValues: {
       legalName: stripeMerchantData?.legalName ?? "",
@@ -401,9 +422,7 @@ export default function OnboardingPage() {
           ...step,
           active: true,
           title:
-            provider === "stripe"
-              ? "Stripe API Keys (optional)"
-              : "Dodo Payments API Key (optional)",
+            provider === "stripe" ? "Stripe API Keys" : "Dodo Payments API Key",
         };
       return step;
     });
@@ -816,6 +835,37 @@ export default function OnboardingPage() {
                       </div>
                     </div>
 
+                    {selectedProvider === "stripe" && (
+                      <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
+                        <div className="flex items-start gap-2">
+                          <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                          <div className="space-y-1">
+                            <p className="font-medium leading-none">
+                              Use test or live keys
+                            </p>
+                            <p className="text-xs sm:text-sm text-blue-800">
+                              You can start with either Stripe test keys{" "}
+                              <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-xs text-blue-900">
+                                pk_test_...
+                              </code>{" "}
+                              /{" "}
+                              <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-xs text-blue-900">
+                                sk_test_...
+                              </code>
+                              or with live keys{" "}
+                              <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-xs text-blue-900">
+                                pk_live_...
+                              </code>{" "}
+                              /{" "}
+                              <code className="rounded bg-blue-100 px-1 py-0.5 font-mono text-xs text-blue-900">
+                                sk_live_...
+                              </code>
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Stripe requires both keys */}
                     {selectedProvider === "stripe" && (
                       <div className="space-y-2">
@@ -830,7 +880,7 @@ export default function OnboardingPage() {
                           value={publicKey}
                           onChange={(e) => setPublicKey(e.target.value)}
                           onKeyDown={handleKeyDown}
-                          placeholder="pk_live_..."
+                          placeholder="pk_test_... or pk_live_..."
                         />
                       </div>
                     )}
@@ -851,11 +901,37 @@ export default function OnboardingPage() {
                         onKeyDown={handleKeyDown}
                         placeholder={
                           selectedProvider === "stripe"
-                            ? "sk_live_..."
+                            ? "sk_test_... or sk_live_..."
                             : "xxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
                         }
                       />
                     </div>
+
+                    {selectedProvider === "stripe" &&
+                      (publicKey || secretKey) && (
+                        <p className="text-xs text-muted-foreground">
+                          Detected Stripe mode:{" "}
+                          <span className="font-medium text-foreground">
+                            {detectedStripeEnvironment === "test"
+                              ? "Test"
+                              : detectedStripeEnvironment === "live"
+                                ? "Live"
+                                : "Unknown"}
+                          </span>
+                          {detectedStripeEnvironment === "unknown"
+                            ? " — double-check the key format."
+                            : null}
+                        </p>
+                      )}
+
+                    {stripeEnvironmentMismatch && (
+                      <p className="text-xs text-destructive">
+                        Heads up: your publishable key appears to be{" "}
+                        {stripePublishableEnvironment} while your secret key is{" "}
+                        {stripeSecretEnvironment}. Stripe expects both keys to
+                        come from the same environment.
+                      </p>
+                    )}
 
                     <div className="flex space-x-2 mt-2">
                       <Button

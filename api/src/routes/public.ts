@@ -1,7 +1,13 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { db } from "../db/client";
-import { subscriptions } from "@lumen/common/schema";
+import {
+  subscriptions,
+  invitation,
+  organization,
+  user,
+  member,
+} from "@lumen/common/schema";
 import { apiKeys } from "@lumen/common/schema";
 import { eq, and, isNull, ne, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -18,6 +24,7 @@ import {
   subscriptionsScheduledChanges,
   paymentRetries,
   customerOrganizations,
+  subscriptionFeatures,
 } from "@lumen/common/schema";
 import { enforceDunningEndAction } from "../helpers/dunning";
 import { dunningConfigs } from "@lumen/common/schema";
@@ -52,12 +59,22 @@ import {
   createPspPaymentAuthorization,
   generateReturnObject,
   postProcessDodoPayment,
+  createCheckoutSessionForPayment,
 } from "../helpers/paymentprovider";
 import { retryInvoicePayment } from "../helpers/paymentprovider";
 import { processPayment } from "../helpers/paymentprovider";
-import { createFreeSubscriptionForUser } from "../helpers/create-free-subscription";
 import { ContentfulStatusCode } from "hono/utils/http-status";
+import {
+  registerSSEClient,
+  unregisterSSEClient,
+  publishSSEEvent,
+  getPaymentStatus,
+  sseClients as redisBackedSseClients,
+  clearSseClientsForTesting,
+} from "../lib/sse-manager";
 
+import { attemptAutoRecreateStripeWebhook } from "../helpers/paymentprovider";
+import { processTopupPayment } from "../helpers/topups";
 const taxCalculationSchema = z.object({
   lumenPublishableKey: z
     .string()
@@ -195,13 +212,13 @@ const createPaymentSchema = z.object({
   trialDays: z.number().optional(),
 });
 
-// Map to store active SSE connections, keyed by paymentIntentId
-export const sseClients = new Map<string, SSEStreamingApi>();
+// Expose SSE client registry for tests (actual implementation in sse-manager)
+export const sseClients = redisBackedSseClients;
 let id = 0;
 
 // Export for testing purposes
 export const exposeForTesting = {
-  clearSseClients: () => sseClients.clear(),
+  clearSseClients: () => clearSseClientsForTesting(),
 };
 
 async function getOrCreateLumenPaymentMethodFromPspPayment({
@@ -283,9 +300,12 @@ async function getOrCreateLumenPaymentMethodFromPspPayment({
     pspPaymentMethodDetails &&
     pspPaymentMethodDetails.type !== "card"
   ) {
-    console.log(
-      `${paymentProvider.name} payment method ${pspPaymentMethodDetails.id} is of type ${pspPaymentMethodDetails.type}, not 'card'. Skipping save.`
-    );
+    const message = `[Admin Action Required] Customer: ${customerId}. Merchant: ${merchantId}. ${paymentProvider.name} payment method ${pspPaymentMethodDetails.id} is of type ${pspPaymentMethodDetails.type}, not 'card'. Skipping save.`;
+    const notify = createNotificationProvider();
+    await notify.sendSlack({
+      text: message,
+    });
+    console.log(message);
     return null;
   } else {
     throw new Error(
@@ -322,6 +342,33 @@ function validateIntentMetadata(
 
   if (intentType === "payment") {
     if (isSucceeded) {
+      // Credit topup payments
+      if (metadata.is_topup === "true") {
+        const topupCustomerId = metadata.topup_customer_id as
+          | string
+          | undefined;
+        const topupCreditDefinitionId = metadata.topup_credit_definition_id as
+          | string
+          | undefined;
+        const topupQuantity = metadata.topup_quantity as string | undefined;
+        const topupUnitPriceCents = metadata.topup_unit_price_cents as
+          | string
+          | undefined;
+        if (
+          !topupCustomerId ||
+          !topupCreditDefinitionId ||
+          !topupQuantity ||
+          !topupUnitPriceCents
+        ) {
+          return {
+            isValid: false,
+            error:
+              "Missing required metadata for topup payment: topup_customer_id, topup_credit_definition_id, topup_quantity, topup_unit_price_cents",
+          };
+        }
+        return { isValid: true };
+      }
+
       // Trial upgrade path uses trial_subscription_id
       if (metadata.is_trial_upgrade === "true") {
         const trialSubId = metadata.trial_subscription_id as string | undefined;
@@ -439,30 +486,6 @@ function validateIntentMetadata(
   return { isValid: true };
 }
 
-// Helper function to send event to SSE client
-function sendEventToSSEClient(sseLookupId: string, broadcastData: any): void {
-  console.log("sseLookupId", sseLookupId);
-  const clientStream = sseClients.get(sseLookupId);
-
-  if (clientStream) {
-    console.log("Found clientStream");
-    try {
-      clientStream.writeSSE({
-        data: JSON.stringify(broadcastData),
-        event: "stripe_event", // Use a specific event name for Stripe webhooks
-        id: crypto.randomUUID(),
-      });
-      console.log(
-        `Sent Stripe event type ${broadcastData.type} to SSE client for ID: ${sseLookupId}`
-      );
-    } catch (err) {
-      console.error(`Failed to send to SSE client for ID ${sseLookupId}:`, err);
-    }
-  } else {
-    console.log(`No active SSE client found for ID: ${sseLookupId}`);
-  }
-}
-
 // Prepare event broadcast data for SSE clients
 function prepareEventBroadcastData(event: Stripe.Event, merchantId: string) {
   return {
@@ -483,6 +506,51 @@ function getSSELookupIdFromEvent(event: Stripe.Event): string | undefined {
     return setupIntent.id;
   }
   return undefined;
+}
+
+/**
+ * Check if a webhook has already been processed using Redis for idempotency
+ * Returns true if webhook should be processed, false if it's a duplicate
+ */
+async function checkWebhookIdempotency(
+  provider: "stripe" | "dodo",
+  merchantId: string,
+  eventId: string
+): Promise<boolean> {
+  const idempotencyKey = `webhook:${provider}:${merchantId}:${eventId}`;
+
+  try {
+    const { getRedisClient } = await import("../lib/redis");
+    const redis = await getRedisClient();
+
+    // Try to set the key only if it doesn't exist (NX = not exists)
+    // If it already exists, this webhook was already processed
+    const wasSet = await redis.set(idempotencyKey, "1", {
+      NX: true,
+      EX: 86400, // Expire after 24 hours
+    });
+
+    if (!wasSet) {
+      console.log(
+        `${provider.toUpperCase()} webhook ${eventId} already processed for merchant ${merchantId}, ignoring duplicate`
+      );
+      return false; // Skip processing
+    }
+
+    console.log(
+      `Processing ${provider.toUpperCase()} webhook ${eventId} for merchant ${merchantId}`
+    );
+    return true; // Process webhook
+  } catch (redisError) {
+    // Redis failure should not block webhook processing
+    // Log and continue (risk: duplicate processing if Redis is down)
+    console.error(
+      `Redis idempotency check failed for ${provider} webhook ${eventId}:`,
+      redisError
+    );
+    console.warn("Continuing without idempotency protection");
+    return true; // Process anyway when Redis is unavailable
+  }
 }
 
 // Process recurring payment from webhook
@@ -1927,6 +1995,36 @@ async function handlePaymentEvent(payment: typeof payments.$inferSelect) {
       }
     }
 
+    // Check for credit topup payments - creates invoice, grants credits
+    if (payment.metadata.is_topup === "true") {
+      console.log("Processing credit topup payment:", payment.id);
+
+      // CRITICAL: We must throw an error if processing fails
+      // This tells the PSP to retry the webhook, preventing customer from being charged without receiving credits
+      const topupResult = await processTopupPayment(payment);
+
+      if (!topupResult.success) {
+        console.error(
+          `Failed to process topup payment: ${topupResult.message}`,
+          {
+            paymentId: payment.id,
+            message: topupResult.message,
+          }
+        );
+        // Throw error to trigger webhook retry
+        throw new Error(
+          `Topup processing failed: ${topupResult.message || "Unknown error"}`
+        );
+      }
+
+      console.log(
+        `Topup processed: invoice ${topupResult.invoiceId}, credits ${topupResult.creditGrantId}`
+      );
+
+      // Topup payments don't need further processing (no subscription creation/updates)
+      return { status: "topup_processed", payment };
+    }
+
     // Check for trial upgrades first
     if (payment.metadata.is_trial_upgrade === "true") {
       console.log("Processing trial upgrade payment:", payment.id);
@@ -2176,7 +2274,7 @@ export const publicRoute: Hono = new Hono()
       console.log(
         `SSE client connected for paymentIntentId: ${paymentIntentId}`
       );
-      sseClients.set(paymentIntentId, stream);
+      const { cachedEvents } = await registerSSEClient(paymentIntentId, stream);
 
       // Send initial connection-established event
       await stream.writeSSE({
@@ -2188,13 +2286,40 @@ export const publicRoute: Hono = new Hono()
         id: crypto.randomUUID(),
       });
 
+      // Send any cached events that arrived before SSE connected
+      if (cachedEvents.length > 0) {
+        console.log(
+          `Replaying ${cachedEvents.length} cached events for ${paymentIntentId}`
+        );
+        for (const event of cachedEvents) {
+          try {
+            await stream.writeSSE({
+              data: JSON.stringify(event),
+              event: "stripe_event",
+              id: crypto.randomUUID(),
+            });
+          } catch (error) {
+            console.error(
+              `Failed to replay cached SSE event for ${paymentIntentId}:`,
+              error
+            );
+            break;
+          }
+        }
+      }
+
       // Periodic ping to keep connection alive
       const intervalId = setInterval(() => {
-        void stream.writeSSE({
-          data: "ping",
-          event: "ping",
-          id: crypto.randomUUID(),
-        });
+        void stream
+          .writeSSE({
+            data: "ping",
+            event: "ping",
+            id: crypto.randomUUID(),
+          })
+          .catch((error) => {
+            console.error(`Failed to send ping to ${paymentIntentId}:`, error);
+            clearInterval(intervalId);
+          });
       }, 5000); // CRITICAL: NEEDS TO BE LESS THAN 10 SECONDS (BUN has 10 sec timeout)
 
       // Cleanup on client disconnect
@@ -2202,7 +2327,7 @@ export const publicRoute: Hono = new Hono()
         console.log(
           `SSE client disconnected for paymentIntentId: ${paymentIntentId}`
         );
-        sseClients.delete(paymentIntentId);
+        unregisterSSEClient(paymentIntentId);
         clearInterval(intervalId);
       });
 
@@ -2210,6 +2335,103 @@ export const publicRoute: Hono = new Hono()
       await new Promise<void>((resolve) => stream.onAbort(resolve));
     });
   })
+  .get("/payment-status/:intentId", async (c) => {
+    c.header("Access-Control-Allow-Origin", "*");
+    const intentId = c.req.param("intentId");
+
+    console.log(`Payment status polling request for intentId: ${intentId}`);
+
+    try {
+      const status = await getPaymentStatus(intentId);
+
+      if (!status) {
+        return c.json(
+          {
+            status: "pending",
+            message: "Payment not found or still processing",
+          },
+          202
+        );
+      }
+
+      return c.json(status, 200);
+    } catch (error) {
+      console.error(`Failed to get payment status for ${intentId}:`, error);
+      return c.json(
+        {
+          error: "Failed to retrieve payment status",
+          message:
+            error instanceof Error ? error.message : "Unknown server error",
+        },
+        500
+      );
+    }
+  })
+  .get(
+    "/invitation/:invitationId",
+    zValidator(
+      "param",
+      z.object({
+        invitationId: z.string().min(1),
+      })
+    ),
+    async (c) => {
+      try {
+        const { invitationId } = c.req.valid("param");
+
+        const invitationData = await db
+          .select({
+            id: invitation.id,
+            email: invitation.email,
+            role: invitation.role,
+            status: invitation.status,
+            organizationId: invitation.organizationId,
+            organizationName: organization.name,
+            inviterName: user.name,
+            inviterEmail: user.email,
+          })
+          .from(invitation)
+          .innerJoin(
+            organization,
+            eq(invitation.organizationId, organization.id)
+          )
+          .innerJoin(user, eq(invitation.inviterId, user.id))
+          .where(eq(invitation.id, invitationId))
+          .limit(1);
+
+        if (!invitationData || invitationData.length === 0) {
+          return c.json({ error: "Invitation not found" }, 404);
+        }
+
+        const invite = invitationData[0];
+
+        if (invite.status !== "pending") {
+          return c.json({ error: "Invitation is no longer pending" }, 400);
+        }
+
+        const roleDisplay = Array.isArray(invite.role)
+          ? invite.role
+              .map((r) => r.charAt(0).toUpperCase() + r.slice(1))
+              .join(", ")
+          : typeof invite.role === "string"
+            ? invite.role
+                .split(",")
+                .map((r) => r.charAt(0).toUpperCase() + r.slice(1))
+                .join(", ")
+            : "Member";
+
+        return c.json({
+          organizationName: invite.organizationName,
+          role: roleDisplay,
+          inviterName: invite.inviterName || invite.inviterEmail,
+          email: invite.email,
+        });
+      } catch (error) {
+        console.error("Error fetching invitation info:", error);
+        return c.json({ error: "Internal server error" }, 500);
+      }
+    }
+  )
   .post("/webhook-dodo/:merchant_id", async (c) => {
     const merchantId = c.req.param("merchant_id");
     console.log("Received Dodo webhook for merchant", merchantId);
@@ -2236,6 +2458,19 @@ export const publicRoute: Hono = new Hono()
         subscriptionId: webhookPayload.data?.subscription_id,
         status: webhookPayload.data?.status,
       });
+
+      // IDEMPOTENCY CHECK: Prevent duplicate webhook processing
+      const dodoPaymentId = webhookPayload.data?.payment_id;
+      if (dodoPaymentId) {
+        const shouldProcess = await checkWebhookIdempotency(
+          "dodo",
+          merchantId,
+          dodoPaymentId
+        );
+        if (!shouldProcess) {
+          return c.json({ received: true, duplicate: true }, 200);
+        }
+      }
 
       if (
         webhookPayload.type !== "payment.succeeded" &&
@@ -2264,6 +2499,15 @@ export const publicRoute: Hono = new Hono()
       if (!payment) {
         console.error(
           `No Lumen payment ID found for Dodo payment metadata. Dodo payment ID: ${dodoPayment.payment_id}`
+        );
+        return c.json({ received: true });
+      }
+
+      // Verify this webhook is for the correct merchant
+      // This prevents processing webhooks sent to stale/incorrect endpoints
+      if (payment.merchantId !== merchantId) {
+        console.log(
+          `Dodo webhook merchant mismatch: payment belongs to ${payment.merchantId}, but webhook was sent to ${merchantId}. Ignoring.`
         );
         return c.json({ received: true });
       }
@@ -2358,19 +2602,29 @@ export const publicRoute: Hono = new Hono()
           );
         }
 
-        // Only post-process paid events that produced an invoice (non-setup, non-payment-link)
-        const shouldPostProcess =
-          !isCheckoutSession && !isTrial && amountCents > 0;
+        // Post-process Dodo payments to fetch invoice PDF and update tax info
+        // This applies to all paid invoices except trials and zero-amount payments
+        const shouldPostProcess = !isTrial && amountCents > 0;
         if (shouldPostProcess) {
           // Get the updated payment record to ensure we have the invoice ID
           payment = await db.query.payments.findFirst({
             where: eq(payments.id, payment.id),
           });
 
-          if (!payment?.invoiceId) {
+          if (!payment) {
+            console.warn(
+              "Dodo payment record not found during post-processing"
+            );
+            return c.json({ received: true });
+          }
+
+          // For checkout sessions, invoice ID might be in metadata
+          const invoiceId = payment.invoiceId || payment.metadata?.invoice_id;
+
+          if (!invoiceId) {
             console.warn(
               "Dodo payment succeeded without invoiceId; skipping post-processing",
-              { paymentId: payment?.id }
+              { paymentId: payment.id }
             );
             return c.json({ received: true });
           }
@@ -2379,7 +2633,7 @@ export const publicRoute: Hono = new Hono()
           await postProcessDodoPayment({
             dodoPayment,
             paymentId: payment.id,
-            invoiceId: payment.invoiceId,
+            invoiceId: invoiceId,
             merchantId,
           });
         }
@@ -2459,7 +2713,7 @@ export const publicRoute: Hono = new Hono()
 
     // If you call c.req.text() later in the code, stripe webhook verification will fail
     const rawBody = await c.req.text();
-    const event = (await c.req.json()) as Stripe.Event;
+    let event = (await c.req.json()) as Stripe.Event;
 
     if (supportedEventTypes.some((type) => event.type.startsWith(type))) {
       const message = `Received Stripe webhook for merchant ${merchantId}: Processing supported event type: ${event.type} status=${(event.data.object as SupportedEvent).status}, id=${(event.data.object as SupportedEvent).id}`;
@@ -2498,7 +2752,47 @@ export const publicRoute: Hono = new Hono()
       if (!isVerified) {
         const errorMessage = `Webhook verification failed for event ${event.id}`;
         console.error(errorMessage);
-        return c.json({ error: errorMessage }, 400);
+        // Attempt auto-heal of Stripe webhook to keep things hands-off
+        try {
+          await attemptAutoRecreateStripeWebhook({
+            merchantId,
+            paymentProvider,
+            stripeClient,
+          });
+        } catch (healErr) {
+          console.error(
+            `Auto-heal attempt failed for merchant ${merchantId}:`,
+            healErr
+          );
+        }
+        // Robust fallback: fetch the canonical event from Stripe and proceed
+        try {
+          const fetched = await stripeClient.events.retrieve(event.id);
+          if (fetched && fetched.id === event.id) {
+            event = fetched as Stripe.Event;
+            console.log(
+              `Recovered webhook event ${event.id} via Stripe API after verification failure`
+            );
+          } else {
+            return c.json({ error: errorMessage }, 400);
+          }
+        } catch (fetchErr) {
+          console.error(
+            `Failed to fetch event ${event.id} from Stripe after verification failure:`,
+            fetchErr
+          );
+          return c.json({ error: errorMessage }, 400);
+        }
+      }
+
+      // IDEMPOTENCY CHECK: Prevent duplicate webhook processing
+      const shouldProcess = await checkWebhookIdempotency(
+        "stripe",
+        merchantId,
+        event.id
+      );
+      if (!shouldProcess) {
+        return c.json({ received: true, duplicate: true }, 200);
       }
 
       const obj = event.data.object as SupportedEvent;
@@ -2556,6 +2850,15 @@ export const publicRoute: Hono = new Hono()
         const errorMessage = `Payment not found for externalPaymentId: ${obj.id}, lumenPaymentId: ${lumenPaymentId}`;
         console.error(errorMessage);
         return c.json({ error: errorMessage }, 404);
+      }
+
+      // Verify this webhook is for the correct merchant
+      // Defense-in-depth: prevents processing payments belonging to different merchants
+      if (payment.merchantId !== merchantId) {
+        console.log(
+          `Stripe webhook merchant mismatch: payment belongs to ${payment.merchantId}, but webhook was sent to ${merchantId}. Ignoring.`
+        );
+        return c.json({ received: true });
       }
 
       if (!payment?.metadata) {
@@ -2655,10 +2958,16 @@ export const publicRoute: Hono = new Hono()
         }
       }
 
-      // Send event notification to connected clients
+      // Send event notification to connected clients across all instances
       const sseLookupId = getSSELookupIdFromEvent(event);
       if (sseLookupId) {
-        sendEventToSSEClient(sseLookupId, broadcastData);
+        const publishResult = await publishSSEEvent(sseLookupId, broadcastData);
+        console.log("SSE publish result", {
+          intentId: sseLookupId,
+          deliveredLocally: publishResult.deliveredLocally,
+          publishedToRedis: publishResult.publishedToRedis,
+          cachedInRedis: publishResult.cachedInRedis,
+        });
       } else {
         console.log(
           `Webhook event type ${event.type} not configured for SSE broadcast or ID not found.`
@@ -3043,6 +3352,33 @@ export const publicRoute: Hono = new Hono()
         }
 
         console.log("Customer in payment-init:", customer);
+
+        // Check for existing active subscription before initiating payment
+        // This prevents duplicate subscriptions when frontend doesn't have subscription check enabled
+        const existingActiveSubscription =
+          await getActiveSubscriptionForCustomer(
+            apiKeyData.merchantId,
+            customer.id,
+            tx
+          );
+
+        if (
+          existingActiveSubscription &&
+          existingActiveSubscription.planId === data.planId
+        ) {
+          return {
+            error: `You already have an active subscription to this plan (${plan.planName}). Please manage the existing subscription to change billing frequency.`,
+            code: 409,
+            existingSubscription: {
+              stableSubscriptionId:
+                existingActiveSubscription.stableSubscriptionId,
+              planId: existingActiveSubscription.planId,
+              planName: plan.planName,
+              status: existingActiveSubscription.status,
+            },
+          };
+        }
+
         if (!customer.pspCustomerId) {
           if (paymentProvider.isPaymentProviderReady) {
             console.log(
@@ -3410,51 +3746,80 @@ export const publicRoute: Hono = new Hono()
           });
         } else {
           // Pure free plan with no billing potential - create subscription directly
-          console.log("Creating subscription directly for pure free plan");
-
-          const [result, statusCode] = await createFreeSubscriptionForUser(
-            {
-              merchantId: apiKeyData.merchantId,
-              userId: data.userId,
-              customerEmail: data.customerEmail,
-              customerName: data.customerName,
-              billingAddressLine1: data.customerAddress,
-              billingAddressLine2: data.customerAddressLine2,
-              billingCity: data.customerCity,
-              billingPostalCode: data.customerZip,
-              billingCountry: data.customerCountry,
-              taxId: data.taxId,
-            },
-            tx
+          // using the explicitly requested plan and price (not auto-discovered)
+          console.log(
+            `Creating subscription directly for pure free plan: ${plan.id} with price: ${price.id}`
           );
 
-          if (statusCode !== 200) {
+          const { subscription, creditGrants } = await createSubscriptionCore({
+            merchantId: apiKeyData.merchantId,
+            customerId: customer.id,
+            planId: plan.id,
+            effectivePriceId: price.id,
+            startTimestamp: new Date(),
+            paymentMethodId: undefined, // No payment method needed for free plans
+            dangerouslyAllowMultipleSubscriptions: true,
+            tx,
+          });
+
+          if (!subscription) {
             return {
-              ...result,
-              code: statusCode,
+              error: "Failed to create subscription",
+              code: 500,
             };
           }
 
-          console.log("Free subscription created successfully", result);
-          // At this point we know it's a success result but we need this to make TS happy
-          if (
-            "message" in result &&
-            "subscription" in result &&
-            "credit_grants_created" in result
-          ) {
+          // Get the complete subscription with features
+          const subscriptionWithFeatures =
+            await tx.query.subscriptions.findFirst({
+              where: eq(subscriptions.id, subscription.id),
+              with: {
+                customer: true,
+                plan: true,
+                price: true,
+                subscriptionFeatures: {
+                  where: isNull(subscriptionFeatures.deletedAt),
+                  with: {
+                    feature: true,
+                  },
+                },
+                subscriptionDetails: true,
+              },
+            });
+
+          if (!subscriptionWithFeatures) {
             return {
-              message: result.message,
-              subscription_id: result.subscription.id,
-              invoice_id: result.invoice?.id, // Free subscriptions don't generate invoices
-              credit_grants_created: result.credit_grants_created,
-              plan: result.plan, // Include plan details for consistency with createFreeSubscriptionForUser
+              error: "Failed to retrieve created subscription",
+              code: 500,
             };
           }
 
-          // This should never happen
+          const invoice = await generateImmediateInvoice({
+            merchantId: apiKeyData.merchantId,
+            customerId: customer.id,
+            subscription,
+            price,
+            subscriptionDetailsRecords:
+              subscriptionWithFeatures.subscriptionDetails,
+            firstBillingPeriodStart: new Date(),
+            tx,
+            taxInfo: undefined,
+          });
+
+          console.log(
+            `Free subscription created successfully: ${subscription.id} for plan ${plan.planName}`
+          );
+
           return {
-            error: "Unexpected response format",
-            code: 500,
+            message: "Free subscription created successfully",
+            subscription_id: subscription.id,
+            invoice_id: invoice?.id,
+            credit_grants_created: creditGrants.grantCount,
+            plan: {
+              id: plan.id,
+              name: plan.planName,
+              description: plan.planDescription,
+            },
           };
         }
       });
@@ -3474,4 +3839,197 @@ export const publicRoute: Hono = new Hono()
         500
       );
     }
-  });
+  })
+  .get(
+    "/payment-link/:paymentId",
+    zValidator(
+      "param",
+      z.object({
+        paymentId: createPrefixValidator(
+          ID_PREFIXES.payment,
+          "Invalid payment ID"
+        )(z.string()),
+      })
+    ),
+    async (c) => {
+      /**
+       * Dynamic Payment Link Endpoint
+       *
+       * This endpoint solves the problem of Stripe checkout sessions expiring after 24 hours.
+       * Instead of returning direct checkout session URLs to customers, we return a link to this endpoint.
+       * When the customer clicks the link, we:
+       * 1. Look up the payment and validate it's still pending
+       * 2. Create a fresh checkout session on-demand
+       * 3. Redirect to the new checkout session URL
+       *
+       * This ensures payment links never expire, as we generate a new checkout session each time.
+       */
+      try {
+        const { paymentId } = c.req.valid("param");
+
+        console.log(`Dynamic payment link accessed for payment: ${paymentId}`);
+
+        // Create a fresh checkout session for this payment
+        const { checkoutSessionUrl } = await createCheckoutSessionForPayment({
+          paymentId,
+        });
+
+        console.log(
+          `Redirecting to fresh checkout session: ${checkoutSessionUrl}`
+        );
+
+        // Redirect the customer to the fresh checkout session
+        return c.redirect(checkoutSessionUrl, 302);
+      } catch (error) {
+        console.error("Error in dynamic payment link:", error);
+
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error occurred";
+
+        if (errorMessage.includes("status: succeeded")) {
+          return c.html(
+            `
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Invoice Already Paid</title>
+              <style>
+                body {
+                  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                  display: flex;
+                  justify-content: center;
+                  align-items: center;
+                  min-height: 100vh;
+                  margin: 0;
+                  background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+                }
+                .container {
+                  background: white;
+                  padding: 3rem;
+                  border-radius: 12px;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                  max-width: 500px;
+                  text-align: center;
+                }
+                .success-icon {
+                  font-size: 4rem;
+                  margin-bottom: 1rem;
+                }
+                h1 {
+                  color: #38a169;
+                  margin-bottom: 1rem;
+                }
+                p {
+                  color: #4a5568;
+                  line-height: 1.6;
+                  margin-bottom: 1.5rem;
+                }
+                .success-details {
+                  background: #c6f6d5;
+                  border-left: 4px solid #38a169;
+                  padding: 1rem;
+                  margin: 1.5rem 0;
+                  text-align: center;
+                  font-size: 0.95rem;
+                  color: #22543d;
+                  font-weight: 500;
+                }
+                .help-text {
+                  font-size: 0.9rem;
+                  color: #718096;
+                  margin-top: 2rem;
+                }
+              </style>
+            </head>
+            <body>
+              <div class="container">
+                <div class="success-icon">✓</div>
+                <h1>Invoice Already Paid</h1>
+                <p>Good news! This invoice has already been paid successfully.</p>
+                <div class="success-details">
+                  Payment completed
+                </div>
+                <p class="help-text">
+                  If you have any questions about this payment, please contact the merchant.
+                </p>
+              </div>
+            </body>
+            </html>
+            `,
+            200
+          );
+        }
+
+        return c.html(
+          `
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Payment Link Error</title>
+            <style>
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+              }
+              .container {
+                background: white;
+                padding: 3rem;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                max-width: 500px;
+                text-align: center;
+              }
+              h1 {
+                color: #e53e3e;
+                margin-bottom: 1rem;
+              }
+              p {
+                color: #4a5568;
+                line-height: 1.6;
+                margin-bottom: 1.5rem;
+              }
+              .error-details {
+                background: #fed7d7;
+                border-left: 4px solid #e53e3e;
+                padding: 1rem;
+                margin: 1.5rem 0;
+                text-align: left;
+                font-size: 0.9rem;
+                color: #742a2a;
+              }
+              .help-text {
+                font-size: 0.9rem;
+                color: #718096;
+                margin-top: 2rem;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>Payment Link Error</h1>
+              <p>We encountered an issue while processing your payment link.</p>
+              <div class="error-details">
+                ${errorMessage}
+              </div>
+              <p class="help-text">
+                This payment link may have already been used or is no longer valid.
+                Please contact the merchant if you need assistance.
+              </p>
+            </div>
+          </body>
+          </html>
+          `,
+          500
+        );
+      }
+    }
+  );

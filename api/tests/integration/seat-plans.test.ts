@@ -620,8 +620,8 @@ describe("Seat-Based Plans Integration Tests", () => {
 
     const customer = createdCustomers[0];
 
-    // Find the created subscription
-    const createdSubscriptions = await db
+    // Find the created subscription (poll to avoid CI race with webhook processing)
+    let createdSubscriptions = await db
       .select()
       .from(subscriptions)
       .where(
@@ -633,9 +633,25 @@ describe("Seat-Based Plans Integration Tests", () => {
       );
 
     if (createdSubscriptions.length !== 1) {
-      throw new Error(
-        `Expected 1 subscription, found ${createdSubscriptions.length}`
-      );
+      const deadline = Date.now() + 8000; // allow up to 8s in slow CI
+      while (createdSubscriptions.length === 0 && Date.now() < deadline) {
+        await sleep(250);
+        createdSubscriptions = await db
+          .select()
+          .from(subscriptions)
+          .where(
+            and(
+              eq(subscriptions.merchantId, merchantId),
+              eq(subscriptions.customerId, customer.id),
+              isNull(subscriptions.deletedAt)
+            )
+          );
+      }
+      if (createdSubscriptions.length !== 1) {
+        throw new Error(
+          `Expected 1 subscription, found ${createdSubscriptions.length}`
+        );
+      }
     }
 
     const subscription = createdSubscriptions[0];

@@ -208,6 +208,16 @@ interface PlanCreditDefinition {
   renewOnBilling: boolean | null;
   featureId: string | null;
   planId: string | null;
+  // Top-up configuration
+  enableTopups?: boolean;
+  topupPricePerCreditCents?: number | null;
+  topupMinQuantity?: number | null;
+  topupMaxQuantity?: number | null;
+  // Overage configuration
+  allowOverage?: boolean;
+  overagePricePerCreditCents?: number | null;
+  overageMaxAmount?: number | null;
+  overageMaxType?: "amount" | "percent" | null;
 }
 
 interface SubscriptionDetail {
@@ -566,6 +576,19 @@ const getStatusIcon = (status: string) => {
     default:
       return <AlertCircle className="w-4 h-4" />;
   }
+};
+
+const formatStatusLabel = (status?: string) => {
+  if (!status) return "";
+  return status
+    .split(/[_\s]+/)
+    .map((part) =>
+      part.length > 0
+        ? part[0].toUpperCase() + part.slice(1).toLowerCase()
+        : ""
+    )
+    .filter(Boolean)
+    .join(" ");
 };
 
 // Helper function to format credit status with colors (matching subscription list page)
@@ -1806,7 +1829,7 @@ export default function SubscriptionDetailsPage() {
           </CardHeader>
           <CardContent>
             <Badge className={getStatusColor(status)}>
-              {status.charAt(0).toUpperCase() + status.slice(1)}
+              {formatStatusLabel(status)}
             </Badge>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1956,9 +1979,21 @@ export default function SubscriptionDetailsPage() {
             </CardHeader>
             <CardContent className="space-y-4">
               <div>
-                <p className="text-sm font-medium text-muted-foreground">
-                  Plan
-                </p>
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-muted-foreground">
+                    Plan
+                  </p>
+                  <Link href={`/plans/${subscription.plan.stablePlanId}`}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex items-center gap-1"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                      View Plan
+                    </Button>
+                  </Link>
+                </div>
                 <p className="text-lg font-semibold">
                   {subscription.plan.planName}
                 </p>
@@ -2109,6 +2144,87 @@ export default function SubscriptionDetailsPage() {
                               {creditDef.description && (
                                 <div className="text-xs mt-1.5 opacity-75 leading-relaxed">
                                   {creditDef.description}
+                                </div>
+                              )}
+
+                              {/* Top-up or Overage Details */}
+                              {(creditDef.enableTopups || creditDef.allowOverage) && (
+                                <div className="mt-3 pt-3 border-t border-current border-opacity-10 text-sm">
+                                  {creditDef.enableTopups ? (
+                                    <div>
+                                      <div className="font-semibold mb-1 flex items-center gap-1.5">
+                                        <div className="p-1 rounded bg-white bg-opacity-40">
+                                          <CreditCard className="h-3 w-3" />
+                                        </div>
+                                        On-demand Top-ups Available
+                                      </div>
+                                      <div className="text-xs opacity-90 space-y-0.5 pl-6">
+                                        <div className="flex justify-between">
+                                          <span>Price:</span>
+                                          <span className="font-medium">
+                                            {formatCurrency(
+                                              creditDef.topupPricePerCreditCents ||
+                                                0,
+                                              creditDef.currency || "USD"
+                                            )}{" "}
+                                            per credit
+                                          </span>
+                                        </div>
+                                        {creditDef.topupMinQuantity && (
+                                          <div className="flex justify-between">
+                                            <span>Min purchase:</span>
+                                            <span className="font-medium">
+                                              {creditDef.topupMinQuantity}{" "}
+                                              credits
+                                            </span>
+                                          </div>
+                                        )}
+                                        {creditDef.topupMaxQuantity && (
+                                          <div className="flex justify-between">
+                                            <span>Max purchase:</span>
+                                            <span className="font-medium">
+                                              {creditDef.topupMaxQuantity}{" "}
+                                              credits
+                                            </span>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ) : creditDef.allowOverage ? (
+                                    <div>
+                                      <div className="font-semibold mb-1 flex items-center gap-1.5">
+                                        <div className="p-1 rounded bg-white bg-opacity-40">
+                                          <Activity className="h-3 w-3" />
+                                        </div>
+                                        Overage Billing Enabled
+                                      </div>
+                                      <div className="text-xs opacity-90 space-y-0.5 pl-6">
+                                        <div className="flex justify-between">
+                                          <span>Price:</span>
+                                          <span className="font-medium">
+                                            {formatCurrency(
+                                              creditDef.overagePricePerCreditCents ||
+                                                0,
+                                              creditDef.currency || "USD"
+                                            )}{" "}
+                                            per credit
+                                          </span>
+                                        </div>
+                                        {creditDef.overageMaxAmount && (
+                                          <div className="flex justify-between">
+                                            <span>Limit:</span>
+                                            <span className="font-medium">
+                                              Max {creditDef.overageMaxAmount}
+                                              {creditDef.overageMaxType ===
+                                              "percent"
+                                                ? "% of allowance"
+                                                : " credits"}
+                                            </span>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ) : null}
                                 </div>
                               )}
                             </div>
@@ -2910,19 +3026,11 @@ export default function SubscriptionDetailsPage() {
                                     <div className="font-medium">
                                       {grant.applicationType === "monetary"
                                         ? formatCurrencyLocal(
-                                            grant.initialAmount,
+                                            grant.remainingAmount,
                                             grant.currency
                                           )
-                                        : grant.initialAmount.toLocaleString()}
+                                        : grant.remainingAmount.toLocaleString()}
                                     </div>
-                                    {grant.status === "ACTIVE" &&
-                                      grant.remainingAmount !==
-                                        grant.initialAmount && (
-                                        <div className="text-xs text-muted-foreground">
-                                          {grant.remainingAmount.toLocaleString()}{" "}
-                                          remaining
-                                        </div>
-                                      )}
                                   </TableCell>
                                   <TableCell>
                                     <div className="text-sm">

@@ -7,7 +7,8 @@ import {
   PageTitleProvider,
   usePageTitle,
 } from "@/components/dashboard/page-title-context";
-import { useSession } from "@/lib/auth-client";
+import { useSession, getSession } from "@/lib/auth-client";
+import type { EnhancedSession } from "@lumen/common";
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { useCookieConsent } from "@/lib/cookie-consent-context";
@@ -79,28 +80,50 @@ function LocaleWrapper({ children }: { children: React.ReactNode }) {
 }
 
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
-  const { data: session, isPending } = useSession();
+  const { data, isPending } = useSession();
+  const session = (data as unknown as EnhancedSession) || null;
   const router = useRouter();
   const { autoConsentOnLogin } = useCookieConsent();
 
   useEffect(() => {
-    if (!isPending && !session?.user) {
-      router.replace("/login");
-    }
-    if (
-      !isPending &&
-      session?.user &&
-      // TODO: auto-create merchant ID, not in Stripe onboarding flow
-      !session?.merchant?.id
-    ) {
-      router.replace("/onboarding");
-    }
+    let cancelled = false;
+    const ensureMerchantAndMaybeRedirect = async () => {
+      if (isPending) return;
+      if (!session?.user) {
+        router.replace("/login");
+        return;
+      }
+      if (!session?.merchant?.id) {
+        try {
+          const { data: freshData } = await getSession({
+            query: { disableCookieCache: true },
+          });
+          const fresh = (freshData as unknown as EnhancedSession) || null;
+          if (!cancelled && !fresh?.merchant?.id) {
+            router.replace("/onboarding");
+            return;
+          }
+        } catch {
+          if (!cancelled) router.replace("/onboarding");
+          return;
+        }
+      }
 
-    // Auto-consent to cookies when user is logged in and using the dashboard
-    if (!isPending && session?.user) {
-      autoConsentOnLogin();
-    }
-  }, [session, isPending, router, autoConsentOnLogin]);
+      if (!cancelled) {
+        autoConsentOnLogin();
+      }
+    };
+    ensureMerchantAndMaybeRedirect();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    session?.user,
+    session?.merchant?.id,
+    isPending,
+    router,
+    autoConsentOnLogin,
+  ]);
 
   // Show loading state while checking authentication
   if (isPending) {

@@ -55,7 +55,7 @@ const subscriptionFeatureOverridesSchema = z.object({
   featureIds: z.array(z.string()).optional(),
 });
 
-const deleteSubscription = async (
+export const deleteSubscription = async (
   merchantId: string,
   stableSubscriptionId: string
 ) => {

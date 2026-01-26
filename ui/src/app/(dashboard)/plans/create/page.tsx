@@ -18,6 +18,7 @@ import { randomPlan } from "@/lib/random";
 import { Badge } from "@/components/ui/badge";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
 // Feature interface
 export interface FeatureData {
@@ -31,6 +32,13 @@ export interface FeatureData {
   hasCreditAllowance?: boolean;
   // Trial-specific credit allowance
   trialCreditAllowance?: number;
+  // Top-up configuration
+  enableTopups?: boolean;
+  topupPricePerCreditCents?: number;
+  topupMinQuantity?: number;
+  topupMaxQuantity?: number;
+  topupExpiryBehavior?: "billing_cycle" | "custom_days" | "never";
+  topupCustomExpiryDays?: number;
   // New fields for existing features
   isExisting?: boolean;
   existingFeatureId?: string;
@@ -93,6 +101,12 @@ const generateSlugFromName = (name: string): string => {
     .replace(/\s+/g, "-");
 };
 
+const formatCurrency = (amount: number, currency: string) =>
+  new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: currency.toUpperCase(),
+  }).format(amount);
+
 const handleAddFeature = (field: {
   pushValue: (value: FeatureData) => void;
 }) => {
@@ -106,6 +120,13 @@ const handleAddFeature = (field: {
     creditAllowanceAmount: 0,
     creditAllowanceRenewal: "monthly",
     trialCreditAllowance: 0,
+    // Top-up defaults
+    enableTopups: false,
+    topupPricePerCreditCents: undefined,
+    topupMinQuantity: 1,
+    topupMaxQuantity: undefined,
+    topupExpiryBehavior: "billing_cycle",
+    topupCustomExpiryDays: undefined,
   });
 };
 
@@ -162,6 +183,11 @@ export default function CreatePlanPage() {
     },
     onSubmit: async ({ value }) => {
       try {
+        console.log(
+          "Plan creation - value.features:",
+          JSON.stringify(value.features, null, 2)
+        );
+
         // Create the plan with all associated data in a single API call
         const planResponse = await apiClient.plans.$post({
           json: {
@@ -218,13 +244,18 @@ export default function CreatePlanPage() {
 
         const planData = await planResponse.json();
         if ("error" in planData) {
+          toast.error(planData.error);
           throw new Error(planData.error);
         }
 
         const plan = planData.plans[0];
+        toast.success("Plan created successfully");
         router.push(`/plans/${plan.id}`);
       } catch (error) {
         console.error("Error creating plan:", error);
+        if (error instanceof Error) {
+          toast.error(error.message || "Failed to create plan");
+        }
         throw error;
       }
     },
@@ -300,6 +331,12 @@ export default function CreatePlanPage() {
       },
     },
   });
+
+  // Keep currency in sync with session's merchant default currency
+  useEffect(() => {
+    const currency = session?.merchant?.defaultCurrency || "USD";
+    form.setFieldValue("currency", currency);
+  }, [session?.merchant?.defaultCurrency, form]);
 
   // Watch form values using useStore for reactive preview
   const formValues = useStore(form.store, (state) => state.values);
@@ -476,6 +513,13 @@ export default function CreatePlanPage() {
           creditAllowanceAmount: 0,
           creditAllowanceRenewal: "monthly",
           trialCreditAllowance: 0,
+          // Top-up defaults
+          enableTopups: false,
+          topupPricePerCreditCents: undefined,
+          topupMinQuantity: 1,
+          topupMaxQuantity: undefined,
+          topupExpiryBehavior: "billing_cycle",
+          topupCustomExpiryDays: undefined,
         };
         form.setFieldValue("features", [...currentFeatures, newFeature]);
       }
@@ -816,20 +860,30 @@ export default function CreatePlanPage() {
                     {hasYearlyPrice && (
                       <form.AppField
                         name="yearlyPrice"
-                        children={(field) => (
-                          <field.Number2DecimalsField
-                            label={
-                              isSeatBased
-                                ? "Price per seat per year (per month)"
-                                : "Yearly Price (per month)"
-                            }
-                            subtitle={
-                              isSeatBased
-                                ? "This will be multiplied by 12 and billed yearly per seat"
-                                : "This will be multiplied by 12 and billed yearly"
-                            }
-                          />
-                        )}
+                        children={(field) => {
+                          const yearlyTotal = (field.state.value || 0) * 12;
+                          const formattedYearly = yearlyTotal > 0
+                            ? formatCurrency(yearlyTotal / 100, defaultCurrency)
+                            : null;
+                          return (
+                            <field.Number2DecimalsField
+                              label={
+                                isSeatBased
+                                  ? "Price per seat per year (per month)"
+                                  : "Yearly Price (per month)"
+                              }
+                              subtitle={
+                                formattedYearly
+                                  ? isSeatBased
+                                    ? `${formattedYearly}/year per seat`
+                                    : `${formattedYearly}/year`
+                                  : isSeatBased
+                                    ? "This will be multiplied by 12 and billed yearly per seat"
+                                    : "This will be multiplied by 12 and billed yearly"
+                              }
+                            />
+                          );
+                        }}
                       />
                     )}
                   </div>
@@ -1246,6 +1300,322 @@ export default function CreatePlanPage() {
                             }
                           </form.AppField>
 
+                          {/* Overage Handling - mutually exclusive choice between top-ups and usage pricing */}
+                          <form.AppField
+                            name={`features[${index}].hasCreditAllowance`}
+                          >
+                            {(creditField) =>
+                              creditField.state.value && (
+                                <div className="space-y-3">
+                                  <Label className="text-sm font-medium">
+                                    When credits run out
+                                  </Label>
+                                  <p className="text-xs text-muted-foreground -mt-1">
+                                    Choose how to handle usage after the credit allowance is exhausted
+                                  </p>
+
+                                  {/* Option selector */}
+                                  <div className="grid grid-cols-1 gap-3">
+                                    {/* Option 1: Block access (no overage) */}
+                                    <form.AppField name={`features[${index}].enableTopups`}>
+                                      {(topupField) => (
+                                        <form.AppField name={`features[${index}].usagePricePerUnit`}>
+                                          {(usageField) => {
+                                            const hasTopups = topupField.state.value;
+                                            const hasUsagePrice = usageField.state.value && usageField.state.value > 0;
+                                            const isBlockAccess = !hasTopups && !hasUsagePrice;
+
+                                            return (
+                                              <>
+                                                {/* Block Access Option */}
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    topupField.handleChange(false);
+                                                    usageField.handleChange(undefined);
+                                                  }}
+                                                  className={`w-full text-left p-4 rounded-lg border-2 transition-all ${
+                                                    isBlockAccess
+                                                      ? "border-blue-500 bg-blue-50"
+                                                      : "border-gray-200 hover:border-gray-300 bg-white"
+                                                  }`}
+                                                >
+                                                  <div className="flex items-start gap-3">
+                                                    <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center ${
+                                                      isBlockAccess ? "border-blue-500" : "border-gray-300"
+                                                    }`}>
+                                                      {isBlockAccess && <div className="w-2 h-2 rounded-full bg-blue-500" />}
+                                                    </div>
+                                                    <div className="flex-1">
+                                                      <div className="font-medium text-sm">Block access</div>
+                                                      <div className="text-xs text-muted-foreground mt-0.5">
+                                                        Users cannot use more than their credit allowance
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                </button>
+
+                                                {/* On-Demand Top-ups Option */}
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    topupField.handleChange(true);
+                                                    usageField.handleChange(undefined);
+                                                  }}
+                                                  className={`w-full text-left p-4 rounded-lg border-2 transition-all ${
+                                                    hasTopups
+                                                      ? "border-purple-500 bg-purple-50"
+                                                      : "border-gray-200 hover:border-gray-300 bg-white"
+                                                  }`}
+                                                >
+                                                  <div className="flex items-start gap-3">
+                                                    <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center ${
+                                                      hasTopups ? "border-purple-500" : "border-gray-300"
+                                                    }`}>
+                                                      {hasTopups && <div className="w-2 h-2 rounded-full bg-purple-500" />}
+                                                    </div>
+                                                    <div className="flex-1">
+                                                      <div className="font-medium text-sm">On-demand credit top-ups</div>
+                                                      <div className="text-xs text-muted-foreground mt-0.5">
+                                                        Users can purchase additional credits at a set price
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                </button>
+
+                                                {/* Usage-Based Billing Option */}
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    topupField.handleChange(false);
+                                                    // Set a default value to indicate usage pricing is selected
+                                                    if (!usageField.state.value) {
+                                                      usageField.handleChange(0);
+                                                    }
+                                                  }}
+                                                  className={`w-full text-left p-4 rounded-lg border-2 transition-all ${
+                                                    hasUsagePrice || (usageField.state.value === 0 && !hasTopups && !isBlockAccess)
+                                                      ? "border-orange-500 bg-orange-50"
+                                                      : "border-gray-200 hover:border-gray-300 bg-white"
+                                                  }`}
+                                                >
+                                                  <div className="flex items-start gap-3">
+                                                    <div className={`w-4 h-4 mt-0.5 rounded-full border-2 flex items-center justify-center ${
+                                                      hasUsagePrice || (usageField.state.value === 0 && !hasTopups && !isBlockAccess) ? "border-orange-500" : "border-gray-300"
+                                                    }`}>
+                                                      {(hasUsagePrice || (usageField.state.value === 0 && !hasTopups && !isBlockAccess)) && <div className="w-2 h-2 rounded-full bg-orange-500" />}
+                                                    </div>
+                                                    <div className="flex-1">
+                                                      <div className="font-medium text-sm">Usage-based billing (overage)</div>
+                                                      <div className="text-xs text-muted-foreground mt-0.5">
+                                                        Automatically charge per unit for usage beyond the allowance
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                </button>
+                                              </>
+                                            );
+                                          }}
+                                        </form.AppField>
+                                      )}
+                                    </form.AppField>
+                                  </div>
+
+                                  {/* Top-up Configuration Panel */}
+                                  <form.AppField name={`features[${index}].enableTopups`}>
+                                    {(topupField) =>
+                                      topupField.state.value && (
+                                        <div className="space-y-4 border rounded-lg p-4 bg-purple-50 border-purple-200 mt-2">
+                                          <div className="flex items-start space-x-3">
+                                            <div className="flex-shrink-0">
+                                              <div className="w-5 h-5 bg-purple-500 rounded-full flex items-center justify-center">
+                                                <span className="text-white text-xs font-bold">
+                                                  +
+                                                </span>
+                                              </div>
+                                            </div>
+                                            <div className="flex-1">
+                                              <h4 className="text-sm font-medium text-purple-900">
+                                                Credit Top-up Configuration
+                                              </h4>
+                                              <p className="text-sm text-purple-700 mt-1">
+                                                Configure how customers can
+                                                purchase additional credits when
+                                                they run out.
+                                              </p>
+                                            </div>
+                                          </div>
+
+                                          <form.AppField
+                                            name={`features[${index}].topupPricePerCreditCents`}
+                                          >
+                                            {(subField) => (
+                                              <subField.Number2DecimalsField
+                                                label="Price per credit"
+                                                subtitle={`${formatCurrency(
+                                                  (subField.state.value || 0) /
+                                                    100,
+                                                  defaultCurrency
+                                                )} per credit`}
+                                              />
+                                            )}
+                                          </form.AppField>
+
+                                          <div className="grid grid-cols-2 gap-4">
+                                            <form.AppField
+                                              name={`features[${index}].topupMinQuantity`}
+                                            >
+                                              {(subField) => (
+                                                <subField.NumberField
+                                                  label="Minimum purchase"
+                                                  subtitle="Minimum credits per purchase"
+                                                />
+                                              )}
+                                            </form.AppField>
+
+                                            <form.AppField
+                                              name={`features[${index}].topupMaxQuantity`}
+                                            >
+                                              {(subField) => (
+                                                <subField.NumberField
+                                                  label="Maximum purchase (optional)"
+                                                  subtitle="Maximum credits per purchase"
+                                                />
+                                              )}
+                                            </form.AppField>
+                                          </div>
+
+                                          <form.AppField
+                                            name={`features[${index}].topupExpiryBehavior`}
+                                          >
+                                            {(expiryField) => (
+                                              <div className="space-y-3">
+                                                <Label className="text-sm font-medium">
+                                                  When do purchased credits
+                                                  expire?
+                                                </Label>
+                                                <div className="flex bg-gray-100 border border-gray-200 rounded-lg p-0.5 mt-2 w-fit">
+                                                  <button
+                                                    type="button"
+                                                    className={`px-3 py-1 text-sm font-bold rounded-md transition-all ${
+                                                      expiryField.state
+                                                        .value ===
+                                                      "billing_cycle"
+                                                        ? "bg-white text-gray-900 shadow-sm border border-gray-200"
+                                                        : "text-gray-600 hover:text-gray-900 hover:bg-gray-50"
+                                                    }`}
+                                                    onClick={() => {
+                                                      expiryField.handleChange(
+                                                        "billing_cycle"
+                                                      );
+                                                    }}
+                                                  >
+                                                    Billing cycle
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    className={`px-3 py-1 text-sm font-bold rounded-md transition-all ${
+                                                      expiryField.state
+                                                        .value === "custom_days"
+                                                        ? "bg-white text-gray-900 shadow-sm border border-gray-200"
+                                                        : "text-gray-600 hover:text-gray-900 hover:bg-gray-50"
+                                                    }`}
+                                                    onClick={() => {
+                                                      expiryField.handleChange(
+                                                        "custom_days"
+                                                      );
+                                                    }}
+                                                  >
+                                                    Custom days
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    className={`px-3 py-1 text-sm font-bold rounded-md transition-all ${
+                                                      expiryField.state
+                                                        .value === "never"
+                                                        ? "bg-white text-gray-900 shadow-sm border border-gray-200"
+                                                        : "text-gray-600 hover:text-gray-900 hover:bg-gray-50"
+                                                    }`}
+                                                    onClick={() => {
+                                                      expiryField.handleChange(
+                                                        "never"
+                                                      );
+                                                    }}
+                                                  >
+                                                    Never
+                                                  </button>
+                                                </div>
+                                              </div>
+                                            )}
+                                          </form.AppField>
+
+                                          <form.AppField
+                                            name={`features[${index}].topupExpiryBehavior`}
+                                          >
+                                            {(expiryBehavior) =>
+                                              expiryBehavior.state.value ===
+                                                "custom_days" && (
+                                                <form.AppField
+                                                  name={`features[${index}].topupCustomExpiryDays`}
+                                                >
+                                                  {(subField) => (
+                                                    <subField.NumberField
+                                                      label="Days until expiry"
+                                                      subtitle="How many days until purchased credits expire"
+                                                    />
+                                                  )}
+                                                </form.AppField>
+                                              )
+                                            }
+                                          </form.AppField>
+                                        </div>
+                                      )
+                                    }
+                                  </form.AppField>
+
+                                  {/* Usage Price Configuration Panel */}
+                                  <form.AppField name={`features[${index}].usagePricePerUnit`}>
+                                    {(usageField) => {
+                                      const hasUsagePrice = usageField.state.value !== undefined;
+                                      const hasTopups = form.getFieldValue("features")?.[index]?.enableTopups;
+
+                                      return hasUsagePrice && !hasTopups ? (
+                                        <div className="space-y-4 border rounded-lg p-4 bg-orange-50 border-orange-200 mt-2">
+                                          <div className="flex items-start space-x-3">
+                                            <div className="flex-shrink-0">
+                                              <div className="w-5 h-5 bg-orange-500 rounded-full flex items-center justify-center">
+                                                <span className="text-white text-xs font-bold">
+                                                  $
+                                                </span>
+                                              </div>
+                                            </div>
+                                            <div className="flex-1">
+                                              <h4 className="text-sm font-medium text-orange-900">
+                                                Usage-Based Overage Pricing
+                                              </h4>
+                                              <p className="text-sm text-orange-700 mt-1">
+                                                Set the price charged per unit when users exceed their credit allowance.
+                                              </p>
+                                            </div>
+                                          </div>
+
+                                          <usageField.Number2DecimalsField
+                                            label="Price per unit"
+                                            subtitle={
+                                              usageField.state.value && usageField.state.value > 0
+                                                ? `${formatCurrency(usageField.state.value / 100, defaultCurrency)} per unit billed monthly`
+                                                : "Enter the price per unit for overage usage"
+                                            }
+                                          />
+                                        </div>
+                                      ) : null;
+                                    }}
+                                  </form.AppField>
+                                </div>
+                              )
+                            }
+                          </form.AppField>
+
                           {/* Trial Credit Allowance for usage-based features */}
                           <form.AppField
                             name={`features[${index}].isUsageBased`}
@@ -1291,25 +1661,6 @@ export default function CreatePlanPage() {
                             }
                           </form.AppField>
 
-                          {/* Usage price field for usage-based features */}
-                          <form.AppField
-                            name={`features[${index}].isUsageBased`}
-                          >
-                            {(toggleField) =>
-                              toggleField.state.value && (
-                                <form.AppField
-                                  name={`features[${index}].usagePricePerUnit`}
-                                >
-                                  {(subField) => (
-                                    <subField.Number2DecimalsField
-                                      label="Usage price per unit (billed monthly)"
-                                      subtitle="Leave empty if you don't want to charge per usage. Use credit allowances above to set how much your users can use"
-                                    />
-                                  )}
-                                </form.AppField>
-                              )
-                            }
-                          </form.AppField>
                         </div>
                       ))}
 

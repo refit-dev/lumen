@@ -21,6 +21,12 @@ export interface InvoiceItem {
   unitAmountCents: number;
 }
 
+export const getPaymentLinkFromNotes = (notes: string) => {
+  return (
+    notes.match(/https?:\/\/[^\s]*\/public\/payment-link\/[^\s]*/)?.[0] || null
+  );
+};
+
 export interface InvoiceData {
   invoiceNumber: string;
   customer?: CustomerFromApi;
@@ -199,20 +205,17 @@ const styles = StyleSheet.create({
 
 // Component to handle notes with special formatting for checkout links
 const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
-  // Check if notes contain a checkout link
-  const checkoutLinkMatch = notes.match(
-    /https:\/\/checkout\.stripe\.com\/[^\s]+/
-  );
+  // Check if notes contain a checkout link (Stripe or dynamic payment link)
+  const paymentLink = getPaymentLinkFromNotes(notes);
 
-  if (checkoutLinkMatch) {
-    const checkoutLink = checkoutLinkMatch[0];
-    const beforeLink = notes.substring(0, checkoutLinkMatch.index);
+  if (paymentLink) {
+    const beforeLink = notes.substring(0, notes.indexOf(paymentLink));
     const afterLink = notes.substring(
-      checkoutLinkMatch.index! + checkoutLink.length
+      notes.indexOf(paymentLink) + paymentLink.length
     );
 
     // Check if this is a payment completion note vs payment required note
-    const isPaid = notes.includes("Paid online via checkout session");
+    const isPaid = notes.includes("Paid online via payment link");
     const isPaymentRequired = notes.includes("Payment required:");
 
     if (isPaid) {
@@ -236,7 +239,7 @@ const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
               ✓ Payment Completed
             </Text>
             <Text style={{ fontSize: 9, color: "#15803d", marginTop: 2 }}>
-              This invoice was paid online via Stripe checkout.
+              This invoice was paid online via Payment Link.
             </Text>
           </View>
         </View>
@@ -270,7 +273,7 @@ const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
               Click the link below to pay this invoice securely online:
             </Text>
             <Link
-              src={checkoutLink}
+              src={paymentLink}
               style={{
                 backgroundColor: "#ffffff",
                 padding: 10,
@@ -298,12 +301,12 @@ const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
                   marginTop: 2,
                 }}
               >
-                Secure Stripe checkout
+                Secure online checkout
               </Text>
             </Link>
             <Text style={{ fontSize: 8, color: "#6b7280", marginTop: 6 }}>
-              This secure link will take you to Stripe's checkout page where you
-              can pay with a credit or debit card.
+              This secure link will take you to a checkout page where you can
+              pay with a credit or debit card.
             </Text>
           </View>
         </View>
@@ -317,7 +320,7 @@ const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
           </Text>
           <Text style={{ fontSize: 10 }}>{beforeLink}</Text>
           <Text style={{ fontSize: 9, color: "#1d4ed8", marginTop: 2 }}>
-            Payment link: {checkoutLink}
+            Payment link: {paymentLink}
           </Text>
           {afterLink && (
             <Text style={{ fontSize: 10, marginTop: 2 }}>{afterLink}</Text>
@@ -327,7 +330,7 @@ const NotesSection: React.FC<{ notes: string }> = ({ notes }) => {
     }
   }
 
-  // For notes without checkout links, render as plain text
+  // For notes without payment links, render as plain text
   return (
     <View style={{ marginBottom: 24 }}>
       <Text style={{ fontWeight: "bold", fontSize: 10, marginBottom: 2 }}>

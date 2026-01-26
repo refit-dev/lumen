@@ -18,3 +18,6 @@ export * from "./types";
 export * from "./db/utils";
 
 export * from "./pricing/transform";
+
+// Auth permissions (organization roles)
+export * from "./auth/permissions";

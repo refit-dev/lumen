@@ -3,7 +3,8 @@ import {
   createCoreNotificationProvider,
   type EmailAttachment,
 } from "./notificationCore";
-import { logger } from "./logging";
+import { getPaymentLinkFromNotes } from "@lumen/common/pdf";
+import { type PostgresDB } from "@lumen/common";
 
 export type InvoiceEmailOptions = {
   invoice: InvoiceCompleteAPI;
@@ -13,6 +14,9 @@ export type InvoiceEmailOptions = {
   nodeEnv?: "development" | "test" | "staging" | "production";
   resendApiKey?: string | null;
   slackWebhook?: string | null;
+  apiUrl?: string | null;
+  internalApiKey?: string | null;
+  db?: PostgresDB;
 };
 
 export type InvoiceEmailResult = {
@@ -71,13 +75,10 @@ function generateInvoiceEmailHtml(invoice: InvoiceCompleteAPI): string {
         ? "Credit Note"
         : "Invoice";
 
-  const paymentLinkMatch = invoice.notes?.match(
-    /https:\/\/checkout\.stripe\.com\/[^\s]+/
-  );
-  const paymentLink = paymentLinkMatch ? paymentLinkMatch[0] : null;
+  const paymentLink = getPaymentLinkFromNotes(invoice.notes || "");
   const isPaymentRequired = invoice.notes?.includes("Payment required:");
   const isPaymentCompleted = invoice.notes?.includes(
-    "Paid online via checkout session"
+    "Paid online via payment link"
   );
   const hasPaymentLink =
     paymentLink && (isPaymentRequired || isPaymentCompleted);
@@ -97,7 +98,7 @@ function generateInvoiceEmailHtml(invoice: InvoiceCompleteAPI): string {
             <strong>Thank you! Your payment has been successfully processed.</strong>
           </p>
           <p style="font-size: 14px; color: #16a34a; margin-bottom: 0;">
-            This invoice was paid online via Stripe checkout. No further action is required.
+            This invoice was paid online via Payment Link. No further action is required.
           </p>
         </div>
       `
@@ -143,6 +144,9 @@ export async function sendInvoiceEmail(
     nodeEnv,
     resendApiKey,
     slackWebhook,
+    apiUrl,
+    internalApiKey,
+    db,
   } = options;
 
   console.info(`Starting email sending for invoice ${invoice.id}`, {
@@ -150,6 +154,19 @@ export async function sendInvoiceEmail(
     customerEmail: invoice.customer?.email,
     invoiceNumber,
   });
+
+  const totalAmountCents = invoice.totalAmountCents ?? 0;
+  if (totalAmountCents === 0) {
+    console.info(
+      `Invoice ${invoice.id} has zero total amount, skipping customer email`
+    );
+    return {
+      success: true,
+      invoiceId: invoice.id,
+      customerEmail: invoice.customer?.email ?? undefined,
+      message: "Invoice email skipped - zero amount invoice",
+    };
+  }
 
   // Check if customer has email
   if (!invoice.customer?.email) {
@@ -180,6 +197,9 @@ export async function sendInvoiceEmail(
     nodeEnv: nodeEnv || "development",
     resendApiKey: resendApiKey || null,
     slackWebhook: slackWebhook || null,
+    apiUrl: apiUrl || null,
+    internalApiKey: internalApiKey || null,
+    db,
   });
 
   try {
@@ -268,6 +288,7 @@ export async function sendRefundNoticeEmail(params: {
   currency: string;
   originalInvoiceNumber?: string | null;
   reason?: string | null;
+  db?: PostgresDB;
 }): Promise<{ success: boolean; error?: string }> {
   const {
     to,
@@ -278,6 +299,7 @@ export async function sendRefundNoticeEmail(params: {
     currency,
     originalInvoiceNumber,
     reason,
+    db,
   } = params;
 
   try {
@@ -285,6 +307,7 @@ export async function sendRefundNoticeEmail(params: {
       nodeEnv: (process.env.NODE_ENV as any) || "development",
       resendApiKey: process.env.RESEND_API_KEY || null,
       slackWebhook: process.env.SLACK_WEBHOOK || null,
+      db,
     });
 
     const amount = (amountCents / 100).toFixed(2);

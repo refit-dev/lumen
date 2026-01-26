@@ -12,6 +12,7 @@ import {
 import { ContentfulStatusCode } from "hono/utils/http-status";
 import DodoPayments from "dodopayments";
 import { env } from "../env";
+import { requireOrgRole } from "../middleware/auth";
 
 const validateDodoKey = async (
   secretKey: string
@@ -171,6 +172,7 @@ export const dodoRouter = new Hono()
   })
   .post(
     "/validate-key",
+    requireOrgRole("owner"),
     zValidator(
       "json",
       z.object({
@@ -185,6 +187,7 @@ export const dodoRouter = new Hono()
   )
   .post(
     "/config",
+    requireOrgRole("owner"),
     zValidator(
       "json",
       z.object({
@@ -238,7 +241,10 @@ export const dodoRouter = new Hono()
               encryptedWebhookSecret = await encryptField("whsec_placeholder");
             } else {
               // Don't create webhook in development
-              const webhookUrl = `${env.API_URL}/v1/public/webhook-dodo/${merchantId}`;
+              const baseUrl = env.API_URL.endsWith("/v1")
+                ? env.API_URL
+                : `${env.API_URL}/v1`;
+              const webhookUrl = `${baseUrl}/public/webhook-dodo/${merchantId}`;
               const webhook = await client.webhooks.create({ url: webhookUrl });
               const { secret } = await client.webhooks.retrieveSecret(
                 webhook.id

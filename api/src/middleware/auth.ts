@@ -18,6 +18,7 @@ declare module "hono" {
       id: string;
     };
     triggerDev?: boolean; // Flag to indicate if the request is from Trigger.dev
+    memberRole?: string | null;
   }
 }
 
@@ -136,6 +137,11 @@ export const requireAuth: MiddlewareHandler = async (
         c.set("merchant", session.merchant);
       }
 
+      // Store member role if available
+      if (session.memberRole) {
+        c.set("memberRole", session.memberRole);
+      }
+
       // Block if no merchant is associated with the account
       if (
         !session.merchant &&
@@ -148,7 +154,9 @@ export const requireAuth: MiddlewareHandler = async (
         // This route is used to fetch the Dodo configuration so it needs to be accessible without a merchant
         !c.req.path.includes("dodo/validate-key") &&
         // This route is used to request access to Payment Providers before merchant is created
-        !c.req.path.includes("beta/request")
+        !c.req.path.includes("beta/request") &&
+        // Accepting an invitation should be allowed before merchant context exists
+        !c.req.path.includes("team/accept-invitation")
       ) {
         return c.json(
           { error: "Unauthorized. No merchant associated with this account" },
@@ -206,4 +214,70 @@ export const triggerAuth: MiddlewareHandler = async (
     console.error("Trigger.dev auth error:", error);
     return c.json({ error: "Internal server error" }, 500);
   }
+};
+
+/**
+ * Middleware to require specific organization role(s)
+ * Must be used after requireAuth middleware
+ *
+ * @param allowedRoles - Array of allowed roles, or single role string
+ * @returns Middleware handler
+ */
+export const requireOrgRole = (
+  allowedRoles: string | string[]
+): MiddlewareHandler => {
+  const requiredRoles = Array.isArray(allowedRoles)
+    ? allowedRoles
+    : [allowedRoles];
+  const allowWithoutOrgPaths = [
+    "/stripe/validate-keys",
+    "/dodo/validate-key",
+  ];
+
+  return async (c: Context, next: Next) => {
+    const organization = c.get("organization");
+    const requestPath = c.req.path;
+
+    if (
+      !organization &&
+      allowWithoutOrgPaths.some((path) => requestPath.includes(path))
+    ) {
+      return await next();
+    }
+
+    const memberRole = c.get("memberRole") ?? "";
+
+    // Roles are stored as a comma-separated string by Better Auth.
+    const memberRoles = memberRole
+      .split(",")
+      .map((role) => role.trim())
+      .filter(Boolean);
+
+    if (memberRoles.length === 0) {
+      return c.json(
+        {
+          error:
+            "No organization role found. Please ensure you are logged in and part of an organization.",
+        },
+        403
+      );
+    }
+
+    const hasRequiredRole = memberRoles.some((role) =>
+      requiredRoles.includes(role)
+    );
+
+    if (!hasRequiredRole) {
+      return c.json(
+        {
+          error: `Insufficient permissions. Required role: ${requiredRoles.join(
+            " or "
+          )}. Your role: ${memberRoles.join(", ") || "none"}`,
+        },
+        403
+      );
+    }
+
+    return await next();
+  };
 };

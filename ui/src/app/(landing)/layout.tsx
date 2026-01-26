@@ -12,6 +12,7 @@ import { useState, useEffect } from "react";
 import { useCookieConsent } from "@/lib/cookie-consent-context";
 import localFont from "next/font/local";
 import { Menu, X } from "lucide-react";
+import Script from "next/script";
 
 const calSans = localFont({
   src: "../../../public/CalSans-Regular.ttf",
@@ -389,6 +390,24 @@ export default function LandingLayout({
 
       {/* Cookie Banner - only shown on landing pages */}
       <CookieBanner />
+
+      {/* RB2B Script */}
+      <Script
+        id="rb2b-script"
+        strategy="afterInteractive"
+        dangerouslySetInnerHTML={{
+          __html: `
+            !function(key) {
+              if (window.reb2b) return;
+              window.reb2b = {loaded: true};
+              var s = document.createElement("script");
+              s.async = true;
+              s.src = "https://ddwl4m2hdecbv.cloudfront.net/b/" + key + "/" + key + ".js.gz";
+              document.getElementsByTagName("script")[0].parentNode.insertBefore(s, document.getElementsByTagName("script")[0]);
+            }("XOE9GHVDYMOM");
+          `,
+        }}
+      />
     </div>
   );
 }

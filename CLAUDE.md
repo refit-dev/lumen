@@ -75,7 +75,23 @@
   - Components are billed independently based on their own billing cycles
   - Each component generates its own subscription details and invoices
 
-#### 3.5.0 Taxation Scope (B2B vs B2C)
+#### 3.5.0 Dunning & Grace Period System
+
+- **Grace Period Management**: Subscriptions enter `past_due` status when payment fails or payment link is created
+- **Automatic Flow (Pricing Table)**: Payment failures trigger immediate dunning via webhook → subscription marked `past_due` with grace period
+- **Manual Flow (Admin-Created)**: Payment link generation automatically marks subscription `past_due` with grace period
+- **Grace Period Timeline**:
+  - Day 0: Payment fails or link sent (invoice email already delivered)
+  - Day 6 (T-24h): "Grace ending soon" reminder email sent automatically
+  - Day 7: Grace expires, configured action enforced (pause/cancel/mark_as_unpaid)
+- **Dunning Configuration**: Hierarchical (plan-specific → merchant default → system default)
+- **Recovery**: Successful payment automatically resumes subscription and resets billing cycle
+- **Jobs Pipeline**:
+  - `retryDunningPayments` (daily at 10 AM UTC): Retry failed payments
+  - `notifyGraceEndingSoon` (hourly): Send T-24h reminder emails
+  - `applyScheduledChanges` (every minute): Enforce expired grace periods
+
+#### 3.5.1 Taxation Scope (B2B vs B2C)
 
 - Current scope: B2B only. We require business identifiers to compute tax (e.g. VAT ID or business name).
 - If a customer lacks business identifiers (no `taxId` and no `businessName`), we treat the transaction as B2C and return zero tax.
@@ -83,7 +99,7 @@
 - Reason code added: `b2c_tax_not_supported` (code 21) to clearly flag B2C cases.
 - First-time and trial-to-paid flows store tax metadata in payment/invoice; renewals re-calculate taxes using the engine.
 
-#### 3.5.0.1 Tax Setup UI (Onboarding Wizard)
+#### 3.5.1.1 Tax Setup UI (Onboarding Wizard)
 
 - The `/tax` page shows a guided wizard until tax is configured.
 - Configuration is considered complete when either:
@@ -99,7 +115,7 @@
   - Step 3: Review & confirm → saves via `POST /tax/config/update`.
 - For US merchants choosing Automatic, the page recommends configuring state nexus after saving.
 
-### 3.5.1 Seat-Based Pricing & Mid-Cycle Billing
+### 3.5.2 Seat-Based Pricing & Mid-Cycle Billing
 
 - **Seat Management**: API endpoints for adding/removing seats with event tracking
 - **Mid-Cycle Charging**: Prorated billing for seat additions with immediate charging support
@@ -159,6 +175,7 @@
   - Configuration management with masked key display
   - Validation endpoints for API key verification
   - Automatic webhook provisioning: When saving a valid Dodo API key, the system attempts to auto-create a webhook endpoint in Dodo using the authenticated API client and stores the returned signing secret securely. The webhook URL used is `${API_URL}/v1/public/webhook-dodo/{merchantId}`. If auto-creation fails, the save still succeeds and the webhook can be configured later.
+  - Stripe webhook auto-healing (production): On webhook signature verification failure for an active merchant, the system acquires a short Redis lock and automatically deletes any existing webhook endpoint for the merchant URL, recreates a fresh endpoint, and rotates/persists the new signing secret. Skips in development (Stripe CLI flow) and rate-limits via lock cooldown.
 
 ### 3.9.1 Payment Method Selection & Failover (Subscriptions)
 
@@ -174,6 +191,17 @@
 - **Free Plan Detection**: Automatic identification of $0 plans with no usage costs
 - **Free Subscription Creation**: Streamlined signup flow for free plans without payment methods
 - **Trial-to-Paid Conversion**: Seamless upgrade path from trial to parent plan
+
+### 3.11 Teams & Invitations
+
+- Policy: One user belongs to exactly one organization; organization has exactly one merchant.
+- Invite flow:
+  - Logged-out users are redirected to `/login` with invite context preserved.
+  - Logged-in users see a confirmation screen on `/accept-invite` outlining impact before joining.
+  - On confirmation, backend endpoint `POST /v1/team/accept-invitation` accepts the invite and enforces single-org policy:
+    - Soft-deletes the previous merchant (`merchants.deletedAt`),
+    - Deletes the previous organization if it has no other members; otherwise removes the current user’s membership.
+    - Session refresh required client-side to reflect new org/merchant.
 
 ## 5. Current Focus
 

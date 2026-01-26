@@ -1,5 +1,7 @@
 import { sendEmailWithResend } from "./emails";
 import { logger } from "./logging";
+import { isEmailDenylisted } from "./emailDenylist";
+import { type PostgresDB } from "@lumen/common";
 
 type NodeEnv = "development" | "test" | "staging" | "production";
 
@@ -27,6 +29,9 @@ export type CoreNotificationConfig = {
   nodeEnv: NodeEnv;
   resendApiKey?: string | null;
   slackWebhook?: string | null;
+  apiUrl?: string | null;
+  internalApiKey?: string | null;
+  db?: PostgresDB;
 };
 
 export type CoreNotificationProvider = {
@@ -45,7 +50,32 @@ export type CoreNotificationProvider = {
 export function createCoreNotificationProvider(
   config: CoreNotificationConfig
 ): CoreNotificationProvider {
-  const { nodeEnv, resendApiKey, slackWebhook } = config;
+  const { nodeEnv, resendApiKey, slackWebhook, apiUrl, internalApiKey, db } =
+    config;
+
+  async function checkEmailDenylist(email: string): Promise<boolean> {
+    const isTriggerEnv = process.env.IS_TRIGGER_ENV === "true";
+
+    if (isTriggerEnv) {
+      if (!apiUrl || !internalApiKey) {
+        logger.error(
+          `isTriggerEnv is true but API URL or internal API key not configured, skipping denylist check. apiUrl: ${apiUrl}, internalApiKey: ${internalApiKey}`
+        );
+        return false;
+      }
+    }
+    try {
+      return await isEmailDenylisted({
+        email,
+        apiUrl,
+        apiKey: internalApiKey,
+        db,
+      });
+    } catch (error) {
+      logger.error("Failed to check denylist via DB, allowing email", error);
+      return false;
+    }
+  }
 
   async function sendSlack(
     opts: SendSlackOptions
@@ -90,6 +120,15 @@ export function createCoreNotificationProvider(
   async function sendEmail(
     opts: SendEmailOptions
   ): Promise<{ success: boolean; error?: string }> {
+    const isDenylisted = await checkEmailDenylist(opts.to);
+    if (isDenylisted) {
+      logger.info(`Skipping email to denylisted address: ${opts.to}`);
+      await sendSlack({
+        text: `Skipping email to denylisted address: ${opts.to}. Subject: ${opts.subject}. From: ${opts.from}.`,
+      });
+      return { success: true };
+    }
+
     const shouldSendRealEmail =
       nodeEnv === "production" || opts.allowNonProdSend === true;
 

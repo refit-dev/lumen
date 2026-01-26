@@ -1,7 +1,14 @@
 import { betterAuth, BetterAuthOptions } from "better-auth";
 import { createAuthMiddleware } from "better-auth/api";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { organization, admin } from "better-auth/plugins";
+import { organization, admin, captcha } from "better-auth/plugins";
+import {
+  ac,
+  ownerRole,
+  adminRole,
+  memberRole,
+  developerRole,
+} from "@lumen/common";
 import { customSession } from "better-auth/plugins";
 import { db } from "./db/client";
 import { getMerchantByUserId, getOrganizationsByUserId } from "@lumen/common";
@@ -46,44 +53,60 @@ const enhanceSessionWithMerchant = customSession(
       session,
       organization: null,
       merchant: null,
+      memberRole: null,
     };
     try {
       // get organization and merchant info
       const orgs = await getOrganizationsByUserId(db, user.id);
-      if (orgs?.length > 1) {
+      // Deduplicate by organization id to tolerate duplicate member rows
+      const uniqueOrgsMap = new Map<string, (typeof orgs)[number]>();
+      for (const row of orgs || []) {
+        const orgId = row.organization.id;
+        if (!uniqueOrgsMap.has(orgId)) uniqueOrgsMap.set(orgId, row);
+      }
+      const uniqueOrgs = Array.from(uniqueOrgsMap.values());
+      if (uniqueOrgs.length > 1) {
         console.error("Multiple organizations found for user");
         return sessionData;
       }
-      if (orgs?.length === 0) {
+      if (uniqueOrgs.length === 0) {
         console.error("No organizations found for user");
         return sessionData;
       }
 
+      const orgData = uniqueOrgs[0]; // one organization per user
+      const memberRole = orgData.member.role;
+
       const sessionDataWithOrg = {
         ...sessionData,
         organization: {
-          id: orgs[0].organization.id,
-          name: orgs[0].organization.name,
-          slug: orgs[0].organization.slug,
+          id: orgData.organization.id,
+          name: orgData.organization.name,
+          slug: orgData.organization.slug,
         },
+        memberRole,
       };
-      const merchant = await getMerchantByUserId(db, user.id);
-      if (merchant.length > 1) {
-        console.error("Multiple merchants found for user");
-        return sessionDataWithOrg;
-      }
-      if (merchant.length === 0) {
-        console.error("No merchants found for user");
+
+      const merchantResult = await db.query.merchants.findFirst({
+        where: (merchants, { eq, isNull, and }) =>
+          and(
+            eq(merchants.organizationId, orgData.organization.id),
+            isNull(merchants.deletedAt)
+          ),
+      });
+
+      if (!merchantResult) {
+        console.error("No merchant found for organization");
         return sessionDataWithOrg;
       }
 
       return {
         ...sessionDataWithOrg,
         merchant: {
-          id: merchant[0].id,
-          legalName: merchant[0].legalName,
-          displayName: merchant[0].displayName,
-          defaultCurrency: merchant[0].defaultCurrency,
+          id: merchantResult.id,
+          legalName: merchantResult.legalName,
+          displayName: merchantResult.displayName,
+          defaultCurrency: merchantResult.defaultCurrency,
         },
       };
     } catch (error) {
@@ -93,9 +116,6 @@ const enhanceSessionWithMerchant = customSession(
       );
       return sessionData;
     }
-    // unreachable
-    // console.error("Unreachable code");
-    // return sessionData;
   }
 );
 
@@ -123,6 +143,13 @@ const lumenApiKey = await getSecretOrEnvVar({
   throwOnStagingOrProdError: true,
 });
 
+const turnstileSecretKey = await getSecretOrEnvVar({
+  secretNameTemplate: "lumen/*/turnstile-secret-key",
+  envVariableName: "TURNSTILE_SECRET_KEY",
+  throwOnDevError: false,
+  throwOnStagingOrProdError: false,
+});
+
 const authConfig = {
   database: drizzleAdapter(db, {
     provider: "pg",
@@ -145,7 +172,56 @@ const authConfig = {
     },
   },
   plugins: [
-    organization(),
+    captcha({
+      provider: "cloudflare-turnstile", // or google-recaptcha, hcaptcha, captchafox
+      secretKey: turnstileSecretKey || "1x0000000000000000000000000000000AA", // test key always pass
+    }),
+    organization({
+      // Use shared access control and roles (including custom 'developer')
+      ac: ac as any,
+      roles: {
+        owner: ownerRole,
+        admin: adminRole,
+        member: memberRole,
+        developer: developerRole,
+      },
+      async sendInvitationEmail(data) {
+        const inviteUrl = `${CORS_ORIGIN}/accept-invite?invitationId=${data.id}&invitee=${encodeURIComponent(
+          data.email
+        )}`;
+        const roles = Array.isArray(data.role) ? data.role : [data.role];
+        const roleText = roles.includes("owner")
+          ? "Owner"
+          : roles.includes("admin")
+            ? "Admin"
+            : roles.includes("developer")
+              ? "Developer"
+              : "Member";
+
+        try {
+          await notify.sendEmail({
+            to: data.email,
+            subject: `You've been invited to join ${data.organization.name}`,
+            html: `
+              <h1>Team Invitation</h1>
+              <p>Hello,</p>
+              <p>${data.inviter.user.name || data.inviter.user.email} has invited you to join <strong>${data.organization.name}</strong> as a <strong>${roleText}</strong>.</p>
+              <a href="${inviteUrl}" style="background-color: #000; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block; margin: 20px 0;">
+                Accept Invitation
+              </a>
+              <p>If the button doesn't work, you can copy and paste this link into your browser:</p>
+              <p><a href="${inviteUrl}">${inviteUrl}</a></p>
+              <p>This invitation will expire in 48 hours.</p>
+              <p>If you didn't expect this invitation, you can safely ignore this email.</p>
+              <p>Best regards,<br>The Lumen Team</p>
+            `,
+            from: "Lumen <noreply@getlumen.dev>",
+          });
+        } catch (error) {
+          console.error("Failed to send invitation email:", error);
+        }
+      },
+    }),
     admin({
       defaultRole: "owner",
       adminRoles: ["admin"],
@@ -251,7 +327,7 @@ const authConfig = {
       }
     }),
   },
-} satisfies BetterAuthOptions;
+} as const satisfies BetterAuthOptions;
 
 export const auth = betterAuth(authConfig) as ReturnType<
   typeof betterAuth<typeof authConfig>

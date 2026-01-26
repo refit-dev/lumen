@@ -17,6 +17,9 @@ export const lumenNextHandler = async ({
     "customers/portal/set-subscription-payment-method",
     "customers/portal/payment-methods/{id}",
     "invoices/{id}/pdf",
+    // Credit top-up endpoints
+    "credits/available-topups",
+    "credits/topup",
   ];
   const API_KEY = apiKey || process.env.LUMEN_API_KEY;
   if (!API_KEY) {

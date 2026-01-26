@@ -18,6 +18,10 @@ import {
   AvailableCreditDefinition,
   NewCreditConfig,
 } from "../helpers/credits";
+import {
+  getAvailableTopups,
+  purchaseCreditTopup,
+} from "../helpers/topups";
 import { db } from "../db/client";
 import {
   creditDefinitions,
@@ -1064,7 +1068,103 @@ export const creditsRouter = new Hono()
     return c.json({
       limits: MANUAL_CREDIT_LIMITS,
     });
-  });
+  })
+
+  // ============================================
+  // Credit Top-Up Endpoints
+  // ============================================
+
+  // Get available top-ups for a customer
+  .get(
+    "/available-topups",
+    zValidator(
+      "query",
+      z.object({
+        externalCustomerId: z.string().min(1, "External customer ID is required"),
+      })
+    ),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const { externalCustomerId } = c.req.valid("query");
+
+      try {
+        const availableTopups = await getAvailableTopups(
+          merchantId,
+          externalCustomerId
+        );
+
+        return c.json({ availableTopups });
+      } catch (error) {
+        console.error("Error fetching available top-ups:", error);
+        return c.json(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Failed to fetch available top-ups",
+          },
+          error instanceof Error && error.message.includes("not found") ? 404 : 500
+        );
+      }
+    }
+  )
+
+  // Purchase credit top-up
+  .post(
+    "/topup",
+    zValidator(
+      "json",
+      z.object({
+        externalCustomerId: z.string().min(1, "External customer ID is required"),
+        creditDefinitionId: z.string().min(1, "Credit definition ID is required"),
+        quantity: z.number().int().positive("Quantity must be a positive integer"),
+        idempotencyKey: z.string().optional(),
+      })
+    ),
+    async (c) => {
+      const merchantId = c.get("merchant")!.id;
+      const { externalCustomerId, creditDefinitionId, quantity, idempotencyKey } =
+        c.req.valid("json");
+
+      try {
+        const result = await purchaseCreditTopup({
+          merchantId,
+          externalCustomerId,
+          creditDefinitionId,
+          quantity,
+          idempotencyKey,
+        });
+
+        return c.json(result, 201);
+      } catch (error) {
+        console.error("Error purchasing credit top-up:", error);
+
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : "Failed to purchase credit top-up";
+
+        // Determine appropriate status code based on error type
+        if (error instanceof Error) {
+          if (error.message.includes("not found")) {
+            return c.json({ error: errorMessage }, 404);
+          } else if (
+            error.message.includes("Minimum") ||
+            error.message.includes("Maximum") ||
+            error.message.includes("not enabled") ||
+            error.message.includes("not configured") ||
+            error.message.includes("does not match")
+          ) {
+            return c.json({ error: errorMessage }, 400);
+          } else if (error.message.includes("Payment failed")) {
+            return c.json({ error: errorMessage }, 402);
+          }
+        }
+
+        return c.json({ error: errorMessage }, 500);
+      }
+    }
+  );
 
 // Trigger-related endpoints for background jobs
 export const triggerCreditsRouter = new Hono()

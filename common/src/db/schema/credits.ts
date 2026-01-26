@@ -27,7 +27,16 @@ export const creditGrantSources = [
   "promotion",
   "manual",
   "refill",
+  "topup",
 ] as const;
+
+// Top-up Expiry Behavior
+export const topupExpiryBehaviors = [
+  "billing_cycle",
+  "custom_days",
+  "never",
+] as const;
+export type TopupExpiryBehavior = (typeof topupExpiryBehaviors)[number];
 export type CreditGrantSource = (typeof creditGrantSources)[number];
 
 // Credit Application Types
@@ -104,6 +113,16 @@ export const creditDefinitions = pgTable(
     name: text("name").notNull(),
     description: text("description"),
 
+    // TOP-UP CONFIGURATION
+    enableTopups: boolean("enable_topups").default(false),
+    topupPricePerCreditCents: integer("topup_price_per_credit_cents"),
+    topupMinQuantity: integer("topup_min_quantity").default(1),
+    topupMaxQuantity: integer("topup_max_quantity"),
+    topupExpiryBehavior: text("topup_expiry_behavior", {
+      enum: topupExpiryBehaviors,
+    }).default("billing_cycle"),
+    topupCustomExpiryDays: integer("topup_custom_expiry_days"),
+
     // TIMESTAMPS
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
@@ -124,6 +143,13 @@ export const creditDefinitions = pgTable(
     index("idx_credit_definitions_application_type")
       .on(table.applicationType, table.merchantId)
       .where(sql`${table.deletedAt} IS NULL`),
+
+    // Index for top-up enabled credit definitions
+    index("idx_credit_definitions_topups")
+      .on(table.planId, table.enableTopups, table.isActive)
+      .where(
+        sql`${table.deletedAt} IS NULL AND ${table.enableTopups} = true`
+      ),
   ]
 );
 

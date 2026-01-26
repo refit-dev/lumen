@@ -90,6 +90,7 @@ import {
   SelectItem,
   SelectValue,
 } from "@/components/ui/select";
+import Link from "next/link";
 
 const removeFalsyValuesFromObject = (obj: Record<string, unknown>) => {
   return Object.fromEntries(Object.entries(obj).filter(([, value]) => !!value));
@@ -206,6 +207,7 @@ interface SubscriptionWithPlan {
   plan?: {
     planName: string;
     planDescription?: string | null;
+    stablePlanId: string;
   };
   price?: {
     currency: string;
@@ -237,6 +239,7 @@ export default function CreateCustomerPage() {
   const [pdfLoadingId, setPdfLoadingId] = useState<string | null>(null);
   const [eventsLimit, setEventsLimit] = useState(10);
   const [isTestMode, setIsTestMode] = useState(false);
+  const [showExpiredCredits, setShowExpiredCredits] = useState(false);
 
   const customerId = params.customerId as string;
 
@@ -939,6 +942,15 @@ export default function CreateCustomerPage() {
       ) || []
     );
   }, [entitlements]);
+
+  // Filter credit grants based on showExpiredCredits toggle
+  const filteredCreditGrants = useMemo(() => {
+    if (!creditGrants?.grants) return [];
+    if (showExpiredCredits) {
+      return creditGrants.grants;
+    }
+    return creditGrants.grants.filter((grant) => grant.status === "ACTIVE");
+  }, [creditGrants?.grants, showExpiredCredits]);
 
   // Determine currency with fallback priority: plan -> merchant -> customer -> USD
   const activePlanCurrency =
@@ -2175,10 +2187,19 @@ export default function CreateCustomerPage() {
                                 <TableRow key={subscription.id}>
                                   <TableCell>
                                     <div>
-                                      <div className="font-medium">
-                                        {subscriptionWithPlan.plan?.planName ||
-                                          "Unknown Plan"}
-                                      </div>
+                                      {subscriptionWithPlan.plan?.stablePlanId ? (
+                                        <Link
+                                          href={`/plans/${subscriptionWithPlan.plan.stablePlanId}`}
+                                          className="font-medium text-blue-600 hover:text-blue-800 hover:underline"
+                                        >
+                                          {subscriptionWithPlan.plan.planName}
+                                        </Link>
+                                      ) : (
+                                        <div className="font-medium">
+                                          {subscriptionWithPlan.plan?.planName ||
+                                            "Unknown Plan"}
+                                        </div>
+                                      )}
                                       {subscriptionWithPlan.plan
                                         ?.planDescription && (
                                         <div className="text-sm text-muted-foreground">
@@ -2481,8 +2502,21 @@ export default function CreateCustomerPage() {
                 )}
 
                 {activeTab === "credits" && (
-                  <div>
-                    {creditGrants?.grants && creditGrants.grants.length > 0 ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-end space-x-2">
+                      <Label
+                        htmlFor="show-expired-credits"
+                        className="text-sm text-muted-foreground"
+                      >
+                        Show expired
+                      </Label>
+                      <Switch
+                        id="show-expired-credits"
+                        checked={showExpiredCredits}
+                        onCheckedChange={setShowExpiredCredits}
+                      />
+                    </div>
+                    {filteredCreditGrants.length > 0 ? (
                       <div className="rounded-md border">
                         <Table>
                           <TableHeader>
@@ -2490,15 +2524,13 @@ export default function CreateCustomerPage() {
                               <TableHead>Credit</TableHead>
                               <TableHead>Type</TableHead>
                               <TableHead>Status</TableHead>
-                              <TableHead>Remaining</TableHead>
-                              <TableHead>Total</TableHead>
+                              <TableHead>Amount</TableHead>
                               <TableHead>Expires</TableHead>
-                              <TableHead>Renews</TableHead>
                               <TableHead>Source</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {creditGrants.grants.map((grant) => {
+                            {filteredCreditGrants.map((grant) => {
                               const statusInfo = formatCreditStatus(
                                 grant.status
                               );
@@ -2544,16 +2576,6 @@ export default function CreateCustomerPage() {
                                     </div>
                                   </TableCell>
                                   <TableCell>
-                                    <div className="text-muted-foreground">
-                                      {grant.applicationType === "monetary"
-                                        ? formatCurrency(
-                                            grant.initialAmount,
-                                            grant.currency || "USD"
-                                          )
-                                        : grant.initialAmount.toLocaleString()}
-                                    </div>
-                                  </TableCell>
-                                  <TableCell>
                                     {grant.expiryDate ? (
                                       <LocaleAwareDate
                                         date={grant.expiryDate}
@@ -2580,7 +2602,11 @@ export default function CreateCustomerPage() {
                     ) : (
                       <div className="text-center py-8 text-muted-foreground">
                         <Gift className="h-8 w-8 mx-auto mb-2 opacity-50" />
-                        <p>No credit grants found for this customer</p>
+                        <p>
+                          {showExpiredCredits
+                            ? "No credit grants found for this customer"
+                            : "No active credit grants found for this customer"}
+                        </p>
                         <p className="text-sm">
                           Use the &quot;Grant Credits&quot; button above to add
                           credits
@@ -3274,8 +3300,7 @@ export default function CreateCustomerPage() {
                       <TableHead>Credit</TableHead>
                       <TableHead>Type</TableHead>
                       <TableHead>Status</TableHead>
-                      <TableHead>Remaining</TableHead>
-                      <TableHead>Total</TableHead>
+                      <TableHead>Amount</TableHead>
                       <TableHead>Expires</TableHead>
                       <TableHead>Renews</TableHead>
                       <TableHead>Source</TableHead>
@@ -3322,16 +3347,6 @@ export default function CreateCustomerPage() {
                                     grant.currency || customerCurrency
                                   )
                                 : grant.remainingAmount.toLocaleString()}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="text-muted-foreground">
-                              {grant.applicationType === "monetary"
-                                ? formatCurrency(
-                                    grant.initialAmount,
-                                    grant.currency || customerCurrency
-                                  )
-                                : grant.initialAmount.toLocaleString()}
                             </div>
                           </TableCell>
                           <TableCell>

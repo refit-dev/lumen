@@ -225,6 +225,13 @@ export async function createCreditDefinition(
     refillRrule,
     renewOnBilling = false,
     priority = 100,
+    // Top-up configuration fields
+    enableTopups,
+    topupPricePerCreditCents,
+    topupMinQuantity,
+    topupMaxQuantity,
+    topupExpiryBehavior,
+    topupCustomExpiryDays,
   } = params;
 
   const db_tx = tx || db;
@@ -335,6 +342,13 @@ export async function createCreditDefinition(
       renewOnBilling,
       priority,
       isActive: true,
+      // Top-up configuration
+      enableTopups,
+      topupPricePerCreditCents,
+      topupMinQuantity,
+      topupMaxQuantity,
+      topupExpiryBehavior,
+      topupCustomExpiryDays,
     })
     .returning();
 

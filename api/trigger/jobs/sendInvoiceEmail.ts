@@ -25,6 +25,8 @@ export const sendInvoiceEmailJob = task({
       nodeEnv: triggerEnv.NODE_ENV,
       resendApiKey: triggerEnv.RESEND_API_KEY ?? null,
       slackWebhook: triggerEnv.SLACK_WEBHOOK ?? null,
+      apiUrl: triggerEnv.API_URL,
+      internalApiKey: triggerEnv.INTERNAL_API_KEY,
     });
 
     return result;

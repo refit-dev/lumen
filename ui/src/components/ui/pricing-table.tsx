@@ -18,6 +18,9 @@ import {
   ChevronDown,
   Search,
   CreditCard,
+  Plus,
+  Coins,
+  RefreshCw,
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { DodoPayments } from "dodopayments-checkout";
@@ -122,6 +125,60 @@ export interface PricingTableProps {
   plans: Plan[];
 }
 
+// ----------------------------------------------------------------------------
+// CREDIT TOP-UP TYPES
+// ----------------------------------------------------------------------------
+
+export type TopupExpiryBehavior = "billing_cycle" | "custom_days" | "never";
+
+export interface AvailableTopup {
+  creditDefinitionId: string;
+  featureName: string;
+  featureSlug: string;
+  currentUsage: number;
+  creditsRemaining: number;
+  creditAllowance: number;
+  topupPricePerCreditCents: number;
+  minQuantity: number;
+  maxQuantity: number | null;
+  currency: string;
+  expiryBehavior: TopupExpiryBehavior;
+  estimatedExpiryDate: string | null;
+}
+
+export interface TopupPurchaseResult {
+  success: boolean;
+  creditGrant: {
+    id: string;
+    initialAmount: number;
+    expiryDate: string | null;
+  };
+  invoice: {
+    id: string;
+    customerInvoiceNumber: string | null;
+    totalAmountCents: number;
+    status: string;
+  };
+  payment: {
+    id: string | null;
+    status: string;
+  };
+}
+
+const clampTopupQuantity = (
+  value: string | number,
+  minQuantity: number,
+  maxQuantity?: number | null
+): number => {
+  const parsed = parseInt(String(value), 10);
+  if (Number.isNaN(parsed)) {
+    return minQuantity;
+  }
+  const capped =
+    typeof maxQuantity === "number" ? Math.min(parsed, maxQuantity) : parsed;
+  return Math.max(minQuantity, capped);
+};
+
 // Simple validation function (replacing Zod)
 const validatePricingTableData = (data: unknown): data is PricingTableProps => {
   if (!data || typeof data !== "object") return false;
@@ -206,6 +263,25 @@ const AlertTitle: React.FC<{
     {children}
   </h5>
 );
+
+// Simple Progress component (inline)
+const Progress: React.FC<{
+  value?: number;
+  max?: number;
+  className?: string;
+}> = ({ value = 0, max = 100, className = "" }) => {
+  const percentage = Math.min(Math.max((value / max) * 100, 0), 100);
+  return (
+    <div
+      className={`relative h-2 w-full overflow-hidden rounded-full bg-primary/20 ${className}`}
+    >
+      <div
+        className="h-full bg-primary transition-all duration-300 ease-in-out"
+        style={{ width: `${percentage}%` }}
+      />
+    </div>
+  );
+};
 
 // Simple CloseButton component (inline)
 const CloseButton: React.FC<{
@@ -979,7 +1055,9 @@ export const PricingTableCards = ({
   };
 
   return (
-    <div className={`container px-4 py-12 mx-auto ${className ?? ""}`}>
+    <div
+      className={`container px-4 py-12 mx-auto max-w-6xl ${className ?? ""}`}
+    >
       {heading && (
         <div>
           <h2 className="text-3xl font-bold tracking-tight sm:text-4xl md:text-5xl">
@@ -1015,7 +1093,7 @@ export const PricingTableCards = ({
       )}
 
       <div
-        className={`grid ${getGridColumnsClass()} gap-6 lg:gap-8 justify-center`}
+        className={`grid ${getGridColumnsClass()} gap-6 lg:gap-8 justify-center justify-items-center`}
       >
         {plans.map((plan, i) => {
           const currentPlan = isCurrentPlan(plan);
@@ -1025,7 +1103,7 @@ export const PricingTableCards = ({
               key={i}
               className={`flex flex-col justify-between relative min-h-[500px] ${
                 currentPlan ? "ring-2 ring-blue-500 shadow-lg" : ""
-              }`}
+              } w-full max-w-[560px] mx-auto`}
             >
               {plan.isPopular && !currentPlan && (
                 <Badge className="absolute -top-2 right-4">
@@ -1692,38 +1770,164 @@ export const PaymentModal = ({
 
   useEffect(() => {
     if (!isOpen || !showPaymentForm || !intentId) return;
-    const es = new EventSource(`${apiBaseUrl}/public/events/${intentId}`);
-    es.addEventListener("stripe_event", (ev) => {
+
+    let es: EventSource | null = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECTS = 3;
+    let reconnectTimeout: NodeJS.Timeout;
+    let eventReceived = false;
+    let pollingInterval: NodeJS.Timeout;
+    let timeoutId: NodeJS.Timeout;
+    let pollingStarted = false;
+    let successHandled = false; // Deduplicate success events
+
+    // Polling fallback function
+    const pollForPaymentStatus = async () => {
       try {
-        const evt = JSON.parse((ev as MessageEvent).data);
-        if (evt.type === "payment_intent.succeeded") {
-          onPaymentSuccess?.(evt.data.object.id);
-          es.close();
-        } else if (evt.type === "payment_intent.payment_failed") {
-          const msg =
-            evt.data.object.last_payment_error?.message || "Payment failed";
-          setCheckoutFormErrorMessage(msg);
-          onPaymentError?.(msg);
-        } else if (evt.type === "setup_intent.succeeded") {
-          onPaymentSuccess?.();
-          es.close();
-        } else if (evt.type === "setup_intent.setup_failed") {
-          const msg =
-            evt.data.object.last_setup_error?.message || "Setup failed";
-          setCheckoutFormErrorMessage(msg);
-          onPaymentError?.(msg);
+        console.log(`Polling payment status for ${intentId}...`);
+        const res = await fetch(
+          `${apiBaseUrl}/public/payment-status/${intentId}`
+        );
+        const data = await res.json();
+
+        if (data.status === "succeeded" && !successHandled) {
+          successHandled = true;
+          console.log("Payment succeeded (via polling)");
+          onPaymentSuccess?.(intentId);
+          clearPolling();
+        } else if (data.status === "failed") {
+          console.log("Payment failed (via polling)");
+          setCheckoutFormErrorMessage(
+            data.error || "Payment failed. Please try again."
+          );
+          onPaymentError?.(data.error || "Payment failed");
+          clearPolling();
         }
-      } catch (e) {
-        console.error("Failed to parse SSE event", e);
+        // If still pending, continue polling
+      } catch (err) {
+        console.error("Polling failed:", err);
+        // Continue polling despite error - network might recover
       }
-    });
-    es.onerror = (e) => {
-      console.error("SSE error", e);
-      setCheckoutFormErrorMessage("Network error. Please retry.");
-      onPaymentError?.("Network error during payment processing.");
-      es.close();
     };
-    return () => es.close();
+
+    const clearPolling = () => {
+      if (pollingInterval) clearInterval(pollingInterval);
+      if (timeoutId) clearTimeout(timeoutId);
+      pollingStarted = false;
+    };
+
+    const connect = () => {
+      // Clear any stale timers from previous attempts
+      if (timeoutId) clearTimeout(timeoutId);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      eventReceived = false;
+      console.log(
+        `Connecting to SSE (attempt ${reconnectAttempts + 1}/${MAX_RECONNECTS + 1})...`
+      );
+      es = new EventSource(`${apiBaseUrl}/public/events/${intentId}`);
+
+      es.addEventListener("stripe_event", (ev) => {
+        try {
+          eventReceived = true;
+          clearTimeout(timeoutId); // Clear timeout on any event
+          const evt = JSON.parse((ev as MessageEvent).data);
+          console.log("Received SSE event:", evt.type);
+
+          if (evt.type === "payment_intent.succeeded") {
+            if (successHandled) {
+              console.log("Duplicate payment success event ignored");
+              return;
+            }
+            successHandled = true;
+            console.log("Payment succeeded (via SSE)");
+            onPaymentSuccess?.(evt.data.object.id);
+            es?.close();
+            clearPolling();
+          } else if (evt.type === "payment_intent.payment_failed") {
+            const msg =
+              evt.data.object.last_payment_error?.message || "Payment failed";
+            console.log("Payment failed (via SSE):", msg);
+            setCheckoutFormErrorMessage(msg);
+            onPaymentError?.(msg);
+            clearPolling();
+          } else if (evt.type === "setup_intent.succeeded") {
+            if (successHandled) {
+              console.log("Duplicate setup success event ignored");
+              return;
+            }
+            successHandled = true;
+            console.log("Setup succeeded (via SSE)");
+            onPaymentSuccess?.();
+            es?.close();
+            clearPolling();
+          } else if (evt.type === "setup_intent.setup_failed") {
+            const msg =
+              evt.data.object.last_setup_error?.message || "Setup failed";
+            console.log("Setup failed (via SSE):", msg);
+            setCheckoutFormErrorMessage(msg);
+            onPaymentError?.(msg);
+            clearPolling();
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE event", e);
+        }
+      });
+
+      es.onerror = (e) => {
+        console.error("SSE error", e);
+        es?.close();
+
+        // Attempt reconnection
+        if (reconnectAttempts < MAX_RECONNECTS) {
+          reconnectAttempts++;
+          const delay = 2000 * reconnectAttempts;
+          console.log(
+            `SSE connection failed, reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECTS})...`
+          );
+          reconnectTimeout = setTimeout(connect, delay);
+        } else {
+          // Exhausted reconnection attempts, fall back to polling
+          console.warn(
+            "SSE reconnection failed after max attempts, falling back to polling..."
+          );
+          setCheckoutFormErrorMessage(
+            "Connection issue detected. Checking payment status..."
+          );
+          if (!pollingStarted) {
+            pollingStarted = true;
+            pollingInterval = setInterval(pollForPaymentStatus, 3000);
+            // Run immediately
+            pollForPaymentStatus();
+          }
+        }
+      };
+
+      // Timeout: if no event received after 60 seconds, start polling
+      timeoutId = setTimeout(() => {
+        if (!eventReceived) {
+          console.warn(
+            "No SSE event received after 60s, starting polling fallback..."
+          );
+          setCheckoutFormErrorMessage(
+            "Taking longer than expected. Checking payment status..."
+          );
+          if (!pollingStarted) {
+            pollingStarted = true;
+            pollingInterval = setInterval(pollForPaymentStatus, 3000);
+            pollForPaymentStatus();
+          }
+        }
+      }, 60000);
+    };
+
+    connect();
+
+    return () => {
+      console.log("Cleaning up SSE connection and polling...");
+      es?.close();
+      clearTimeout(reconnectTimeout);
+      clearPolling();
+    };
   }, [
     isOpen,
     showPaymentForm,
@@ -2179,7 +2383,8 @@ function CheckoutForm({
 
 export const PricingTable = ({
   pricingTableSlug,
-  lumenPublishableKey = process.env.NEXT_PUBLIC_LUMEN_PUBLISHABLE_KEY,
+  lumenPublishableKey = process.env.NEXT_PUBLIC_LUMEN_PUBLISHABLE_KEY ||
+    process.env.REACT_APP_LUMEN_PUBLISHABLE_KEY,
   redirectUrl,
   apiBaseUrl = "https://api.getlumen.dev/v1",
   userId,
@@ -2406,9 +2611,37 @@ export const PricingTable = ({
         <AlertDescription>
           <div className="text-sm mt-2">
             <p>
-              No publishable key, please set NEXT_PUBLIC_LUMEN_PUBLISHABLE_KEY
-              in your environment variables or pass it as a prop. Get your API
-              Key from{" "}
+              No publishable key found. Please set an environment variable or
+              pass it as a prop:
+            </p>
+            <ul className="list-disc list-inside mt-2 space-y-1">
+              <li>
+                Next.js:{" "}
+                <code className="bg-gray-100 px-1 rounded">
+                  NEXT_PUBLIC_LUMEN_PUBLISHABLE_KEY
+                </code>
+              </li>
+              <li>
+                Create React App:{" "}
+                <code className="bg-gray-100 px-1 rounded">
+                  REACT_APP_LUMEN_PUBLISHABLE_KEY
+                </code>
+              </li>
+              <li>
+                Vite: Pass as prop{" "}
+                <code className="bg-gray-100 px-1 rounded">
+                  lumenPublishableKey=&quot;pk_...&quot;
+                </code>
+              </li>
+              <li>
+                Other: Pass as prop{" "}
+                <code className="bg-gray-100 px-1 rounded">
+                  lumenPublishableKey=&quot;pk_...&quot;
+                </code>
+              </li>
+            </ul>
+            <p className="mt-2">
+              Get your API Key from{" "}
               <a
                 href="https://getlumen.dev/developer/apikeys"
                 target="_blank"
@@ -3176,6 +3409,20 @@ export function CustomerPortal({
   const [pmRefreshing, setPmRefreshing] = useState(false);
   const [listeningForSetupEvent, setListeningForSetupEvent] = useState(false);
 
+  // Credit top-up state
+  const [availableTopups, setAvailableTopups] = useState<AvailableTopup[]>([]);
+  const [topupsLoading, setTopupsLoading] = useState(false);
+  const [topupsError, setTopupsError] = useState<string | null>(null);
+  const [selectedTopup, setSelectedTopup] = useState<AvailableTopup | null>(
+    null
+  );
+  const [topupQuantity, setTopupQuantity] = useState<string>("1");
+  const [topupDialogOpen, setTopupDialogOpen] = useState(false);
+  const [topupPurchasing, setTopupPurchasing] = useState(false);
+  const [topupPurchaseError, setTopupPurchaseError] = useState<string | null>(
+    null
+  );
+
   const fetchOverview = async () => {
     setLoading(true);
     setError(null);
@@ -3211,8 +3458,103 @@ export function CustomerPortal({
     }
   };
 
+  const fetchAvailableTopups = async () => {
+    setTopupsLoading(true);
+    setTopupsError(null);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/credits/available-topups?externalCustomerId=${encodeURIComponent(
+          externalCustomerId
+        )}`,
+        { credentials: "include" }
+      );
+      if (!res.ok) {
+        if (res.status === 404) {
+          setAvailableTopups([]);
+          return;
+        }
+        throw new Error(`Failed to load topups (${res.status})`);
+      }
+      const json = await res.json();
+      setAvailableTopups(json.availableTopups || []);
+    } catch (e) {
+      setTopupsError(getErrorMessage(e) || "Failed to load available top-ups");
+    } finally {
+      setTopupsLoading(false);
+    }
+  };
+
+  const handleTopupPurchase = async () => {
+    if (!selectedTopup) return;
+    setTopupPurchasing(true);
+    setTopupPurchaseError(null);
+    const normalizedQuantity = clampTopupQuantity(
+      topupQuantity,
+      selectedTopup.minQuantity,
+      selectedTopup.maxQuantity
+    );
+    setTopupQuantity(String(normalizedQuantity));
+    try {
+      const res = await fetch(`${lumenHandlerUrl}/credits/topup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          externalCustomerId,
+          creditDefinitionId: selectedTopup.creditDefinitionId,
+          quantity: normalizedQuantity,
+        }),
+      });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Purchase failed (${res.status})`);
+      }
+
+      const result: TopupPurchaseResult = await res.json();
+
+      // Check payment status to determine if credits are available immediately
+      const paymentStatus = result.payment?.status;
+      const isPaymentPending =
+        paymentStatus === "pending" ||
+        paymentStatus === "processing" ||
+        paymentStatus === "requires_action";
+
+      if (isPaymentPending) {
+        // Payment is pending - show message about webhook confirmation
+        setTopupPurchaseError(
+          `Payment initiated successfully. Credits will be added automatically once payment is confirmed. You'll receive an email notification when your credits are available.`
+        );
+        // Keep dialog open to show the message, but allow closing
+        setTopupPurchasing(false);
+        // Refresh overview to show pending payment/invoice
+        await fetchOverview();
+        return;
+      }
+
+      // Payment succeeded synchronously - credits should be granted
+      // Close dialog and refresh
+      setTopupDialogOpen(false);
+      setSelectedTopup(null);
+      setTopupQuantity("1");
+      // Refresh both credits and overview (for invoices/payments)
+      await Promise.all([fetchAvailableTopups(), fetchOverview()]);
+    } catch (e) {
+      setTopupPurchaseError(getErrorMessage(e) || "Failed to purchase credits");
+    } finally {
+      setTopupPurchasing(false);
+    }
+  };
+
+  const openTopupDialog = (topup: AvailableTopup) => {
+    setSelectedTopup(topup);
+    setTopupQuantity(String(topup.minQuantity));
+    setTopupPurchaseError(null);
+    setTopupDialogOpen(true);
+  };
+
   useEffect(() => {
     fetchOverview();
+    fetchAvailableTopups();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [externalCustomerId, lumenHandlerUrl]);
 
@@ -3627,10 +3969,11 @@ export function CustomerPortal({
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="payment-methods" className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="payment-methods">Payment Methods</TabsTrigger>
             <TabsTrigger value="invoices">Invoices</TabsTrigger>
             <TabsTrigger value="payments">Payment History</TabsTrigger>
+            <TabsTrigger value="credits">Credits</TabsTrigger>
           </TabsList>
 
           <TabsContent value="payment-methods" className="mt-6">
@@ -3880,7 +4223,340 @@ export function CustomerPortal({
               )}
             </div>
           </TabsContent>
+
+          <TabsContent value="credits" className="mt-6">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="font-medium">Credit Top-ups</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Purchase additional credits for your features
+                  </p>
+                </div>
+                {!topupsLoading && availableTopups.length > 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={fetchAvailableTopups}
+                    className="text-muted-foreground"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
+
+              {topupsLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                  <span className="ml-2 text-sm text-muted-foreground">
+                    Loading available top-ups...
+                  </span>
+                </div>
+              ) : topupsError ? (
+                <div className="text-center py-8">
+                  <div className="text-red-600 mb-2">{topupsError}</div>
+                  <Button
+                    onClick={fetchAvailableTopups}
+                    variant="outline"
+                    size="sm"
+                  >
+                    Try Again
+                  </Button>
+                </div>
+              ) : availableTopups.length === 0 ? (
+                <div className="text-center py-8">
+                  <div className="text-muted-foreground mb-2">
+                    No credit top-ups available
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Credit top-ups will appear here when enabled for your plan
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {availableTopups.map((topup) => {
+                    const usagePercent =
+                      topup.creditAllowance > 0
+                        ? Math.round(
+                            ((topup.creditAllowance - topup.creditsRemaining) /
+                              topup.creditAllowance) *
+                              100
+                          )
+                        : 0;
+                    return (
+                      <div
+                        key={topup.creditDefinitionId}
+                        className="border rounded-lg p-4 hover:border-primary/30 transition-colors"
+                      >
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center gap-3">
+                            <div className="h-10 w-10 rounded-full bg-amber-100 flex items-center justify-center">
+                              <Coins className="h-5 w-5 text-amber-600" />
+                            </div>
+                            <div>
+                              <div className="font-medium">
+                                {topup.featureName}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {formatCurrency(
+                                  topup.topupPricePerCreditCents,
+                                  topup.currency
+                                )}{" "}
+                                per credit
+                                {topup.maxQuantity &&
+                                  ` • Max ${topup.maxQuantity.toLocaleString()}`}
+                              </div>
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => openTopupDialog(topup)}
+                          >
+                            <Plus className="h-4 w-4 mr-1" />
+                            Buy
+                          </Button>
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-sm">
+                            <span className="text-muted-foreground">
+                              Credits Remaining
+                            </span>
+                            <span
+                              className={`font-medium ${
+                                topup.creditsRemaining === 0
+                                  ? "text-red-600"
+                                  : usagePercent >= 80
+                                    ? "text-amber-600"
+                                    : "text-green-600"
+                              }`}
+                            >
+                              {topup.creditsRemaining.toLocaleString()}{" "}
+                              <span className="text-muted-foreground font-normal">
+                                / {topup.creditAllowance.toLocaleString()}
+                              </span>
+                            </span>
+                          </div>
+                          <Progress
+                            value={100 - usagePercent}
+                            className={`h-2 ${
+                              topup.creditsRemaining === 0
+                                ? "[&>div]:bg-red-500"
+                                : usagePercent >= 80
+                                  ? "[&>div]:bg-amber-500"
+                                  : "[&>div]:bg-green-500"
+                            }`}
+                          />
+                          {topup.creditsRemaining === 0 ? (
+                            <div className="text-xs text-red-600 font-medium pt-1">
+                              Credits depleted - purchase more to continue using
+                              this feature
+                            </div>
+                          ) : usagePercent >= 80 ? (
+                            <div className="text-xs text-amber-600 pt-1">
+                              Running low -{" "}
+                              {topup.creditsRemaining.toLocaleString()} credits
+                              left
+                            </div>
+                          ) : (
+                            <div className="text-xs text-muted-foreground pt-1">
+                              {topup.creditAllowance - topup.creditsRemaining}{" "}
+                              of {topup.creditAllowance.toLocaleString()}{" "}
+                              credits used
+                            </div>
+                          )}
+                          {topup.expiryBehavior !== "never" &&
+                            topup.estimatedExpiryDate && (
+                              <div className="text-xs text-muted-foreground pt-1">
+                                Expires{" "}
+                                {new Date(
+                                  topup.estimatedExpiryDate
+                                ).toLocaleDateString(undefined, {
+                                  month: "short",
+                                  day: "numeric",
+                                  year: "numeric",
+                                })}
+                              </div>
+                            )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </TabsContent>
         </Tabs>
+
+        {/* Credit Top-up Purchase Dialog */}
+        {topupDialogOpen && selectedTopup && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+            <div className="bg-white rounded-xl shadow-lg max-w-md w-full mx-4 p-6">
+              <div className="flex items-start justify-between mb-4">
+                <div>
+                  <h3 className="font-semibold text-lg">Purchase Credits</h3>
+                  <p className="text-sm text-muted-foreground">
+                    {selectedTopup.featureName}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setTopupDialogOpen(false)}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="text-sm font-medium mb-2 block">
+                    Number of credits
+                  </label>
+                  <input
+                    type="number"
+                    value={topupQuantity}
+                    onChange={(e) => setTopupQuantity(e.target.value)}
+                    onBlur={() => {
+                      const normalized = clampTopupQuantity(
+                        topupQuantity,
+                        selectedTopup.minQuantity,
+                        selectedTopup.maxQuantity
+                      );
+                      setTopupQuantity(String(normalized));
+                    }}
+                    min={selectedTopup.minQuantity}
+                    max={selectedTopup.maxQuantity || undefined}
+                    className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                  <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                    <span>
+                      Min: {selectedTopup.minQuantity}
+                      {selectedTopup.maxQuantity &&
+                        ` • Max: ${selectedTopup.maxQuantity.toLocaleString()}`}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">
+                      Price per credit
+                    </span>
+                    <span>
+                      {formatCurrency(
+                        selectedTopup.topupPricePerCreditCents,
+                        selectedTopup.currency
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Quantity</span>
+                    <span>{Number(topupQuantity || 0).toLocaleString()}</span>
+                  </div>
+                  <div className="border-t pt-2 flex justify-between font-semibold">
+                    <span>Total</span>
+                    <span>
+                      {formatCurrency(
+                        selectedTopup.topupPricePerCreditCents *
+                          Number(topupQuantity),
+                        selectedTopup.currency
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                {selectedTopup.expiryBehavior !== "never" && (
+                  <p className="text-xs text-muted-foreground">
+                    {selectedTopup.expiryBehavior === "billing_cycle"
+                      ? "Credits will expire at end of billing cycle"
+                      : selectedTopup.estimatedExpiryDate
+                        ? `Credits will expire on ${new Date(
+                            selectedTopup.estimatedExpiryDate
+                          ).toLocaleDateString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                            year: "numeric",
+                          })}`
+                        : "Credits will expire after the configured period"}
+                  </p>
+                )}
+
+                {topupPurchaseError && (
+                  <div
+                    className={`text-sm rounded-lg p-3 ${
+                      topupPurchaseError.includes(
+                        "Payment initiated successfully"
+                      )
+                        ? "text-blue-700 bg-blue-50 border border-blue-200"
+                        : "text-red-600 bg-red-50"
+                    }`}
+                  >
+                    {topupPurchaseError.includes(
+                      "Payment initiated successfully"
+                    ) && (
+                      <div className="flex items-start gap-2">
+                        <div className="flex-shrink-0 mt-0.5">
+                          <svg
+                            className="h-4 w-4 text-blue-600"
+                            fill="currentColor"
+                            viewBox="0 0 20 20"
+                          >
+                            <path
+                              fillRule="evenodd"
+                              d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z"
+                              clipRule="evenodd"
+                            />
+                          </svg>
+                        </div>
+                        <div className="flex-1">
+                          <p className="font-medium text-blue-800 mb-1">
+                            Payment Processing
+                          </p>
+                          <p className="text-blue-700">{topupPurchaseError}</p>
+                        </div>
+                      </div>
+                    )}
+                    {!topupPurchaseError.includes(
+                      "Payment initiated successfully"
+                    ) && topupPurchaseError}
+                  </div>
+                )}
+
+                <div className="flex gap-3">
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    onClick={() => setTopupDialogOpen(false)}
+                    disabled={topupPurchasing}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    className="flex-1"
+                    onClick={handleTopupPurchase}
+                    disabled={topupPurchasing}
+                  >
+                    {topupPurchasing ? (
+                      <>
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        Processing...
+                      </>
+                    ) : (
+                      <>
+                        Purchase for{" "}
+                        {formatCurrency(
+                          selectedTopup.topupPricePerCreditCents *
+                            Number(topupQuantity),
+                          selectedTopup.currency
+                        )}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {addingPm && stripePromise && clientSecret ? (
           <Elements stripe={stripePromise} options={{ clientSecret }}>
@@ -3966,3 +4642,472 @@ function CustomerPortalAddPaymentMethodModal({
 }
 
 export { CustomerPortal as CustomerPortalShadcn };
+
+/**
+ * Standalone Credit Top-up Component
+ * Allows customers to purchase additional credits for enabled features.
+ */
+export function CreditTopup({
+  lumenHandlerUrl,
+  externalCustomerId,
+  className,
+}: {
+  lumenHandlerUrl: string;
+  externalCustomerId: string;
+  className?: string;
+}) {
+  const [availableTopups, setAvailableTopups] = useState<AvailableTopup[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedTopup, setSelectedTopup] = useState<AvailableTopup | null>(
+    null
+  );
+  const [topupQuantity, setTopupQuantity] = useState<string>("1");
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [purchasing, setPurchasing] = useState(false);
+  const [purchaseError, setPurchaseError] = useState<string | null>(null);
+
+  const fetchAvailableTopups = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `${lumenHandlerUrl}/credits/available-topups?externalCustomerId=${encodeURIComponent(
+          externalCustomerId
+        )}`,
+        { credentials: "include" }
+      );
+      if (!res.ok) {
+        if (res.status === 404) {
+          setAvailableTopups([]);
+          return;
+        }
+        throw new Error(`Failed to load topups (${res.status})`);
+      }
+      const json = await res.json();
+      setAvailableTopups(json.availableTopups || []);
+    } catch (e) {
+      setError(getErrorMessage(e) || "Failed to load available top-ups");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePurchase = async () => {
+    if (!selectedTopup) return;
+    setPurchasing(true);
+    setPurchaseError(null);
+    const normalizedQuantity = clampTopupQuantity(
+      topupQuantity,
+      selectedTopup.minQuantity,
+      selectedTopup.maxQuantity
+    );
+    setTopupQuantity(String(normalizedQuantity));
+    try {
+      const res = await fetch(`${lumenHandlerUrl}/credits/topup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          externalCustomerId,
+          creditDefinitionId: selectedTopup.creditDefinitionId,
+          quantity: normalizedQuantity,
+        }),
+      });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Purchase failed (${res.status})`);
+      }
+
+      const result: TopupPurchaseResult = await res.json();
+
+      // Check payment status to determine if credits are available immediately
+      const paymentStatus = result.payment?.status;
+      const isPaymentPending =
+        paymentStatus === "pending" ||
+        paymentStatus === "processing" ||
+        paymentStatus === "requires_action";
+
+      if (isPaymentPending) {
+        // Payment is pending - show message about webhook confirmation
+        setPurchaseError(
+          `Payment initiated successfully. Credits will be added automatically once payment is confirmed. You'll receive an email notification when your credits are available.`
+        );
+        setPurchasing(false);
+        return;
+      }
+
+      // Payment succeeded synchronously - credits should be granted
+      setDialogOpen(false);
+      setSelectedTopup(null);
+      setTopupQuantity("1");
+      await fetchAvailableTopups();
+    } catch (e) {
+      setPurchaseError(getErrorMessage(e) || "Failed to purchase credits");
+    } finally {
+      setPurchasing(false);
+    }
+  };
+
+  const openDialog = (topup: AvailableTopup) => {
+    setSelectedTopup(topup);
+    setTopupQuantity(String(topup.minQuantity));
+    setPurchaseError(null);
+    setDialogOpen(true);
+  };
+
+  useEffect(() => {
+    fetchAvailableTopups();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalCustomerId, lumenHandlerUrl]);
+
+  const formatCurrency = (amountCents: number, currency: string) => {
+    const amount = (amountCents / 100).toFixed(2);
+    const symbol = currencySymbol(currency);
+    return `${symbol}${amount}`;
+  };
+
+  const formatDateShort = (dateString: string | null) => {
+    if (!dateString) return "—";
+    return new Date(dateString).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+  };
+
+  if (loading) {
+    return (
+      <Card className={className}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            Loading Credits
+          </CardTitle>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  if (error) {
+    return (
+      <Card className={className}>
+        <CardHeader>
+          <CardTitle className="text-red-600 flex items-center gap-2">
+            <AlertCircle className="h-5 w-5" />
+            Error Loading Credits
+          </CardTitle>
+          <CardDescription className="text-red-600">{error}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={fetchAvailableTopups} variant="outline">
+            Try Again
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (availableTopups.length === 0) {
+    return (
+      <Card className={className}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Coins className="h-5 w-5" />
+            Credits
+          </CardTitle>
+          <CardDescription>
+            No credit top-ups available for your plan
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      <Card className={className}>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <Coins className="h-5 w-5" />
+              Credit Top-ups
+            </CardTitle>
+            <CardDescription>
+              Purchase additional credits for your features
+            </CardDescription>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={fetchAvailableTopups}
+            className="text-muted-foreground"
+          >
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3">
+            {availableTopups.map((topup) => {
+              const usagePercent =
+                topup.creditAllowance > 0
+                  ? Math.round(
+                      ((topup.creditAllowance - topup.creditsRemaining) /
+                        topup.creditAllowance) *
+                        100
+                    )
+                  : 0;
+              return (
+                <div
+                  key={topup.creditDefinitionId}
+                  className="border rounded-lg p-4 hover:border-primary/30 transition-colors"
+                >
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-3">
+                      <div className="h-10 w-10 rounded-full bg-amber-100 flex items-center justify-center">
+                        <Coins className="h-5 w-5 text-amber-600" />
+                      </div>
+                      <div>
+                        <div className="font-medium">{topup.featureName}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {formatCurrency(
+                            topup.topupPricePerCreditCents,
+                            topup.currency
+                          )}{" "}
+                          per credit
+                          {topup.maxQuantity &&
+                            ` • Max ${topup.maxQuantity.toLocaleString()}`}
+                        </div>
+                      </div>
+                    </div>
+                    <Button size="sm" onClick={() => openDialog(topup)}>
+                      <Plus className="h-4 w-4 mr-1" />
+                      Buy
+                    </Button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">
+                        Credits Remaining
+                      </span>
+                      <span
+                        className={`font-medium ${
+                          topup.creditsRemaining === 0
+                            ? "text-red-600"
+                            : usagePercent >= 80
+                              ? "text-amber-600"
+                              : "text-green-600"
+                        }`}
+                      >
+                        {topup.creditsRemaining.toLocaleString()}{" "}
+                        <span className="text-muted-foreground font-normal">
+                          / {topup.creditAllowance.toLocaleString()}
+                        </span>
+                      </span>
+                    </div>
+                    <Progress
+                      value={100 - usagePercent}
+                      className={`h-2 ${
+                        topup.creditsRemaining === 0
+                          ? "[&>div]:bg-red-500"
+                          : usagePercent >= 80
+                            ? "[&>div]:bg-amber-500"
+                            : "[&>div]:bg-green-500"
+                      }`}
+                    />
+                    {topup.creditsRemaining === 0 ? (
+                      <div className="text-xs text-red-600 font-medium pt-1">
+                        Credits depleted - purchase more to continue using this
+                        feature
+                      </div>
+                    ) : usagePercent >= 80 ? (
+                      <div className="text-xs text-amber-600 pt-1">
+                        Running low - {topup.creditsRemaining.toLocaleString()}{" "}
+                        credits left
+                      </div>
+                    ) : (
+                      <div className="text-xs text-muted-foreground pt-1">
+                        {topup.creditAllowance - topup.creditsRemaining} of{" "}
+                        {topup.creditAllowance.toLocaleString()} credits used
+                      </div>
+                    )}
+                    {topup.expiryBehavior !== "never" &&
+                      topup.estimatedExpiryDate && (
+                        <div className="text-xs text-muted-foreground pt-1">
+                          Expires {formatDateShort(topup.estimatedExpiryDate)}
+                        </div>
+                      )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Purchase Dialog */}
+      {dialogOpen && selectedTopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white rounded-xl shadow-lg max-w-md w-full mx-4 p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="font-semibold text-lg">Purchase Credits</h3>
+                <p className="text-sm text-muted-foreground">
+                  {selectedTopup.featureName}
+                </p>
+              </div>
+              <button
+                onClick={() => setDialogOpen(false)}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="text-sm font-medium mb-2 block">
+                  Number of credits
+                </label>
+                <input
+                  type="number"
+                  value={topupQuantity}
+                  onChange={(e) => setTopupQuantity(e.target.value)}
+                  onBlur={() => {
+                    const normalized = clampTopupQuantity(
+                      topupQuantity,
+                      selectedTopup.minQuantity,
+                      selectedTopup.maxQuantity
+                    );
+                    setTopupQuantity(String(normalized));
+                  }}
+                  min={selectedTopup.minQuantity}
+                  max={selectedTopup.maxQuantity || undefined}
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                />
+                <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                  <span>
+                    Min: {selectedTopup.minQuantity}
+                    {selectedTopup.maxQuantity &&
+                      ` • Max: ${selectedTopup.maxQuantity.toLocaleString()}`}
+                  </span>
+                </div>
+              </div>
+
+              <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">
+                    Price per credit
+                  </span>
+                  <span>
+                    {formatCurrency(
+                      selectedTopup.topupPricePerCreditCents,
+                      selectedTopup.currency
+                    )}
+                  </span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Quantity</span>
+                  <span>{Number(topupQuantity || 0).toLocaleString()}</span>
+                </div>
+                <div className="border-t pt-2 flex justify-between font-semibold">
+                  <span>Total</span>
+                  <span>
+                    {formatCurrency(
+                      selectedTopup.topupPricePerCreditCents *
+                        Number(topupQuantity),
+                      selectedTopup.currency
+                    )}
+                  </span>
+                </div>
+              </div>
+
+              {selectedTopup.expiryBehavior !== "never" && (
+                <p className="text-xs text-muted-foreground">
+                  {selectedTopup.expiryBehavior === "billing_cycle"
+                    ? "Credits will expire at end of billing cycle"
+                    : selectedTopup.estimatedExpiryDate
+                      ? `Credits will expire on ${formatDateShort(
+                          selectedTopup.estimatedExpiryDate
+                        )}`
+                      : "Credits will expire after the configured period"}
+                </p>
+              )}
+
+              {purchaseError && (
+                <div
+                  className={`text-sm rounded-lg p-3 ${
+                    purchaseError.includes("Payment initiated successfully")
+                      ? "text-blue-700 bg-blue-50 border border-blue-200"
+                      : "text-red-600 bg-red-50"
+                  }`}
+                >
+                  {purchaseError.includes("Payment initiated successfully") && (
+                    <div className="flex items-start gap-2">
+                      <div className="flex-shrink-0 mt-0.5">
+                        <svg
+                          className="h-4 w-4 text-blue-600"
+                          fill="currentColor"
+                          viewBox="0 0 20 20"
+                        >
+                          <path
+                            fillRule="evenodd"
+                            d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z"
+                            clipRule="evenodd"
+                          />
+                        </svg>
+                      </div>
+                      <div className="flex-1">
+                        <p className="font-medium text-blue-800 mb-1">
+                          Payment Processing
+                        </p>
+                        <p className="text-blue-700">{purchaseError}</p>
+                      </div>
+                    </div>
+                  )}
+                  {!purchaseError.includes("Payment initiated successfully") &&
+                    purchaseError}
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => setDialogOpen(false)}
+                  disabled={purchasing}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  className="flex-1"
+                  onClick={handlePurchase}
+                  disabled={purchasing}
+                >
+                  {purchasing ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      Purchase for{" "}
+                      {formatCurrency(
+                        selectedTopup.topupPricePerCreditCents *
+                          Number(topupQuantity),
+                        selectedTopup.currency
+                      )}
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+export { CreditTopup as CreditTopupShadcn };

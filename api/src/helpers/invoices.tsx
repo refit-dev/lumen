@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 // ^ we need this because otherwise JSX gets parsed with hono/jsx
 
-import { Font, pdf } from "@react-pdf/renderer";
+import { Document, Font, pdf, Page, Text } from "@react-pdf/renderer";
 import { InvoiceDocument, InvoiceData } from "@lumen/common/pdf";
 import { CustomerFromApi, MerchantFromApi } from "@lumen/common/schema";
 import { taxReasonCodes, getTaxReasonInfo } from "./tax-rates";
@@ -723,7 +723,16 @@ export async function processInvoicePdfGeneration(
         !process.env.GENERATE_PDFS // Set this env var to see PDFs locally
       ) {
         // Development code path
-        pdfBlob = await pdf(<div>mock blob</div>).toBlob();
+        pdfBlob = await pdf(
+          <Document>
+            <Page size="A4">
+              <Text>
+                Mock PDF: If you want to generate full PDFs locally, set the
+                GENERATE_PDFS environment variable to true in /api/.env
+              </Text>
+            </Page>
+          </Document>
+        ).toBlob();
       } else {
         // Production code path
         pdfBlob = await pdf(<InvoiceDocument data={pdfData!} />).toBlob();

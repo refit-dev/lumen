@@ -95,16 +95,36 @@ export async function collectPayment(
       .parse(responseData);
 
     if (result.success) {
-      logger?.info(
-        `Successfully initiated payment collection for customer ${customerId}`,
-        {
-          subscriptionIds: subscriptionIds.join(", "),
-          paymentIntentId: result.paymentIntentId,
-          invoiceId: result.invoiceId,
-          paymentId: result.paymentId,
-          status: result.status,
-        }
-      );
+      if (result.status === "subscription_deleted") {
+        logger?.info(
+          `Customer missing; deleted subscription(s) for customer ${customerId}`,
+          {
+            subscriptionIds: subscriptionIds.join(", "),
+            status: result.status,
+            message: result.message,
+          }
+        );
+      } else if (result.status === "no_op") {
+        logger?.info(
+          `No-op for customer ${customerId} (nothing to bill / cleaned up)`,
+          {
+            subscriptionIds: subscriptionIds.join(", "),
+            status: result.status,
+            message: result.message,
+          }
+        );
+      } else {
+        logger?.info(
+          `Successfully initiated payment collection for customer ${customerId}`,
+          {
+            subscriptionIds: subscriptionIds.join(", "),
+            paymentIntentId: result.paymentIntentId,
+            invoiceId: result.invoiceId,
+            paymentId: result.paymentId,
+            status: result.status,
+          }
+        );
+      }
     } else {
       logger?.warn(
         `Payment collection initiated but may require action for customer ${customerId}`,

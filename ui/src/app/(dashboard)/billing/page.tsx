@@ -41,13 +41,14 @@ export default function BillingPage() {
   }
 
   return (
-    <PageContent title="Lumen Account & Billing">
+    <PageContent title="My Lumen Subscription">
       <div className="max-w-6xl w-full mx-auto p-6">
         <div className="space-y-6 mb-8">
           <div>
             <p className="text-muted-foreground mt-2">
-              Manage your Lumen subscription, view invoices, and update payment
-              methods
+              This portal is just for your team&apos;s subscription with Lumen.
+              Update the card on file, review invoices, and track payments you
+              make to Lumen.
             </p>
           </div>
         </div>

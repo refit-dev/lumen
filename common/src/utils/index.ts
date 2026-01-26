@@ -6,6 +6,8 @@ export * from "./countries";
 
 export const YC_ENROLLMENT_PLACEHOLDER_DOMAIN = "yc-companies-placeholder.com";
 export const YC_ENROLLMENT_FEATURE_SLUG = "yc-company";
+export const EMAIL_DENYLIST_DOMAINS_KEY = "email_denylist_domains";
+export const EMAIL_DENYLIST_ADDRESSES_KEY = "email_denylist_addresses";
 
 export function formatCurrency(amount: number, currency: string): string {
   // Ensure the amount is an integer as required by Dinero.js. If a float or

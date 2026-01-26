@@ -47,6 +47,7 @@ import {
   pricingTables,
 } from "@lumen/common/schema";
 import { testEnv } from "../test-env";
+import { env } from "../../src/env";
 import { createTestMonetaryCreditDefinition } from "../test-helpers/data/credits";
 
 interface SubscriptionFeature {
@@ -867,6 +868,88 @@ describe("Subscriptions API", () => {
     const endedSub = await getResponse.json();
 
     expect(endedSub.subscription.endTimestamp).toBeDefined();
+  });
+
+  it("should delete subscription and return 200 when customer is missing during collect-payment", async () => {
+    const apiClient = createTestApiClient(sessionToken);
+    const apiUrl = env.API_URL;
+    const triggerApiAccessKey = env.TRIGGER_API_ACCESS_KEY!;
+
+    // 1) Create a subscription
+    const createResponse = await apiClient.subscriptions.$post({
+      json: {
+        customerId: testCustomer.id,
+        planId: testPlan.id,
+        effectivePriceId: testPrice.id,
+      },
+    });
+    expect(createResponse.status).toBe(201);
+    const createBody = await createResponse.json();
+    if ("error" in createBody) {
+      throw new Error(`Unexpected error: ${createBody.error}`);
+    }
+    const subscription = createBody.subscription as Subscription;
+
+    // 2) Get its subscription details
+    const detail = await db.query.subscriptionDetails.findFirst({
+      where: and(
+        eq(subscriptionDetails.subscriptionId, subscription.id),
+        isNull(subscriptionDetails.deletedAt)
+      ),
+    });
+    expect(detail).toBeDefined();
+    if (!detail) {
+      throw new Error("Subscription detail not found");
+    }
+
+    // 3) Soft delete the customer
+    await db
+      .update(customers)
+      .set({ deletedAt: new Date() })
+      .where(eq(customers.id, testCustomer.id));
+
+    // 4) Call collect-payment for the deleted customer with the existing subscription/detail
+    const idempotencyKey = `test-missing-customer-${testCustomer.id}-${new Date().toISOString().split("T")[0]}`;
+    const response = await fetch(`${apiUrl}/trigger/billing/collect-payment`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${triggerApiAccessKey}`,
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({
+        customerId: testCustomer.id,
+        subDetails: [
+          {
+            subscriptionId: subscription.id,
+            subscriptionDetailsId: detail.id,
+            nextBillingDate: detail.nextBillingDate.toISOString(),
+          },
+        ],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.status).toBe("subscription_deleted");
+
+    // 5) Verify subscription has been canceled/ended
+    const updatedSub = await db.query.subscriptions.findFirst({
+      where: eq(subscriptions.id, subscription.id),
+    });
+    expect(updatedSub).toBeDefined();
+    expect(updatedSub!.endTimestamp).not.toBeNull();
+    expect(updatedSub!.status).toBe("canceled");
+
+    // 6) Verify subscription details have been soft-deleted
+    const detailsAfter = await db.query.subscriptionDetails.findMany({
+      where: eq(subscriptionDetails.subscriptionId, subscription.id),
+    });
+    expect(detailsAfter.length).toBeGreaterThan(0);
+    for (const d of detailsAfter) {
+      expect(d.deletedAt).not.toBeNull();
+    }
   });
 
   it("should list subscriptions for a specific customer", async () => {

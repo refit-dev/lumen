@@ -29,7 +29,12 @@ import { dodoRouter } from "./dodo";
 import { lumenRouter } from "./lumen";
 import { betaRouter } from "./beta";
 import { enrollmentRouter } from "./enrollment";
-import internalKeyValuesRouter from "./internal_key_values";
+import {
+  internalKeyValuesRouter,
+  internalDenyListRouter,
+} from "./internal_key_values";
+import { requireInternalApiKey } from "../middleware/internalApiKey";
+import { teamRoute } from "./team";
 
 // Create a subrouter for authenticated routes that require either:
 // 1. Session auth (browser-based user session) OR
@@ -63,8 +68,8 @@ const authenticatedRoutes = new Hono()
   .route("/enrollment", enrollmentRouter)
   .route("/lumen", lumenRouter) // For dogfooding Lumen stuff
   .route("/beta", betaRouter)
-  .route("/internal", internalKeyValuesRouter);
-
+  .route("/internal", internalKeyValuesRouter)
+  .route("/team", teamRoute);
 // Router for Trigger.dev webhooks - requires Trigger.dev specific auth
 // These routes are authenticated using the Trigger.dev TRIGGER_API_ACCESS_KEY
 console.log("[ROUTES] Creating trigger routes...");
@@ -81,17 +86,23 @@ const publicRoutesWithRateLimit = new Hono()
   .route("/", publicRoute)
   .route("/pricing-tables", publicPricingTablesRouter);
 
+const denylistRoutes = new Hono()
+  .use(requireInternalApiKey)
+  .route("/", internalDenyListRouter);
+
 // Main router structure:
 // - /public routes: For client-side usage, IP rate limited
 // - / authenticated routes: Require session auth or secret key, API key rate limited
 console.log("[ROUTES] Creating main router...");
 const appRoutes = new Hono()
-  // Use the rate-limited public router group
   .route("/public", publicRoutesWithRateLimit)
-  // Use the authenticated router group (already includes rate limiting)
-  // Use the Trigger.dev router group (already includes Trigger.dev auth)
+  // Fix for Dodo webhooks that were created with double /v1 prefix
+  // caused by API_URL including /v1 and the code appending it again
+  // Should be removed when we know that no one is using the old bad webhook URLs in Dodo
+  .route("/v1/public", publicRoutesWithRateLimit)
   .route("/trigger", triggerRouter)
-  // Use the authenticated router group (already includes rate limiting)
+  .route("/denylist", denylistRoutes)
+  // THIS ROUTE NEEDS TO BE MOUNTED LAST, so requireAuth doesn't apply to all routes
   .route("/", authenticatedRoutes);
 
 console.log("[ROUTES] Main router created successfully");

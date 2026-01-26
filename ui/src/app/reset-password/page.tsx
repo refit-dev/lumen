@@ -14,6 +14,8 @@ import { useState, useEffect, Suspense } from "react";
 import { Loader2 } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import { useRouter, useSearchParams } from "next/navigation";
+import { Turnstile } from "@marsidev/react-turnstile";
+import { TURNSTILE_SITE_KEY } from "@/lib/utils";
 
 function ResetPasswordForm() {
   const [newPassword, setNewPassword] = useState("");
@@ -22,6 +24,7 @@ function ResetPasswordForm() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState("");
 
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -64,6 +67,11 @@ function ResetPasswordForm() {
       const response = await authClient.resetPassword({
         newPassword,
         token,
+        fetchOptions: {
+          headers: {
+            "x-captcha-response": turnstileToken,
+          },
+        },
       });
 
       if (response.error) {
@@ -151,10 +159,16 @@ function ResetPasswordForm() {
                 </div>
               )}
 
+              <Turnstile
+                siteKey={TURNSTILE_SITE_KEY}
+                onSuccess={setTurnstileToken}
+                onExpire={() => setTurnstileToken("")}
+              />
+
               <Button
                 type="submit"
                 className="w-full"
-                disabled={loading || !!error || !token}
+                disabled={loading || !!error || !token || !turnstileToken}
               >
                 {loading ? (
                   <Loader2 size={16} className="animate-spin" />
